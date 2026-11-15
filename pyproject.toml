@@ -71,10 +71,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://ahmadhassan-bted.github.io/RainGeneratorPy/"
-Repository = "https://github.com/AhmadHassan-BTed/RainGeneratorPy"
-"Bug Tracker" = "https://github.com/AhmadHassan-BTed/RainGeneratorPy/issues"
-Documentation = "https://github.com/AhmadHassan-BTed/RainGeneratorPy/blob/main/docs/MASTER_PLAN.md"
+Homepage = "https://ahmadhassan-bted.github.io/RainGen-RainGenerator/"
+Repository = "https://github.com/AhmadHassan-BTed/RainGen-RainGenerator"
+"Bug Tracker" = "https://github.com/AhmadHassan-BTed/RainGen-RainGenerator/issues"
+Documentation = "https://github.com/AhmadHassan-BTed/RainGen-RainGenerator/blob/main/docs/MASTER_PLAN.md"
 
 [project.scripts]
 raingen = "raingen.cli:main"

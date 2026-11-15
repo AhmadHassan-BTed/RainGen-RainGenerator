@@ -44,7 +44,7 @@ from ..scene.metar import scene_from_metar
 from ..scene.schema import Scene
 from ..scene.units import beaufort_to_mps
 
-USER_AGENT = f"raingen/{__version__} (weather sound engine; https://github.com/AhmadHassan-BTed/RainGeneratorPy)"
+USER_AGENT = f"raingen/{__version__} (weather sound engine; https://github.com/AhmadHassan-BTed/RainGen-RainGenerator)"
 
 
 class LiveWeatherError(RuntimeError):
