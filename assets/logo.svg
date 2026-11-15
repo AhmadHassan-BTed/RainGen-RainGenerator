@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="raingen">
+  <title>raingen</title>
+  <defs>
+    <linearGradient id="rg-drop" x1="18" y1="6" x2="46" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a6e6ff"/>
+      <stop offset="0.55" stop-color="#4bb8f5"/>
+      <stop offset="1" stop-color="#1d67cc"/>
+    </linearGradient>
+    <linearGradient id="rg-ring" x1="6" y1="52" x2="58" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#59c3ff" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#59c3ff" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#59c3ff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <!-- orbit ring: back half behind the drop, front half over it (space + time) -->
+  <path d="M6 52A26 6.5 0 0 1 58 52" fill="none" stroke="url(#rg-ring)" stroke-width="2" stroke-opacity="0.55"/>
+  <path d="M32 4C32 4 13 26.5 13 39.5a19 19 0 0 0 38 0C51 26.5 32 4 32 4Z" fill="url(#rg-drop)"/>
+  <path d="M19.5 40h5l3-7.5 4.5 15 4.5-19 4 15.5 2.5-4h5.5" fill="none" stroke="#061224" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M27 15.5c-3.4 4.4-5.9 9.6-6.8 14.6" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M6 52A26 6.5 0 0 0 58 52" fill="none" stroke="url(#rg-ring)" stroke-width="2.2"/>
+</svg>
