@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Master plan · raingen</title>
+<meta name="description" content="The raingen master plan: the science of what makes weather sound real, the engine architecture, the control system, delivery standards, honest wellness and the roadmap.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#060a13" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3f6fb" media="(prefers-color-scheme: light)">
+<meta property="og:type" content="article">
+<meta property="og:title" content="raingen master plan">
+<meta property="og:description" content="From rain generator to the reference weather & environment sound engine.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400..800&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+<script>
+  (function () {
+    var d = document.documentElement;
+    d.classList.add('js');
+    try {
+      var t = localStorage.getItem('rg-theme');
+      if (t === 'light' || t === 'dark') d.setAttribute('data-theme', t);
+    } catch (e) { /* storage blocked: follow the system theme */ }
+  })();
+</script>
+</head>
+<body>
+<div class="progress" id="progress" aria-hidden="true"></div>
+<a class="skip-link" href="#plan-content">Skip to the plan</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="./" aria-label="raingen, home">
+      <img src="assets/logo.svg" alt="" width="30" height="30">
+      <span>raingen <span class="brand-sub">RainGeneratorPy</span></span>
+    </a>
+    <nav class="site-nav" id="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="./#physics">Physics</a></li>
+        <li><a href="./#code">Code</a></li>
+        <li><a href="./#roadmap">Roadmap</a></li>
+        <li><a href="plan.html" aria-current="page">Master plan</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+      <button class="icon-btn" type="button" data-theme-toggle aria-label="Theme: system. Switch theme" title="Theme: system">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17a8.5 8.5 0 0 0 0-17Z" fill="currentColor"/></svg>
+      </button>
+      <a class="icon-btn" href="https://github.com/AhmadHassan-BTed/RainGeneratorPy" aria-label="RainGeneratorPy on GitHub" title="GitHub">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.73.5.5 5.73.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.73 18.27.5 12 .5Z"/></svg>
+      </a>
+      <a class="btn btn-primary btn-sm hide-sm" href="studio/">Open Composer</a>
+      <button class="icon-btn menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <section class="plan-hero" aria-labelledby="plan-title">
+    <div class="wrap">
+      <p class="eyebrow">Master plan</p>
+      <h1 id="plan-title">From rain generator to the reference weather &amp; environment sound engine</h1>
+      <div class="plan-meta">
+        <span id="plan-source">Loading…</span>
+        <span id="plan-reading"></span>
+        <a id="plan-github" href="https://github.com/AhmadHassan-BTed/RainGeneratorPy/blob/main/docs/MASTER_PLAN.md">View on GitHub</a>
+        <a id="plan-download" href="https://raw.githubusercontent.com/AhmadHassan-BTed/RainGeneratorPy/main/docs/MASTER_PLAN.md">Raw Markdown</a>
+      </div>
+    </div>
+  </section>
+
+  <div class="wrap plan-layout">
+    <aside class="toc-aside" id="toc-aside" aria-label="Table of contents">
+      <details class="toc-details" id="toc-details" open>
+        <summary>Contents</summary>
+        <nav class="toc" id="toc" aria-label="Master plan sections"></nav>
+      </details>
+    </aside>
+
+    <article class="prose" id="plan-content" tabindex="-1" aria-busy="true" aria-labelledby="plan-title">
+      <div class="plan-status" id="plan-status" role="status">
+        <div class="skeleton" aria-hidden="true">
+          <i style="width: 72%"></i><i style="width: 94%"></i><i style="width: 88%"></i><i style="width: 60%"></i>
+          <i style="width: 90%; margin-top: 18px"></i><i style="width: 84%"></i><i style="width: 46%"></i>
+        </div>
+        <span class="visually-hidden">Loading the master plan…</span>
+      </div>
+      <noscript>
+        <p>This page renders the master plan with JavaScript. You can also
+          <a href="https://github.com/AhmadHassan-BTed/RainGeneratorPy/blob/main/docs/MASTER_PLAN.md">read it on GitHub</a>.</p>
+      </noscript>
+    </article>
+  </div>
+</main>
+
+<button class="icon-btn to-top" id="to-top" type="button" aria-label="Back to top" title="Back to top">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+</button>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-legal" style="margin-top: 0; padding-top: 0; border-top: 0;">
+      <span>© 2026 Ahmad Hassan · raingen is released under the MIT licence.</span>
+      <span><a href="./">Overview</a> · <a href="studio/">4D Composer</a> · <a href="https://github.com/AhmadHassan-BTed/RainGeneratorPy">GitHub</a></span>
+    </div>
+  </div>
+</footer>
+
+<script type="module">
+/* Client-side renderer for docs/MASTER_PLAN.md: marked (GFM) for the text,
+   mermaid for the signal-flow diagram, a sticky scroll-spied table of contents. */
+const LOCAL_MD = 'MASTER_PLAN.md';
+const REMOTE_MD = 'https://raw.githubusercontent.com/AhmadHassan-BTed/RainGeneratorPy/main/docs/MASTER_PLAN.md';
+const MARKED_SRC = 'https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js';
+const MERMAID_SRC = 'https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js';
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const root = document.documentElement;
+const content = $('#plan-content');
+const tocEl = $('#toc');
+const tocAside = $('#toc-aside');
+const tocDetails = $('#toc-details');
+const desktopMQ = window.matchMedia('(min-width: 1040px)');
+
+/* ---------- shared chrome: theme toggle + mobile menu ---------- */
+(function themeToggle() {
+  const btn = $('[data-theme-toggle]');
+  const order = ['system', 'light', 'dark'];
+  const current = () => root.getAttribute('data-theme') || 'system';
+  const label = (t) => { btn.setAttribute('aria-label', `Theme: ${t}. Switch theme`); btn.title = `Theme: ${t}`; };
+  label(current());
+  btn.addEventListener('click', () => {
+    const next = order[(order.indexOf(current()) + 1) % order.length];
+    if (next === 'system') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', next);
+    try { if (next === 'system') localStorage.removeItem('rg-theme'); else localStorage.setItem('rg-theme', next); } catch (e) { /* ignore */ }
+    label(next);
+    document.dispatchEvent(new CustomEvent('rg-theme'));
+  });
+  window.matchMedia('(prefers-color-scheme: light)').addEventListener?.('change', () => document.dispatchEvent(new CustomEvent('rg-theme')));
+})();
+
+(function menu() {
+  const navEl = $('#site-nav'), toggle = $('.menu-toggle');
+  const close = () => { navEl.classList.remove('is-open'); toggle.setAttribute('aria-expanded', 'false'); toggle.setAttribute('aria-label', 'Open menu'); };
+  toggle.addEventListener('click', () => {
+    const open = !navEl.classList.contains('is-open');
+    navEl.classList.toggle('is-open', open);
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+  });
+  navEl.addEventListener('click', (e) => { if (e.target.closest('a')) close(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && navEl.classList.contains('is-open')) { close(); toggle.focus(); } });
+})();
+
+/* ---------- loading ---------- */
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+async function fetchMarkdown(url) {
+  const res = await fetch(url, { cache: 'no-cache' });
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const type = res.headers.get('content-type') || '';
+  const text = await res.text();
+  // a static host with an SPA fallback may answer 200 with an HTML page
+  if (/text\/html/i.test(type) || /^\s*<!doctype html/i.test(text) || !text.trim()) throw new Error(`${url}: not Markdown`);
+  return text;
+}
+
+async function loadPlan() {
+  try {
+    return { text: await fetchMarkdown(LOCAL_MD), source: 'local', url: LOCAL_MD };
+  } catch (localErr) {
+    return { text: await fetchMarkdown(REMOTE_MD), source: 'github', url: REMOTE_MD };
+  }
+}
+
+/* ---------- markdown → sanitized DOM ---------- */
+const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function renderMarkdown(text) {
+  const marked = window.marked;
+  marked.use({
+    gfm: true,
+    breaks: false,
+    renderer: {
+      // marked 12 passes (code, infostring, escaped); newer versions pass a token object
+      code(code, infostring) {
+        let src = code, lang = infostring;
+        if (code && typeof code === 'object') { src = code.text; lang = code.lang; }
+        if (String(lang || '').trim().split(/\s+/)[0] === 'mermaid') {
+          return `<div class="mermaid-wrap"><pre class="mermaid">${escapeHtml(src)}</pre></div>`;
+        }
+        return false;
+      }
+    }
+  });
+  return marked.parse(text);
+}
+
+function slugify(text) {
+  // GitHub-style: lowercase, drop punctuation, one hyphen per space
+  return text.trim().toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, '').replace(/\s/g, '-');
+}
+
+function buildFragment(html) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html; // inert: nothing loads or runs inside a template
+  const frag = tpl.content;
+
+  frag.querySelectorAll('script, iframe, object, embed, style, link, meta, base, form').forEach((n) => n.remove());
+  frag.querySelectorAll('*').forEach((el) => {
+    for (const attr of Array.from(el.attributes)) {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith('on')) el.removeAttribute(attr.name);
+      else if ((name === 'href' || name === 'src' || name === 'xlink:href') && /^\s*(javascript|vbscript|data):/i.test(attr.value)) el.removeAttribute(attr.name);
+    }
+  });
+
+  // heading ids + anchors
+  const used = new Set();
+  frag.querySelectorAll('h1, h2, h3, h4').forEach((h) => {
+    let base = slugify(h.textContent) || 'section', id = base, n = 1;
+    while (used.has(id)) id = `${base}-${n++}`;
+    used.add(id);
+    h.id = id;
+    if (h.tagName !== 'H1') {
+      const a = document.createElement('a');
+      a.className = 'heading-anchor';
+      a.href = `#${id}`;
+      a.setAttribute('aria-label', `Link to ${h.textContent.trim()}`);
+      a.textContent = '#';
+      h.appendChild(a);
+    }
+  });
+
+  // tables scroll inside their own box, never the page
+  frag.querySelectorAll('table').forEach((t) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'region');
+    wrap.setAttribute('aria-label', 'Table');
+    t.replaceWith(wrap);
+    wrap.appendChild(t);
+    t.querySelectorAll('thead th').forEach((th) => th.setAttribute('scope', 'col'));
+  });
+
+  // task lists
+  frag.querySelectorAll('li > input[type="checkbox"]').forEach((cb) => {
+    cb.closest('li').classList.add('task-list-item');
+    cb.closest('ul, ol')?.classList.add('contains-task-list');
+    cb.setAttribute('aria-label', 'Planned item');
+  });
+
+  // external links open in a new tab
+  frag.querySelectorAll('a[href]').forEach((a) => {
+    const href = a.getAttribute('href');
+    if (/^https?:\/\//i.test(href)) { a.target = '_blank'; a.rel = 'noopener noreferrer'; }
+  });
+
+  // turn "§8" / "§9.2" references into links to the numbered section
+  const bySection = new Map();
+  frag.querySelectorAll('h2, h3').forEach((h) => {
+    const m = h.textContent.trim().match(/^(\d+(?:\.\d+)?)\.?\s/);
+    if (m && !bySection.has(m[1])) bySection.set(m[1], h.id);
+  });
+  const walker = document.createTreeWalker(frag, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (/§\s?\d/.test(node.nodeValue) && !node.parentElement.closest('a, code, pre, h1, h2, h3, h4') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT)
+  });
+  const textNodes = [];
+  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  for (const node of textNodes) {
+    const parts = node.nodeValue.split(/(§\s?\d+(?:\.\d+)?)/);
+    if (parts.length < 2) continue;
+    const out = document.createDocumentFragment();
+    for (const part of parts) {
+      const m = part.match(/^§\s?(\d+(?:\.\d+)?)$/);
+      const id = m && (bySection.get(m[1]) || bySection.get(m[1].split('.')[0]));
+      if (id) {
+        const a = document.createElement('a');
+        a.href = `#${id}`;
+        a.textContent = part;
+        out.appendChild(a);
+      } else if (part) out.appendChild(document.createTextNode(part));
+    }
+    node.replaceWith(out);
+  }
+  return frag;
+}
+
+/* ---------- table of contents + scroll spy ---------- */
+let tocItems = [];
+const headingLabel = (h) => {
+  const c = h.cloneNode(true);
+  c.querySelectorAll('.heading-anchor').forEach((a) => a.remove());
+  return c.textContent.trim();
+};
+
+function buildToc() {
+  // Part headings (h1) become group labels, h2 sections are entries, h3 nest under their h2.
+  const heads = $$('h1, h2, h3', content);
+  const list = document.createElement('ol');
+  let h2Li = null, sub = null;
+  tocItems = [];
+  for (const h of heads) {
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = `#${h.id}`;
+    a.textContent = headingLabel(h);
+    li.appendChild(a);
+    let top = li;
+    if (h.tagName === 'H1') {
+      li.className = 'toc-part';
+      list.appendChild(li);
+      h2Li = null;
+      sub = null;
+    } else if (h.tagName === 'H2' || !h2Li) {
+      list.appendChild(li);
+      if (h.tagName === 'H2') h2Li = li;
+      sub = null;
+    } else {
+      if (!sub) { sub = document.createElement('ol'); h2Li.appendChild(sub); }
+      sub.appendChild(li);
+      top = h2Li;
+    }
+    tocItems.push({ h, a, top });
+  }
+  tocEl.replaceChildren(list);
+  tocEl.addEventListener('click', (e) => {
+    if (e.target.closest('a') && !desktopMQ.matches) tocDetails.open = false;
+  });
+}
+
+let activeIdx = -1;
+function updateSpy() {
+  if (!tocItems.length) return;
+  const line = parseFloat(getComputedStyle(root).getPropertyValue('--header-h')) + 28 || 88;
+  let idx = 0;
+  for (let i = 0; i < tocItems.length; i++) {
+    if (tocItems[i].h.getBoundingClientRect().top <= line) idx = i; else break;
+  }
+  if (idx === activeIdx) return;
+  activeIdx = idx;
+  tocItems.forEach((it, i) => {
+    it.a.classList.toggle('is-active', i === idx);
+    if (i === idx) it.a.setAttribute('aria-current', 'location'); else it.a.removeAttribute('aria-current');
+  });
+  $$('li.is-open', tocEl).forEach((li) => li.classList.remove('is-open'));
+  tocItems[idx].top.classList.add('is-open');
+  if (desktopMQ.matches) {
+    const a = tocItems[idx].a, box = tocAside.getBoundingClientRect(), r = a.getBoundingClientRect();
+    if (r.top < box.top + 8) tocAside.scrollTop -= box.top + 8 - r.top;
+    else if (r.bottom > box.bottom - 8) tocAside.scrollTop += r.bottom - box.bottom + 8;
+  }
+}
+
+function updateProgress() {
+  const bar = $('#progress');
+  const r = content.getBoundingClientRect();
+  const total = r.height - window.innerHeight * 0.6;
+  const p = total > 0 ? Math.min(1, Math.max(0, -r.top / total)) : 0;
+  bar.style.transform = `scaleX(${p})`;
+  $('#to-top').classList.toggle('is-visible', window.scrollY > 900);
+}
+
+let ticking = false;
+window.addEventListener('scroll', () => {
+  if (ticking) return;
+  ticking = true;
+  requestAnimationFrame(() => { ticking = false; updateSpy(); updateProgress(); });
+}, { passive: true });
+window.addEventListener('resize', () => { updateProgress(); });
+$('#to-top').addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  $('#main').focus?.();
+});
+
+const syncTocMode = () => { if (desktopMQ.matches) tocDetails.open = true; };
+desktopMQ.addEventListener?.('change', syncTocMode);
+if (!desktopMQ.matches) tocDetails.open = false;
+tocDetails.addEventListener('toggle', () => { if (desktopMQ.matches && !tocDetails.open) tocDetails.open = true; });
+
+/* ---------- mermaid ---------- */
+const cssVar = (name, fallback) => (getComputedStyle(root).getPropertyValue(name).trim() || fallback);
+function mermaidConfig() {
+  const dark = /dark/.test(getComputedStyle(root).getPropertyValue('color-scheme'));
+  return {
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: 'base',
+    fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+    flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: true },
+    themeVariables: {
+      darkMode: dark,
+      background: cssVar('--surface', dark ? '#0d1626' : '#ffffff'),
+      primaryColor: cssVar('--surface-2', dark ? '#122036' : '#f0f4fa'),
+      primaryTextColor: cssVar('--text', dark ? '#e8eef8' : '#0b1526'),
+      primaryBorderColor: cssVar('--accent', dark ? '#5cc6ff' : '#0a72c0'),
+      secondaryColor: cssVar('--surface-3', dark ? '#18294a' : '#e3eaf4'),
+      tertiaryColor: cssVar('--surface', dark ? '#0d1626' : '#ffffff'),
+      lineColor: cssVar('--muted', dark ? '#8494ad' : '#586a85'),
+      textColor: cssVar('--text', dark ? '#e8eef8' : '#0b1526'),
+      mainBkg: cssVar('--surface-2', dark ? '#122036' : '#f0f4fa'),
+      nodeBorder: cssVar('--accent', dark ? '#5cc6ff' : '#0a72c0'),
+      edgeLabelBackground: cssVar('--surface', dark ? '#0d1626' : '#ffffff'),
+      fontSize: '14px'
+    }
+  };
+}
+
+// the section heading a diagram sits under, used as its accessible name
+function nearestHeading(node) {
+  let el = node.closest('.mermaid-wrap') || node;
+  while (el) {
+    let prev = el.previousElementSibling;
+    while (prev) {
+      if (/^H[1-4]$/.test(prev.tagName)) return prev;
+      prev = prev.previousElementSibling;
+    }
+    el = el.parentElement === content ? null : el.parentElement;
+  }
+  return null;
+}
+
+let mermaidReady = null;
+async function renderDiagrams() {
+  const nodes = $$('pre.mermaid', content);
+  if (!nodes.length) return;
+  nodes.forEach((n) => { if (n.dataset.src == null) n.dataset.src = n.textContent; });
+  try {
+    if (!mermaidReady) mermaidReady = loadScript(MERMAID_SRC);
+    await mermaidReady;
+    const mermaid = window.mermaid;
+    nodes.forEach((n) => { n.removeAttribute('data-processed'); n.textContent = n.dataset.src; });
+    mermaid.initialize(mermaidConfig());
+    await mermaid.run({ nodes });
+    nodes.forEach((n) => {
+      const svg = n.querySelector('svg');
+      if (!svg) return;
+      const h = nearestHeading(n);
+      svg.setAttribute('role', 'img');
+      svg.setAttribute('aria-label', h ? `Diagram: ${headingLabel(h)}` : 'Diagram');
+    });
+  } catch (err) {
+    console.warn('Diagram rendering failed; showing the diagram source instead.', err);
+    mermaidReady = null;
+    nodes.forEach((n) => { n.removeAttribute('data-processed'); n.textContent = n.dataset.src; });
+  }
+}
+document.addEventListener('rg-theme', () => { if ($('pre.mermaid', content)) renderDiagrams(); });
+
+/* ---------- boot ---------- */
+function showError(err) {
+  console.error(err);
+  content.setAttribute('aria-busy', 'false');
+  content.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'plan-status is-error';
+  box.setAttribute('role', 'alert');
+  box.innerHTML = '<p><strong>The master plan could not be loaded.</strong></p>'
+    + '<p>Check your connection, or read it directly on '
+    + '<a href="https://github.com/AhmadHassan-BTed/RainGeneratorPy/blob/main/docs/MASTER_PLAN.md">GitHub</a>.</p>';
+  content.appendChild(box);
+  $('#plan-source').textContent = 'Unavailable';
+}
+
+async function boot() {
+  const markedReady = loadScript(MARKED_SRC).then(() => true, () => false);
+  let plan;
+  try {
+    plan = await loadPlan();
+  } catch (err) {
+    showError(err);
+    return;
+  }
+
+  $('#plan-download').href = plan.url;
+  $('#plan-source').textContent = plan.source === 'local' ? 'Rendered from docs/MASTER_PLAN.md' : 'Rendered live from GitHub (main)';
+  const words = plan.text.split(/\s+/).filter(Boolean).length;
+  $('#plan-reading').textContent = `· ${Math.max(1, Math.round(words / 230))} min read · ${words.toLocaleString('en-US')} words ·`;
+
+  const hasMarked = await markedReady;
+  content.innerHTML = '';
+  if (hasMarked && window.marked) {
+    const frag = buildFragment(renderMarkdown(plan.text));
+    // the document title is already the page heading; the remaining h1s are the plan's "Part" dividers
+    const h1 = frag.firstElementChild && frag.firstElementChild.tagName === 'H1' ? frag.firstElementChild : null;
+    if (h1) {
+      $('#plan-title').textContent = headingLabel(h1).replace(/^Master Plan:\s*/i, '').replace(/^\w/, (c) => c.toUpperCase());
+      h1.remove();
+    }
+    content.appendChild(frag);
+  } else {
+    const note = document.createElement('p');
+    note.className = 'plan-status';
+    note.textContent = 'The Markdown renderer could not be loaded, so the plan is shown as plain text.';
+    const pre = document.createElement('pre');
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.textContent = plan.text;
+    content.append(note, pre);
+  }
+  content.setAttribute('aria-busy', 'false');
+
+  buildToc();
+  updateSpy();
+  updateProgress();
+
+  if (location.hash) {
+    let target = null;
+    try { target = document.getElementById(decodeURIComponent(location.hash.slice(1))); } catch (e) { target = null; }
+    if (target) requestAnimationFrame(() => target.scrollIntoView({ block: 'start' }));
+  }
+
+  await renderDiagrams();
+  updateSpy();
+}
+
+boot();
+</script>
+</body>
+</html>

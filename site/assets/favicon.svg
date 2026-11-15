@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="f-drop" x1="18" y1="4" x2="46" y2="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a6e6ff"/>
+      <stop offset="0.55" stop-color="#4bb8f5"/>
+      <stop offset="1" stop-color="#1d67cc"/>
+    </linearGradient>
+    <style>
+      .wave { stroke: #061224; }
+      @media (prefers-color-scheme: light) { .wave { stroke: #04101f; } }
+    </style>
+  </defs>
+  <path d="M32 2C32 2 10 27 10 41.5a22 22 0 0 0 44 0C54 27 32 2 32 2Z" fill="url(#f-drop)"/>
+  <path class="wave" d="M16 42h7l4-10 5 17 5-17 4 10h7" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
