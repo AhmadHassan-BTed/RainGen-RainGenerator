@@ -156,12 +156,15 @@ def per_acn(order_weights, order: int) -> np.ndarray:
 
 @lru_cache(maxsize=None)
 def _maxre(order: int) -> tuple[float, ...]:
-    x = math.cos(math.radians(137.9) / (order + 1.51))
+    if order <= 0:
+        return (1.0,)
+    # r_E = largest root of P_{N+1}; cos(137.9 deg / (N + 1.51)) is Zotter & Frank's approximation of it
+    x = float(np.max(np.polynomial.legendre.legroots([0.0] * (order + 1) + [1.0]).real))
     return tuple(float(v) for v in legendre(order, x))
 
 
 def maxre_weights(order: int) -> np.ndarray:
-    """Per-degree max-rE weights g_n = P_n(cos(137.9 deg / (N + 1.51))) (Zotter & Frank 2012)."""
+    """Per-degree max-rE weights g_n = P_n(r_E), r_E the largest root of P_{N+1} (Zotter & Frank 2012)."""
     return np.array(_maxre(int(order)), dtype=np.float64)
 
 

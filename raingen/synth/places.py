@@ -13,9 +13,11 @@ Physics:
 * Transmitted sound is mostly diffuse: higher spherical-harmonic orders are tapered,
   and an open window re-radiates as an aperture in its own direction.
 * Rooms: a feedback delay network (Jot & Chaigne 1991; Rocchesso & Smith 1997) with an
-  orthogonal Hadamard feedback matrix and per-line gains g = 10^(-3 d / (RT60 sr)); a
-  one-pole absorption filter in the loop shortens the high-frequency decay (Jot's
-  b = ln(10)/4 log10(g) (1 - 1/alpha^2), alpha = RT60(Nyquist)/RT60(DC)). Line k drives
+  orthogonal Hadamard feedback matrix; each line of d samples loses 60 d / (sr RT60(f)) dB
+  per pass. A one-pole absorption filter per line shortens the high-frequency decay
+  (alpha = RT60(8 kHz) / RT60(mid)); its pole and the line gain are solved per line so the
+  500 Hz-1 kHz decay is the shelter's RT60 exactly (Jot's small-b closed form fails for car
+  cabins). Delays span one to three mean free paths (4V/S, ~1.2 m in a car). Line k drives
   ACN channel k with gain sqrt(L / (2n + 1)), the SN3D energy split of a diffuse field.
 * Car wipers (FMVSS 104 S4.1.1): at least two frequencies, >= 45 and >= 20 cycles/min,
   differing by >= 15; here slow 40, fast 62, intermittent one wipe every ~7.5 s. Rubber
@@ -37,7 +39,7 @@ from raingen.physics.layout import normalize_shelter
 from raingen.spatial.sh import sh_real
 
 from .wind import (PendingMixer, Ramp, SparseModalBank, StatefulSOS, bandpass_sos, block_start_sample, db_spl,
-                   graphic_eq_sos, highpass_sos, noise_rms_gain, shelter_of, smoothstep)
+                   graphic_eq_sos, highpass_sos, noise_rms_gain, shelter_of, smoothstep, sosfilt_inplace)
 
 BANDS_HZ = np.array([63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0])
 EXTERIOR_STEMS = ("rain_far", "wind", "thunder", "ambience", "aftermath")
@@ -46,17 +48,23 @@ _RHO_C = RHO_AIR * 343.0
 
 # Envelope models: surface mass (kg/m^2), leak/open-area fraction, double-leaf dip,
 # geometric shielding (dB at 1 kHz) and per-order SH taper of the transmitted field.
+# Calibration (A-weighted outdoor-indoor level difference of a broadband exterior): a closed
+# room ~27-30 dB, a tilted window (window_open ~0.3) ~15 dB and a fully open one ~10 dB, as
+# measured in 102 bedrooms by Locher et al. (2018, IJERPH 15:149: 27.8 / 15.5 / 10.0 dB); the
+# window-dominated facade is an effective 14 kg/m^2 leaf with a double-glazing dip at 250 Hz.
+# Car body ~28 dB (8 kg/m^2 panels and glass, door seals); a vented attic under thin roofing
+# ~23 dB (provisional); tent fabric ~4 dB.
 SHELTER_ENVELOPE = {
     "car": {"mass": 8.0, "leak": 2.0e-4, "taper": (1.0, 0.55, 0.3, 0.15)},
     "tent": {"mass": 0.15, "leak": 0.12, "taper": (1.0, 0.9, 0.75, 0.6)},
-    "room_closed": {"mass": 20.0, "leak": 5.0e-5, "dip_hz": 215.0, "dip_db": 7.0, "taper": (1.0, 0.35, 0.15, 0.08)},
-    "room_open": {"mass": 20.0, "leak": 5.0e-5, "dip_hz": 215.0, "dip_db": 7.0, "taper": (1.0, 0.35, 0.15, 0.08)},
-    "attic": {"mass": 9.0, "leak": 1.0e-3, "taper": (1.0, 0.45, 0.2, 0.1)},
+    "room_closed": {"mass": 14.0, "leak": 3.0e-4, "dip_hz": 250.0, "dip_db": 6.0, "taper": (1.0, 0.35, 0.15, 0.08)},
+    "room_open": {"mass": 14.0, "leak": 3.0e-4, "dip_hz": 250.0, "dip_db": 6.0, "taper": (1.0, 0.35, 0.15, 0.08)},
+    "attic": {"mass": 6.0, "leak": 3.0e-3, "taper": (1.0, 0.45, 0.2, 0.1)},
     "porch": {"shield_db": 1.5, "taper": (1.0, 0.95, 0.9, 0.85)},
     "cave": {"shield_db": 3.0, "taper": (1.0, 0.8, 0.6, 0.45)},
     "underpass": {"shield_db": 3.0, "taper": (1.0, 0.85, 0.7, 0.55)},
 }
-WINDOW_AREA_SHARE = 0.25        # share of the transmitting envelope taken by an opened window
+WINDOW_AREA_SHARE = 0.1         # open-area fraction of the envelope added by a fully opened window
 WINDOW_AZIMUTH = 0.0            # the room window is ahead of the listener (raingen.physics.layout)
 
 
@@ -260,23 +268,22 @@ class Room:
         self.n_ch = (self.order + 1) ** 2
         self.L = int(lines) if lines else max(8, 1 << int(math.ceil(math.log2(self.n_ch))))
         self.rt60 = max(float(rt60_s), 0.02)
-        size = float(size_m) if size_m else min(max(2.0 + 8.0 * self.rt60, 1.5), 30.0)
+        # mean free path 4V/S grows with the room: ~1.2 m in a car cabin, ~4 m in a living room, >10 m in a cave
+        size = float(size_m) if size_m else min(max(0.6 + 7.0 * self.rt60, 1.0), 30.0)
         d_lo = size / 343.0 * self.sr
         d_hi = 3.0 * d_lo
         targets = d_lo * (d_hi / d_lo) ** (np.arange(self.L) / max(self.L - 1, 1))
         self.delays = np.array(_primes_near(targets), dtype=int)
         self.min_delay = int(self.delays.min())
         self.size = int(self.delays.max()) + 1
-        self.buf = np.zeros((self.L, self.size))
-        self.w = 0
+        # one circular buffer per line, exactly its delay long: the read position is the write position
+        self.lines = [np.zeros(int(d)) for d in self.delays]
+        self.ptr = [0] * self.L
         self.A = _hadamard(self.L)
         rng = np.random.default_rng(0x6F646E66)            # fixed sign pattern (no runtime randomness)
         self.A = self.A * np.where(rng.random(self.L) < 0.5, -1.0, 1.0)[None, :]
-        self.g = 10.0 ** (-3.0 * self.delays / (self.rt60 * self.sr))
-        alpha = min(max(float(hf_ratio), 0.05), 1.0)
-        g_mean = 10.0 ** (-3.0 * float(np.mean(self.delays)) / (self.rt60 * self.sr))
-        self.b = (math.log(10.0) / 4.0) * math.log10(g_mean) * (1.0 - 1.0 / (alpha * alpha))
-        self.b = min(max(self.b, 0.0), 0.95)
+        self.hf_ratio = min(max(float(hf_ratio), 0.05), 1.0)
+        self.b, self.g = self._absorption(self.delays, self.rt60, self.hf_ratio, self.sr)
         self.damp_zi = np.zeros((self.L, 1))
         acn = np.floor(np.sqrt(np.arange(self.n_ch))).astype(int)
         w_in = np.where(acn == 0, 1.0, float(directional_input))
@@ -284,12 +291,59 @@ class Room:
         out_g = np.zeros(self.L)
         out_g[: self.n_ch] = np.sqrt(self.L / (2.0 * acn + 1.0))
         self.out_g = out_g
+        # absorption one-pole per line y = (1 - b_i) x + b_i y[-1] as one SOS section each (sosfilt C kernel)
+        self.damp_sos = [np.array([[1.0 - b, 0.0, 0.0, 1.0, -b, 0.0]]) for b in self.b]
+        self.damp_state = np.zeros((self.L, 1, 1, 2))
         self.energy = 0.0
+        self._written: list[float] = []                    # energy written per block, newest last
+
+    F_MID_HZ = 700.0           # rt60 is the mid-frequency reverberation time (500 Hz-1 kHz octaves, ISO 3382)
+    F_HI_HZ = 8000.0           # hf_ratio = RT60(8 kHz) / RT60(mid)
+
+    @classmethod
+    def _absorption(cls, delays, rt60: float, hf_ratio: float, sr: int) -> tuple[np.ndarray, np.ndarray]:
+        """Per-line one-pole absorption b_i and loop gain g_i (Jot & Chaigne 1991, solved exactly).
+
+        A pass through line i must lose 60 m_i / (sr RT(f)) dB. The one-pole D(w) = (1 - b) / (1 - b e^-jw)
+        is solved per line (bisection on b) for the loss ratio between F_HI_HZ and F_MID_HZ, and g_i then
+        sets the mid-frequency loss exactly. (Jot's small-b closed form, with one b for every line, breaks
+        down for short rooms: a car cabin decayed ~20 % too fast in the mid band.)
+        """
+        w_m = 2.0 * math.pi * cls.F_MID_HZ / sr
+        w_h = 2.0 * math.pi * min(cls.F_HI_HZ, 0.45 * sr) / sr
+
+        def d_db(b, w):
+            return 20.0 * np.log10((1.0 - b) / np.sqrt(1.0 - 2.0 * b * math.cos(w) + b * b))
+
+        m = np.asarray(delays, dtype=float)
+        loss_mid = -60.0 * m / (sr * rt60)                         # dB per pass at mid frequencies
+        want = loss_mid * (1.0 / hf_ratio - 1.0)                   # extra HF loss per pass (<= 0)
+        lo, hi = np.zeros_like(m), np.full_like(m, 0.995)
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            too_much = (d_db(mid, w_h) - d_db(mid, w_m)) < want
+            hi = np.where(too_much, mid, hi)
+            lo = np.where(too_much, lo, mid)
+        b = 0.5 * (lo + hi)
+        g = np.minimum(10.0 ** ((loss_mid - d_db(b, w_m)) / 20.0), 0.999)
+        return b, g
+
+    @property
+    def buf(self) -> np.ndarray:
+        """(L, max delay) view of the line memories (diagnostics)."""
+        out = np.zeros((self.L, self.size))
+        for i, ln in enumerate(self.lines):
+            out[i, : ln.size] = ln
+        return out
 
     def reset(self) -> None:
-        self.buf[:] = 0.0
+        for ln in self.lines:
+            ln[:] = 0.0
+        self.ptr = [0] * self.L
         self.damp_zi[:] = 0.0
+        self.damp_state[:] = 0.0
         self.energy = 0.0
+        self._written = []
 
     def process(self, bus: np.ndarray) -> np.ndarray:
         bus = np.asarray(bus, dtype=float)
@@ -298,27 +352,52 @@ class Room:
         c = min(bus.shape[0], self.n_ch)
         n = bus.shape[1]
         out = np.zeros((max(bus.shape[0], self.n_ch), n))
-        in_energy = float(np.sum(bus[:c] ** 2))
+        in_energy = float(np.einsum("ij,ij->", bus[:c], bus[:c]))
         if in_energy == 0.0 and self.energy < 1e-14:
             return out
         x = self.B[:, :c] @ bus[:c]                        # (L, n) line inputs
-        y_all = np.zeros((self.L, n))
-        rows = np.arange(self.L)[:, None]
+        y_all = np.empty((self.L, n))
+        written = 0.0
         pos = 0
+        lines, ptr = self.lines, self.ptr
         while pos < n:
             m = min(n - pos, self.min_delay)
-            k = np.arange(m)
-            ridx = (self.w - self.delays[:, None] + k[None, :]) % self.size
-            y = self.buf[rows, ridx]
-            y, self.damp_zi = signal.lfilter([1.0 - self.b], [1.0, -self.b], y, axis=-1, zi=self.damp_zi)
-            y = y * self.g[:, None]
-            y_all[:, pos:pos + m] = y
-            widx = (self.w + k) % self.size
-            self.buf[:, widx] = x[:, pos:pos + m] + self.A @ y
-            self.w = (self.w + m) % self.size
+            y = y_all[:, pos:pos + m]
+            for i in range(self.L):                         # read the samples written d_i ago
+                ln, p = lines[i], ptr[i]
+                e = p + m
+                if e <= ln.size:
+                    y[i] = ln[p:e]
+                else:
+                    k = ln.size - p
+                    y[i, :k] = ln[p:]
+                    y[i, k:] = ln[: m - k]
+            yc = np.ascontiguousarray(y)
+            for i in range(self.L):
+                sosfilt_inplace(self.damp_sos[i], yc[i:i + 1], self.damp_state[i])
+            yc *= self.g[:, None]
+            y[...] = yc
+            fb = x[:, pos:pos + m] + self.A @ yc
+            for i in range(self.L):                         # and write the new ones in their place
+                ln, p = lines[i], ptr[i]
+                e = p + m
+                if e <= ln.size:
+                    ln[p:e] = fb[i]
+                    ptr[i] = e % ln.size
+                else:
+                    k = ln.size - p
+                    ln[p:] = fb[i, :k]
+                    ln[: m - k] = fb[i, k:]
+                    ptr[i] = m - k
+            written += float(np.einsum("ij,ij->", fb, fb))
             pos += m
         out[: self.n_ch] = y_all[: self.n_ch] * self.out_g[: self.n_ch, None]
-        self.energy = float(np.sum(self.buf ** 2))
+        # what is still circulating: everything written within the longest delay
+        self._written.append(written)
+        keep = int(math.ceil(self.size / max(n, 1))) + 1
+        if len(self._written) > keep:
+            del self._written[: len(self._written) - keep]
+        self.energy = float(sum(self._written))
         return out
 
 

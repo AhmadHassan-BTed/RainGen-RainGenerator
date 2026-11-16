@@ -1,11 +1,13 @@
 """Tier-0 Vibe macros: Intensity, Closeness/Shelter, Calm<->Wild (MASTER_PLAN 2.3).
 
 Intensity walks the storm path through fixed anchors, interpolated in
-log(rain rate), Beaufort force and log(thunder distance):
+log(rain rate), Beaufort force and log(thunder distance). The rain anchors are
+the "How much rain" detents of MASTER_PLAN 2.3 (WMO words: slight < 2.5,
+moderate 2.5-10, heavy 10-50, intense >= 50, cloudburst >= 100 mm/h):
 
     0 dry, drips only | 20 drizzle 0.3 mm/h, Bft 2 | 40 moderate 5 mm/h, Bft 3
-    60 heavy 20 mm/h, Bft 5 | 80 thunderstorm 40 mm/h, Bft 7, thunder 5 km
-    100 extreme 80 mm/h, Bft 9, thunder 1.5 km
+    60 heavy 20 mm/h, Bft 5 | 80 thunderstorm, very heavy 50 mm/h, Bft 7, thunder 5 km
+    100 cloudburst 100 mm/h, Bft 9, thunder 1.5 km
 
 Closeness: 0 out in it | 25 under umbrella or tree | 50 porch or tent (or the
 scene's own mid shelter: car, attic, cave, underpass) | 75 indoors, window open
@@ -32,7 +34,7 @@ VIBE_DEFAULTS = {"intensity": 40.0, "closeness": 50.0, "wildness": 30.0}
 
 # Intensity anchors
 _I_RATE_X = np.array([5.0, 20.0, 40.0, 60.0, 80.0, 100.0])
-_I_RATE_Y = np.log(np.array([0.02, 0.3, 5.0, 20.0, 40.0, 80.0]))
+_I_RATE_Y = np.log(np.array([0.02, 0.3, 5.0, 20.0, 50.0, 100.0]))
 _I_BFT_X = np.array([0.0, 20.0, 40.0, 60.0, 80.0, 100.0])
 _I_BFT_Y = np.array([1.0, 2.0, 3.0, 5.0, 7.0, 9.0])
 DRY_BELOW = 5.0
@@ -50,6 +52,11 @@ def _lerp(a: float, b: float, u: float) -> float:
 
 def _clip01(x: float) -> float:
     return float(min(1.0, max(0.0, x)))
+
+
+def turbulence_from_gust(g: float) -> float:
+    """Turbulence intensity from the gust factor, G = 1 + 3 I (Appendix A), within the manifest's 0.05 .. 0.5."""
+    return float(min(0.5, max(0.05, round((float(g) - 1.0) / 3.0, 9))))
 
 
 def intensity_rate(intensity: float) -> float:
@@ -84,7 +91,7 @@ def intensity_from_scene(scene: Scene) -> float:
     p = scene.weather.precipitation
     if p.type == "none" or p.rate_mm_h <= 0.0:
         return 0.0
-    lr = math.log(max(0.02, min(80.0, float(p.rate_mm_h))))
+    lr = math.log(max(0.02, min(100.0, float(p.rate_mm_h))))
     return float(np.interp(lr, _I_RATE_Y, _I_RATE_X))
 
 
@@ -194,7 +201,7 @@ def apply_vibe(scene: Scene, intensity: Optional[float] = None, closeness: Optio
         u = _clip01(float(vals["wildness"]) / 100.0)
         g = 1.15 + 0.75 * u
         wind.gust_factor = g
-        wind.turbulence_intensity = (g - 1.0) / 3.0
+        wind.turbulence_intensity = turbulence_from_gust(g)
         wind.gust_rate_per_min = 0.5 + 3.5 * u
         if pr.type in ("rain", "showers", "drizzle", "snow", "sleet", "hail", "graupel"):
             if u >= 0.6 and base["character"] == "continuous" and pr.type != "drizzle":

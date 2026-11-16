@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import weakref
 from typing import Callable, Optional
 
@@ -34,6 +35,7 @@ from .scene.manifest import (PARAMS, fmod_manifest, get_param, markdown_referenc
 from .scene.presets import PRESETS, list_presets as _list_presets, preset as _preset
 from .scene.schema import Keyframe, Listener, Place, Precipitation, RenderSettings, Scene, SceneObject, Thunder, \
     Weather, Wind
+from .scene.textparse import TextParseError
 from .scene.vibe import apply_vibe
 from .wellness.modes import apply_mode
 
@@ -43,15 +45,18 @@ __all__ = [
     "preset", "list_presets", "scene_from_text", "scene_from_metar", "scene_from_live", "load_scene",
     "render", "render_array", "play", "beaufort", "variations", "describe", "one_shots",
     "apply_vibe", "apply_mode", "manifest", "destinations", "PARAMS", "get_param", "to_json_schema",
-    "osc_namespace", "wwise_manifest", "fmod_manifest", "markdown_reference",
+    "osc_namespace", "wwise_manifest", "fmod_manifest", "markdown_reference", "render_file", "duration_seconds",
 ]
 
 SCENE_EXTENSIONS = (".json", ".yaml", ".yml", ".wxscene", ".rainscene", ".scene")
 DEFAULT_SECONDS = 60.0
 
 
-class SceneParseError(ValueError):
-    """Raised by strict parsing when free text names nothing the parser knows."""
+class SceneParseError(TextParseError):
+    """Raised by strict parsing when free text names nothing the parser knows.
+
+    A TextParseError (and so a ValueError): `except TextParseError` catches it too.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +122,14 @@ def _resolve(what, base: Optional[Scene] = None, strict: bool = False) -> tuple[
         return _preset(key), [f"preset {key}"]
     if looks_like_metar(text):
         return _from_metar(text, base), ["METAR " + text.split()[0]]
-    res = parse_text(text, base)
-    understood = [phrase for phrase, _ in res.matched]
-    if strict and not understood:
+    try:
+        res = parse_text(text, base, strict=strict)
+    except TextParseError as exc:
+        if isinstance(exc, SceneParseError):
+            raise
         hint = ", ".join(sorted(PRESETS)[:6])
-        raise SceneParseError(f"nothing recognised in {text!r}; try words like 'heavy rain', 'tin roof', "
-                              f"'wind force 6 from the west', 'thunder 3 km', or a preset ({hint}, ...)")
-    return apply_parse(res, base), understood
+        raise SceneParseError(f"{exc}; or name a preset ({hint}, ...)") from exc
+    return apply_parse(res, base), [phrase for phrase, _ in res.matched]
 
 
 def load_scene(what, base: Optional[Scene] = None) -> Scene:
@@ -182,11 +188,14 @@ def duration_seconds(seconds: Optional[float] = None, minutes: Optional[float] =
     return total
 
 
-def render(what, seconds: Optional[float] = None, minutes: Optional[float] = None, hours: Optional[float] = None,
-           out=None, layout: Optional[str] = None, destination: Optional[str] = None, seed: Optional[int] = None,
-           stems: bool = False, captions=False, mode: Optional[str] = None, progress: Optional[Callable] = None,
-           duration=None, strict: bool = False, **kw) -> RenderReport:
+def render_file(what, seconds: Optional[float] = None, minutes: Optional[float] = None,
+                hours: Optional[float] = None, out=None, layout: Optional[str] = None,
+                destination: Optional[str] = None, seed: Optional[int] = None, stems: bool = False, captions=False,
+                mode: Optional[str] = None, progress: Optional[Callable] = None, duration=None, strict: bool = False,
+                **kw) -> RenderReport:
     """Render anything that names a scene to a file; returns the report (a dict with a readable str()).
+
+    This is `raingen.render(...)` (and `raingen.api.render(...)`), see the note after it.
 
     what         Scene | dict | path to .json/.yaml/.wxscene | preset name | METAR | plain words
     seconds / minutes / hours / duration   length (summed; default 60 s)
@@ -207,6 +216,13 @@ def render(what, seconds: Optional[float] = None, minutes: Optional[float] = Non
     if understood:
         report["understood"] = understood
     return report
+
+
+# `render` is the raingen.render submodule itself, which is callable (render_file) and carries
+# render_file's signature: one object serves as the package attribute `raingen.render`, the
+# function `rg.render(...)` and the module of `from raingen.render import Renderer`, so none of
+# them can shadow another, in any import order (see raingen.render._CallableModule).
+render = sys.modules[__package__ + ".render"]
 
 
 def render_array(what, seconds: Optional[float] = None, minutes: Optional[float] = None,
@@ -233,10 +249,12 @@ def one_shots(kind: str = "thunder", count: int = 12, out_dir=None, distance_km:
     clips = thunder_one_shots(count, distance_km=distance_km, sample_rate=sample_rate, seed=seed)
     if out_dir is None:
         return clips
+    from .io.ucs import canonical_catid
     from .io.wav import StreamingWavWriter
 
     os.makedirs(out_dir, exist_ok=True)
-    base = f"WTHRThun_Thunder {distance_km:g} km one-shot_RGN_raingen" if ucs else "thunder"
+    # UCS v8.2.1: CatID_FXName_CreatorID_SourceID_UserData; WEATHER/THUNDER is CatID THUN
+    base = f"{canonical_catid('THUN')}_Thunder {distance_km:g} km one-shot_RGN_raingen" if ucs else "thunder"
     paths = []
     for i, clip in enumerate(clips, start=1):
         p = os.path.join(out_dir, f"{base}_{i:02d}.wav")
@@ -419,7 +437,8 @@ def _scene_load(cls, path: str) -> Scene:
 
 def _scene_render(self: Scene, seconds: Optional[float] = None, minutes: Optional[float] = None,
                   hours: Optional[float] = None, out=None, out_dir=None, **kw) -> RenderReport:
-    return render(self, seconds=seconds, minutes=minutes, hours=hours, out=out if out is not None else out_dir, **kw)
+    return render_file(self, seconds=seconds, minutes=minutes, hours=hours, out=out if out is not None else out_dir,
+                       **kw)
 
 
 class _RenderSlot:

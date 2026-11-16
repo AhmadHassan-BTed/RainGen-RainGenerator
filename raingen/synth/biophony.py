@@ -1,8 +1,8 @@
 """Life and towns that respond to the weather: insects, birds, frogs and traffic.
 
 Physics / ecology:
-* Crickets: Dolbear's law (Dolbear 1897) for the snowy tree cricket, N60 = 40 + 7 (T_C - 10)
-  chirps per minute (T_F = 50 + (N60 - 40) / 4); field-cricket chirp and syllable rates and
+* Crickets: Dolbear's law (Dolbear 1897) for the snowy tree cricket, T_F = 50 + (N60 - 40) / 4,
+  i.e. N60 = 4 (T_F - 50) + 40 = 7.2 T_C - 32 chirps per minute; field-cricket chirp and syllable rates and
   tree-cricket carrier frequencies scale the same way with temperature (Walker 1962). Crickets
   are silent below ~12 C, in rain above ~2 mm/h, in strong wind and by day (they start up
   toward dusk).
@@ -33,18 +33,20 @@ from scipy import signal
 
 from raingen.core.constants import SAMPLE_RATE, speed_of_sound
 from raingen.core.types import BlockContext, Emission
-from raingen.physics.atmosphere import AirAbsorptionFilter, ground_effect_sos
+from raingen.physics.atmosphere import ground_effect_sos, iso9613_alpha_db_per_m
 
-from .wind import (PendingMixer, Ramp, StatefulSOS, bandpass_sos, block_start_sample, db_spl, highpass_sos,
-                   lowpass_sos, noise_rms_gain, peaking_sos, poisson_offsets, shelter_of, slope_sos, smoothstep)
+from .wind import (AirPath, PendingMixer, Ramp, StatefulSOS, StaticSHEncoder, bandpass_sos, block_start_sample, db_spl,
+                   highpass_sos, lowpass_sos, noise_rms_gain, peaking_sos, poisson_offsets, ramp_frac, shelter_of,
+                   slope_sos, smoothstep)
 
 _SEASON_DOY = {"spring": 80, "summer": 172, "autumn": 266, "fall": 266, "winter": 355}
 TROPICAL = ("tropical",)
 
 
 def dolbear_chirps_per_min(temp_c: float) -> float:
-    """Snowy tree cricket chirp rate (Dolbear 1897): N60 = 40 + 7 (T - 10)."""
-    return max(40.0 + 7.0 * (float(temp_c) - 10.0), 0.0)
+    """Snowy tree cricket chirp rate (Dolbear 1897): T_F = 50 + (N60 - 40) / 4, so N60 = 4 (T_F - 50) + 40."""
+    t_f = 1.8 * float(temp_c) + 32.0
+    return max(4.0 * (t_f - 50.0) + 40.0, 0.0)
 
 
 def sun_times(latitude_deg: float, season: str) -> tuple[float, float]:
@@ -69,7 +71,9 @@ def _mode(v) -> str:
 
 
 def _gauss(x: float, mu: float, sigma: float) -> float:
-    return math.exp(-0.5 * ((x - mu) / sigma) ** 2)
+    """Gaussian bump, exactly 0 beyond 4 sigma (activity smoothing hides the 3e-4 step)."""
+    z = (x - mu) / sigma
+    return math.exp(-0.5 * z * z) if abs(z) < 4.0 else 0.0
 
 
 def _hour_dist(a: float, b: float) -> float:
@@ -373,8 +377,27 @@ REGION_INSECTS = {
 CICADA_REGIONS = ("mediterranean", "east_asia", "tropical", "arid", "oceania", "north_america")
 
 
+AIR_MIN_M = 8.0          # ISO 9613-1 absorption is applied to sources farther than this
+
+
+def air_gain(f_hz, distance_m: float, temp_c: float, rh_pct: float):
+    """ISO 9613-1 amplitude transmission at f_hz over distance_m (1 inside AIR_MIN_M)."""
+    if distance_m <= AIR_MIN_M:
+        return np.ones_like(np.asarray(f_hz, dtype=float))
+    return 10.0 ** (-iso9613_alpha_db_per_m(f_hz, temp_c, rh_pct) * float(distance_m) / 20.0)
+
+
+def absorb_clip(y: np.ndarray, distance_m: float, temp_c: float, rh_pct: float, sr: int) -> np.ndarray:
+    """A finished call/song as heard over distance_m: ISO 9613-1 magnitude applied once by FFT."""
+    if distance_m <= AIR_MIN_M or y.size == 0:
+        return y
+    N = 1 << int(y.size + 255).bit_length()
+    Y = np.fft.rfft(y, N) * air_gain(np.fft.rfftfreq(N, 1.0 / sr), distance_m, temp_c, rh_pct)
+    return np.fft.irfft(Y, N)[: y.size]
+
+
 class _Point:
-    """A fixed point source: geometry, spreading and air absorption."""
+    """A fixed point source: geometry and spreading (absorption is applied by each voice type)."""
 
     def __init__(self, vid: str, position, sr: int):
         self.id = vid
@@ -383,18 +406,15 @@ class _Point:
         self.dist = max(0.5, math.sqrt(x * x + y * y + z * z))
         self.az = math.atan2(y, x)
         self.el = math.atan2(z, math.hypot(x, y))
-        self.air = AirAbsorptionFilter(sr)
         self.sr = sr
 
     def emit(self, y: np.ndarray, w, spread: float = 0.05) -> Emission:
-        if self.dist > 8.0:
-            y = self.air.process(y, self.dist, w.temperature_c, w.humidity_pct)
         return Emission(signal=y, azimuth=self.az, elevation=self.el, distance=self.dist, spread=spread,
                         stem="ambience", source_id=f"bio.{self.id}")
 
 
 class _InsectVoice(_Point):
-    """One singing insect: a temperature-driven chirp/trill pattern on a carrier, in bouts."""
+    """One singing insect: a temperature-driven chirp/trill pattern on a carrier, in bouts (rendered by _InsectBank)."""
 
     def __init__(self, vid, species: str, position, cfg: np.random.Generator, sr: int):
         super().__init__(vid, position, sr)
@@ -407,52 +427,85 @@ class _InsectVoice(_Point):
         self.singing = bool(cfg.random() < 0.7)
         self.trill_len = float(cfg.uniform(2.0, 6.0))
         self.trill_gap = float(cfg.uniform(0.6, 2.5))
-        self.amp = Ramp(0.0)
         self.level = db_spl(self.spec["level"]) * float(cfg.lognormal(0.0, 0.2))
-        self.noise_f = StatefulSOS(bandpass_sos(self.spec["carrier"](20.0), 3.0, sr)) if self.spec["noise"] else None
-        self.noise_g = noise_rms_gain(self.noise_f.sos) if self.noise_f is not None else 1.0
+
+    def pattern(self, temp_c: float) -> tuple[float, float, int, float]:
+        """(chirps per second, duty, syllables per chirp, carrier Hz) at temperature temp_c."""
+        T = max(float(temp_c), 12.0)
+        spec = self.spec
+        if spec["rate"] is None:                    # long trills with gaps
+            period = self.trill_len + self.trill_gap
+            n_syll = max(1, int(round(spec["syll_rate"](T) * self.trill_len)))
+            return 1.0 / period, self.trill_len / period, n_syll, spec["carrier"](T) * self.cjit
+        return max(spec["rate"](T), 0.1) * self.jit, spec["duty"], spec["syll"], spec["carrier"](T) * self.cjit
+
+
+class _InsectBank:
+    """Every insect of the scene as one vectorised bank and one SH emission.
+
+    Each insect sings bouts (~2 min) and pauses (~20 s, shorter when conditions are good);
+    its chirps follow the species' temperature law (Dolbear for tree crickets) on a tonal
+    carrier with a slight downward glide per syllable, or band noise (katydids). Carriers are
+    narrow, so ISO 9613-1 absorption is the gain at the carrier frequency.
+    """
+
+    def __init__(self, voices: list, sr: int):
+        self.voices = voices
+        self.sr = sr
+        V = len(voices)
+        self.V = V
+        self.chirp_phase = np.array([v.chirp_phase for v in voices])
+        self.car_phase = np.array([v.car_phase for v in voices])
+        self.singing = np.array([v.singing for v in voices], dtype=bool)
+        self.level = np.array([v.level for v in voices])
+        self.dist = np.array([v.dist for v in voices])
+        self.noisy = np.array([bool(v.spec["noise"]) for v in voices], dtype=bool)
+        self.amp = Ramp(np.zeros(V))
+        self.noise_f = None
+        if np.any(self.noisy):
+            fc = INSECT_SPECIES[voices[int(np.argmax(self.noisy))].species]["carrier"](20.0)
+            self.noise_f = StatefulSOS(bandpass_sos(fc, 3.0, sr))
+            self.noise_g = noise_rms_gain(self.noise_f.sos)
+        self.encoder = StaticSHEncoder([v.az for v in voices], [v.el for v in voices], 0.05, sr=sr)
+        self._air_key = None
+        self._air = np.ones(V)
 
     def render(self, ctx: BlockContext, act: float) -> Optional[Emission]:
         w = ctx.weather
         n, sr = ctx.n, ctx.sr
         dt = n / sr
-        rng = ctx.rng.get(f"bio.insect.{self.id}", ctx.index)
-        # singing bouts (~2 min) and pauses (~20 s, shorter when conditions are good)
-        if self.singing:
-            if rng.random() < dt / 120.0:
-                self.singing = False
-        elif rng.random() < dt / 20.0 * max(act, 0.05):
-            self.singing = True
-        target = self.level * act * (1.0 if self.singing else 0.0) / self.dist
-        if target <= 0.0 and float(self.amp.value) < 1e-9:
+        rng = ctx.rng.get("bio.insects", ctx.index)
+        u = rng.random(self.V)
+        stop = self.singing & (u < dt / 120.0)
+        start = ~self.singing & (u < dt / 20.0 * max(act, 0.05))
+        self.singing = (self.singing & ~stop) | start
+        pats = [v.pattern(float(w.temperature_c)) for v in self.voices]
+        rate = np.array([p[0] for p in pats])
+        duty = np.array([p[1] for p in pats])
+        n_syll = np.array([p[2] for p in pats], dtype=float)
+        fc = np.array([p[3] for p in pats])
+        key = (round(float(w.temperature_c)), round(float(w.humidity_pct) / 5.0))
+        if key != self._air_key:
+            self._air_key = key
+            self._air = np.array([float(air_gain(f, d, float(w.temperature_c), float(w.humidity_pct)))
+                                  for f, d in zip(fc, self.dist)])
+        target = self.level * act * self.singing / self.dist * self._air
+        if not np.any(target > 0.0) and float(np.max(self.amp.value)) < 1e-9:
             return None
-        T = max(float(w.temperature_c), 12.0)
-        spec = self.spec
-        if spec["rate"] is None:                    # long trills with gaps
-            period = self.trill_len + self.trill_gap
-            rate = 1.0 / period
-            duty = self.trill_len / period
-            n_syll = max(1, int(round(spec["syll_rate"](T) * self.trill_len)))
-        else:
-            rate = max(spec["rate"](T), 0.1) * self.jit
-            duty = spec["duty"]
-            n_syll = spec["syll"]
-        ph = self.chirp_phase + rate * np.arange(1, n + 1) / sr
-        self.chirp_phase = float(ph[-1] % 1.0)
+        k = ramp_frac(n) * n
+        ph = self.chirp_phase[:, None] + rate[:, None] * (k / sr)[None, :]
+        self.chirp_phase = ph[:, -1] % 1.0
         frac = ph % 1.0
-        s = frac / duty * n_syll
-        sf = s % 1.0
-        env = np.where((frac < duty) & (sf < 0.72), np.sin(math.pi * sf / 0.72) ** 2, 0.0)
-        fc = spec["carrier"](T) * self.cjit
+        sf = (frac / duty[:, None] * n_syll[:, None]) % 1.0
+        env = np.where((frac < duty[:, None]) & (sf < 0.72), np.sin(np.pi * sf / 0.72) ** 2, 0.0)
+        cph = self.car_phase[:, None] + 2.0 * np.pi / sr * np.cumsum(fc[:, None] * (1.0 - 0.015 * sf), axis=1)
+        self.car_phase = cph[:, -1] % (2.0 * np.pi)
+        car = np.sin(cph)
         if self.noise_f is not None:
-            car = self.noise_f.process(rng.standard_normal(n)) / self.noise_g
-        else:
-            f = fc * (1.0 - 0.015 * sf)
-            cph = self.car_phase + 2.0 * math.pi * np.cumsum(f) / sr
-            self.car_phase = float(cph[-1] % (2.0 * math.pi))
-            car = np.sin(cph)
+            car[self.noisy] = self.noise_f.process(rng.standard_normal((int(np.sum(self.noisy)), n))) / self.noise_g
         y = self.amp(target, n) * env * car
-        return self.emit(y, w)
+        return Emission(signal=self.encoder.process(y), stem="ambience", is_ambisonic=True, spread=1.0,
+                        source_id="bio.insects")
 
 
 class _CicadaVoice(_Point):
@@ -482,8 +535,10 @@ class _CicadaVoice(_Point):
         pp = self.pphase + self.pulse * np.arange(1, n + 1) / sr
         self.pphase = float(pp[-1] % 1.0)
         pulses = 0.4 + 0.6 * np.sin(math.pi * (pp % 1.0)) ** 2
+        w = ctx.weather
         y = self.amp(target, n) * swell * pulses * self.filt.process(rng.standard_normal(n)) / self.g
-        return self.emit(y, ctx.weather, spread=0.15)
+        y *= float(air_gain(self.fc, self.dist, float(w.temperature_c), float(w.humidity_pct)))
+        return self.emit(y, w, spread=0.15)
 
 
 class _ChorusBed:
@@ -527,21 +582,26 @@ class _CallerVoice(_Point):
         self.busy_until = -1
         self.layer = layer
 
-    def render(self, ctx: BlockContext, act: float) -> Optional[Emission]:
-        n, sr = ctx.n, ctx.sr
+    def eligible(self, start: int, act: float) -> bool:
+        return act > 1e-3 and start >= self.busy_until
+
+    def begin(self, ctx: BlockContext, act: float, offset: int) -> None:
+        """Start a song/call `offset` samples into this block (its content from the voice's own stream)."""
+        sr = ctx.sr
         start = block_start_sample(ctx)
-        if act > 1e-3 and start >= self.busy_until:
-            rng = ctx.rng.get(f"{self.layer}.{self.id}", ctx.index)
-            offs = poisson_offsets(rng, self.per_min / 60.0 * act, n, sr)
-            if offs.size:
-                song = self.synth(rng, sr, self.pitch)
-                amp = self.level * float(rng.lognormal(0.0, 0.15)) * (0.6 + 0.4 * min(act, 1.0)) / self.dist
-                t0 = start + int(offs[0])
-                self.pending.add(t0, song * amp)
-                self.busy_until = t0 + song.size + int(rng.uniform(0.5, 3.0) * sr)
+        rng = ctx.rng.get(f"{self.layer}.{self.id}", ctx.index)
+        song = self.synth(rng, sr, self.pitch)
+        amp = self.level * float(rng.lognormal(0.0, 0.15)) * (0.6 + 0.4 * min(act, 1.0)) / self.dist
+        w = ctx.weather
+        song = absorb_clip(song * amp, self.dist, float(w.temperature_c), float(w.humidity_pct), sr)
+        t0 = start + int(offset)
+        self.pending.add(t0, song)
+        self.busy_until = t0 + song.size + int(rng.uniform(0.5, 3.0) * sr)
+
+    def render(self, ctx: BlockContext, act: float = 0.0) -> Optional[Emission]:
         if not self.pending.active:
             return None
-        y = self.pending.take(start, n)
+        y = self.pending.take(block_start_sample(ctx), ctx.n)
         return self.emit(y, ctx.weather)
 
 
@@ -629,6 +689,8 @@ class BiophonyGenerator:
                     pos = (d * math.cos(az), d * math.sin(az), -h + 0.05)
                 self.frogs.append(_CallerVoice(f"frog{k}.{sp}", synth, lvl, rate, pos, cfg, sr, "bio.frog"))
 
+        self.insect_bank = _InsectBank(self.insects, sr) if self.insects else None
+
         # weather memory
         self.rain_ema = 0.0
         self.wet_memory = 0.0
@@ -654,6 +716,9 @@ class BiophonyGenerator:
         hour = float(w.hour) % 24.0
         tropical = self.region in TROPICAL
 
+        if self.act is None and self.rain_ema == 0.0:
+            # a scene that starts in rain has been raining for a while (as the World primes its wetness)
+            self.rain_ema = R
         a = 1.0 - math.exp(-dt / 600.0)
         self.rain_ema += (R - self.rain_ema) * a
         if R < 0.1:
@@ -724,12 +789,33 @@ class BiophonyGenerator:
             for k, v in tgt.items():
                 self.act[k] += (v - self.act[k]) * (1.0 - math.exp(-dt / taus[k]))
         out = []
-        groups = ((self.insects, "insects"), (self.cicadas, "cicadas"), (self.birds, "birds"),
-                  (self.owls, "owls"), (self.frogs, "frogs"))
-        for voices, key in groups:
-            a = self.act[key]
+        if self.insect_bank is not None:
+            em = self.insect_bank.render(ctx, self.act["insects"])
+            if em is not None:
+                out.append(em)
+        for v in self.cicadas:
+            em = v.render(ctx, self.act["cicadas"])
+            if em is not None:
+                out.append(em)
+        # who starts a song/call in this block: one shared Poisson draw per eligible caller
+        n, sr = ctx.n, ctx.sr
+        start = block_start_sample(ctx)
+        callers = [(v, self.act[key]) for voices, key in ((self.birds, "birds"), (self.owls, "owls"),
+                                                           (self.frogs, "frogs"))
+                   for v in voices if v.eligible(start, self.act[key])]
+        if callers:
+            crng = ctx.rng.get("bio.calls", ctx.index)
+            lam = np.array([v.per_min / 60.0 * a * n / sr for v, a in callers])
+            counts = crng.poisson(lam)
+            offs = crng.integers(0, n, size=int(np.sum(counts))) if np.any(counts) else np.zeros(0, dtype=int)
+            pos = 0
+            for (v, a), c in zip(callers, counts):
+                if c > 0:
+                    v.begin(ctx, a, int(np.min(offs[pos:pos + c])))
+                    pos += int(c)
+        for voices in (self.birds, self.owls, self.frogs):
             for v in voices:
-                em = v.render(ctx, a)
+                em = v.render(ctx)
                 if em is not None:
                     out.append(em)
         if self.chorus is not None:
@@ -862,7 +948,7 @@ class TrafficGenerator:
         self.bed_g = noise_rms_gain(shape)
         self.hiss_f = StatefulSOS(np.vstack([highpass_sos(1500.0, sr), lowpass_sos(8000.0, sr), ge]))
         self.hiss_g = noise_rms_gain(np.vstack([highpass_sos(1500.0, sr), lowpass_sos(8000.0, sr)]))
-        self.air = AirAbsorptionFilter(sr)
+        self.air = AirPath(self.road_d, sr, min_m=8.0)
         self.bed_amp = Ramp(0.0)
         self.hiss_amp = Ramp(0.0)
         self.ou = 0.0
@@ -902,8 +988,7 @@ class TrafficGenerator:
         hiss_t = db_spl(L_bed - 10.0 + 14.0 * wet) * smoothstep(wet, 0.03, 0.4) * smoothstep(q, 0.5, 5.0)
         y = self.bed_amp(bed_t, n) * self.bed_f.process(rng.standard_normal(n)) / self.bed_g
         y = y + self.hiss_amp(hiss_t, n) * self.hiss_f.process(rng.standard_normal(n)) / self.hiss_g
-        if self.road_d > 8.0:
-            y = self.air.process(y, self.road_d, w.temperature_c, w.humidity_pct)
+        y = self.air.process(y, w.temperature_c, w.humidity_pct)
         out.append(Emission(signal=y, azimuth=self.az_c, elevation=math.atan2(0.5 - self.listener_h, self.road_d),
                             distance=self.road_d, spread=0.75 if self.road_d < 100.0 else 0.5, stem="ambience",
                             source_id="traffic.bed"))

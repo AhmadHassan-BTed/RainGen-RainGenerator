@@ -318,10 +318,34 @@ def load_sofa(path: str, sr: Optional[int] = None, length: Optional[int] = None,
     return HRTFSet(az, el, ir, sr, weights=weights, name=os.path.basename(path))
 
 
-def get_hrtf(spec="builtin", sr: int = SAMPLE_RATE, length: int = 256):
-    """'builtin' -> BuiltinHRTF; a path to a .sofa file -> HRTFSet; HRTF objects pass through."""
+@lru_cache(maxsize=4)
+def _sofa_cached(path: str, mtime_ns: int, size: int, sr: int) -> HRTFSet:
+    return load_sofa(path, sr=sr)
+
+
+def get_hrtf(spec="builtin", sr: int = SAMPLE_RATE, length: int = 256, fallback: bool = True):
+    """'builtin' -> BuiltinHRTF; a path to a .sofa file -> HRTFSet; HRTF objects pass through.
+
+    SOFA sets are cached per (path, modification time). When no SOFA reader is installed
+    (h5py or netCDF4), `fallback=True` logs a warning and returns the built-in head instead
+    of failing the whole render; a missing or malformed file still raises.
+    """
     if isinstance(spec, (HRTFSet, BuiltinHRTF)):
         return spec
     if spec is None or str(spec).lower() in ("", "builtin", "default", "spherical", "spherical_head"):
         return _builtin_cached(int(sr), int(length), ())
-    return load_sofa(str(spec), sr=sr)
+    path = os.path.abspath(os.path.expanduser(str(spec)))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"HRTF file not found: {spec}")
+    st = os.stat(path)
+    try:
+        return _sofa_cached(path, int(st.st_mtime_ns), int(st.st_size), int(sr))
+    except ImportError as exc:
+        if not fallback:
+            raise
+        import logging
+        import warnings
+        msg = f"{exc}; using the built-in spherical-head HRTF instead of {os.path.basename(path)}"
+        logging.getLogger(__name__).warning(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        return _builtin_cached(int(sr), int(length), ())

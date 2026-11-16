@@ -4,9 +4,14 @@ Stored units are fixed (2.10): mm/h, m/s, degC, hPa, m / km, and degrees true
 *from* (meteorological convention). Everything a person types or reads goes
 through this module.
 
-Exact conversion factors: 1 kn = 0.514444 m/s (1852 m / 3600 s), 1 mph =
+Exact conversion factors: 1 kn = 1852 m / 3600 s (0.5144 m/s), 1 mph =
 0.44704 m/s, 1 km/h = 1/3.6 m/s, 1 in = 25.4 mm, 1 mi = 1.609344 km,
-1 NM = 1.852 km, 1 ft = 0.3048 m, 1 inHg = 33.8639 hPa.
+1 NM = 1.852 km, 1 ft = 0.3048 m, 1 inHg = 25.4 mm x 13595.1 kg/m^3 x g_n
+= 33.8639 hPa, 1 mmHg = 133.322387415 Pa.
+
+Readouts round-trip: `parse_value(path, format_value(path, v))` recovers v to
+the precision shown, because parse_value also accepts a whole readout
+("force 5, fresh breeze, 9.4 m/s (34 km/h)") and reads its most precise part.
 
 Beaufort: WMO / Met Office scale (WMO-No. 306), continuous fit
 v = 0.836 * B^1.5 m/s at 10 m. Rain-rate words: WMO (WMO-No. 8; slight < 2.5,
@@ -27,7 +32,7 @@ from ..core.constants import speed_of_sound
 # ---------------------------------------------------------------------------
 # Exact factors
 # ---------------------------------------------------------------------------
-KN_TO_MPS = 0.514444
+KN_TO_MPS = 1852.0 / 3600.0                      # international knot (exact)
 MPH_TO_MPS = 0.44704
 KMH_TO_MPS = 1.0 / 3.6
 FTS_TO_MPS = 0.3048
@@ -35,8 +40,8 @@ IN_TO_MM = 25.4
 MI_TO_KM = 1.609344
 NM_TO_KM = 1.852
 FT_TO_M = 0.3048
-INHG_TO_HPA = 33.8639
-MMHG_TO_HPA = 1.333224
+INHG_TO_HPA = 0.0254 * 13595.1 * 9.80665 / 100.0  # conventional inHg (0 degC mercury, g_n): 33.86389 hPa
+MMHG_TO_HPA = 1.33322387415                       # conventional mmHg = 133.322387415 Pa
 
 COMPASS16 = (
     "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
@@ -258,13 +263,25 @@ _DISTANCE_WORDS = {
 }
 
 
+_FLASH_TO_BANG = re.compile(r"\b(?:flash[- ]?(?:to|and)[- ]?(?:bang|thunder)|flash[- ]?bang|f2b)\b")
+
+
 def parse_distance_km(s: Any, temp_c: float = 20.0) -> float:
-    """Distance -> km. Accepts '3 km', '800 m', '2 mi', '5 NM', '9 s' (flash-to-bang at temp_c), words."""
+    """Distance -> km. Accepts '3 km', '800 m', '2 mi', '5 NM', words, and flash-to-bang
+    seconds at temp_c: '9 s', 'flash-to-bang 9 s', '9 s flash-to-bang', 'about 9 seconds flash to bang'."""
     if _is_number(s):
         return float(s)
     t = _norm(s)
     if t in _DISTANCE_WORDS:
         return _DISTANCE_WORDS[t]
+    if _FLASH_TO_BANG.search(t):
+        rest = re.sub(r"\b(?:about|approx\.?|approximately|around|of|is|count(?:ed|ing)?)\b", " ",
+                      _FLASH_TO_BANG.sub(" ", t))
+        v, unit = _split(rest.strip(" :=,"))
+        if _clean_unit(unit).rstrip(".") in ("", "s", "sec", "secs", "second", "seconds"):
+            return seconds_to_km(v, temp_c)
+        raise ValueError(f"flash-to-bang needs seconds, got {unit!r} in {s!r}")
+    t = re.sub(r"^(?:about|approx\.?|approximately|around)\s+", "", t)
     v, unit = _split(t)
     u = _clean_unit(unit).rstrip(".")
     if u in ("", "km", "kms", "kilometre", "kilometres", "kilometer", "kilometers", "k"):
@@ -279,7 +296,7 @@ def parse_distance_km(s: Any, temp_c: float = 20.0) -> float:
         return v * FT_TO_M / 1000.0
     if u in ("yd", "yard", "yards"):
         return v * 0.9144 / 1000.0
-    if u in ("s", "sec", "secs", "second", "seconds", "sflash-to-bang", "secondsflash-to-bang"):
+    if u in ("s", "sec", "secs", "second", "seconds"):
         return seconds_to_km(v, temp_c)
     raise ValueError(f"unknown distance unit {unit!r} in {s!r}")
 
@@ -441,17 +458,18 @@ def parse_hail_size_mm(s: Any) -> float:
     if _is_number(s):
         return float(s)
     t = _norm(s)
+    if re.match(r"^\s*[+\-−]?(?:\d|[.,]\d)", t):     # an explicit size wins over an object name
+        v, unit = _split(re.sub(r"\([^()]*\)", " ", t).strip())   # '15 mm (marble)': the aside is a label
+        u = _clean_unit(unit)
+        if u in ("", "mm"):
+            return v
+        if u in ("cm",):
+            return v * 10.0
+        if u in ("in", "inch", "inches", '"'):
+            return v * IN_TO_MM
     for name, mm in sorted(_HAIL_SIZES_MM, key=lambda kv: -len(kv[0])):
         if name in t:
             return mm
-    v, unit = _split(t)
-    u = _clean_unit(unit)
-    if u in ("", "mm"):
-        return v
-    if u in ("cm",):
-        return v * 10.0
-    if u in ("in", "inch", "inches", '"'):
-        return v * IN_TO_MM
     raise ValueError(f"unknown hail size {s!r}")
 
 
@@ -468,13 +486,50 @@ def parse_bool(s: Any) -> bool:
     raise ValueError(f"cannot parse boolean {s!r}")
 
 
+_STARTS_NUMERIC = re.compile(r"^[+\-−]?(?:\d|[.,]\d)")
+
+
+def _readout_parts(s: str) -> tuple[list[str], list[str]]:
+    """Split a readout like 'force 5, fresh breeze, 9.4 m/s (34 km/h)' into (numeric, other)
+    pieces: comma-space / ' · ' / ';' separated segments and parenthesised asides. Decimal
+    commas ('12,5') are not separators. Numeric pieces keep their order of appearance."""
+    if not re.search(r",\s|\(|\s·\s|;", s):
+        return [], []
+    asides = re.findall(r"\(([^()]*)\)", s)
+    main = re.sub(r"\([^()]*\)", " ", s)
+    pieces = [p.strip() for p in re.split(r",\s+|\s+·\s+|;\s*", main) + asides]
+    pieces = [p for p in pieces if p]
+    numeric = [p for p in pieces if _STARTS_NUMERIC.match(p)]
+    return numeric, [p for p in pieces if not _STARTS_NUMERIC.match(p)]
+
+
 def parse_value(path: str, value: Any, temp_c: float = 20.0) -> Any:
     """Parse a human value for the stored unit implied by a scene path's suffix.
 
     Non-string values pass through unchanged. Unknown suffixes fall back to float().
+    A whole readout from `format_value` is accepted too: its numeric pieces are tried
+    first ('9.4 m/s' before 'force 5'), so formatting and parsing round-trip.
     """
     if not isinstance(value, str):
         return value
+    numeric, other = _readout_parts(value)
+    for part in numeric:
+        try:
+            return _parse_one(path, part, temp_c)
+        except ValueError:
+            continue
+    try:
+        return _parse_one(path, value, temp_c)
+    except ValueError:
+        for part in other:
+            try:
+                return _parse_one(path, part, temp_c)
+            except ValueError:
+                continue
+        raise
+
+
+def _parse_one(path: str, value: str, temp_c: float) -> Any:
     leaf = path.rsplit(".", 1)[-1]
     if re.fullmatch(r"\s*[+\-−]?(?:\d+(?:[.,]\d+)?|[.,]\d+)\s*", value):
         return _num(value)                     # bare numbers are already in stored units
@@ -492,6 +547,11 @@ def parse_value(path: str, value: Any, temp_c: float = 20.0) -> Any:
         return parse_direction_deg(value)
     if leaf.endswith("_hpa"):
         return parse_pressure_hpa(value)
+    if leaf.endswith("_pct"):
+        m = re.fullmatch(r"\s*([+\-−]?(?:\d+(?:[.,]\d+)?|[.,]\d+))\s*(?:%|pct|percent|per\s*cent)?\s*", value.lower())
+        if not m:
+            raise ValueError(f"cannot parse percentage {value!r}")
+        return _num(m.group(1))
     if leaf == "hail_size_mm":
         return parse_hail_size_mm(value)
     if leaf.endswith("_m"):
@@ -641,8 +701,7 @@ def format_value(path: str, value: Any, system: str = "metric", temp_c: float = 
             return f"{_sig(v / IN_TO_MM, 2)} in/h ({_sig(v, 2)} mm/h), {label}"
         return f"{_sig(v, 2)} mm/h, {label}"
     if leaf.endswith("_mps"):
-        b = mps_to_beaufort(v)
-        force = beaufort_force(v)
+        force = beaufort_force(v)                   # WMO band, consistent with the 0.836 B^1.5 fit at integers
         name = BEAUFORT_NAMES[force]
         if system == "us":
             return f"{v / MPH_TO_MPS:.0f} mph, {name} (force {force})"

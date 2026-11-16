@@ -10,7 +10,9 @@ a rolling 7-day window kept in hourly bins. Digital level is mapped to SPL by a
 calibration constant: the SPL (dB re 20 uPa) produced by a full-scale sine at
 the current device volume. A-weighting is the IEC 61672-1 analog prototype
 (poles 20.6, 107.7, 737.9, 12194 Hz) through the bilinear transform,
-normalised to 0 dB at 1 kHz. The louder ear is metered (conservative).
+normalised to 0 dB at 1 kHz. The louder ear is metered (conservative): each ear's
+exposure is integrated separately and the larger one counts, per hourly bin, so the
+result does not depend on the block length.
 When the allowance is exceeded `recommended_gain()` brings playback back to the
 reference level; that limit sits outside the parameter graph (2.7).
 """
@@ -82,10 +84,12 @@ class DoseMeter:
         self.start_time_s = float(start_time_s if start_time_s is not None else time.time())
         self._sos = a_weighting_sos(self.sr)
         self._zi: Optional[np.ndarray] = None
-        self.bins: dict[int, float] = {}          # epoch hour -> Pa^2 h
+        self.bins: dict[int, float] = {}          # epoch hour -> Pa^2 h of the louder ear in that hour
+        self._ear_bins: dict[int, np.ndarray] = {}  # epoch hour -> Pa^2 h per ear
+        self._ear_session: Optional[np.ndarray] = None
         self.session_dose = 0.0
         self.session_seconds = 0.0
-        self._recent: list[tuple[float, float]] = []   # (seconds, mean p^2) for short-term LAeq
+        self._recent: list[tuple[float, np.ndarray]] = []   # (seconds, mean p^2 per ear) for short-term LAeq
         self._recent_s = 0.0
         self._processed = 0
 
@@ -98,7 +102,8 @@ class DoseMeter:
         self.calibration_db_spl = float(db_spl_full_scale)
 
     def process(self, x: np.ndarray, now_s: Optional[float] = None, volume_gain: float = 1.0) -> float:
-        """Accumulate the dose for one block (C, n) or (n,); returns this block's Pa^2 h.
+        """Accumulate the dose for one block (C, n) or (n,); returns the Pa^2 h this block added to
+        the louder ear's hourly bin.
 
         `now_s` is the wall-clock epoch time at the block (defaults to start + audio time),
         `volume_gain` any post-meter playback gain (linear)."""
@@ -111,14 +116,23 @@ class DoseMeter:
         if self._zi is None or self._zi.shape[1] != C:
             self._zi = np.zeros((self._sos.shape[0], C, 2))
         xa, self._zi = signal.sosfilt(self._sos, x * float(volume_gain), axis=-1, zi=self._zi)
-        ms = float(np.max(np.mean(xa * xa, axis=1)))
-        p2 = ms * self.pa_per_unit ** 2
+        np.copyto(self._zi, 0.0, where=np.abs(self._zi) < 1e-30)  # no subnormal limit cycle on silence
+        p2 = np.mean(xa * xa, axis=1) * self.pa_per_unit ** 2       # per ear, Pa^2
         dt_s = n / self.sr
-        dose = p2 * dt_s / 3600.0
+        dose = p2 * dt_s / 3600.0                                   # per ear, Pa^2 h
         t = float(now_s) if now_s is not None else self.start_time_s + self._processed / self.sr
         hour = int(t // 3600.0)
-        self.bins[hour] = self.bins.get(hour, 0.0) + dose
-        self.session_dose += dose
+        ear = self._ear_bins.get(hour)
+        if ear is None or ear.shape != dose.shape:
+            ear = np.full(C, self.bins.get(hour, 0.0))
+        before = self.bins.get(hour, 0.0)
+        ear = ear + dose
+        self._ear_bins[hour] = ear
+        self.bins[hour] = float(np.max(ear))
+        if self._ear_session is None or self._ear_session.shape != dose.shape:
+            self._ear_session = np.full(C, self.session_dose)
+        self._ear_session = self._ear_session + dose
+        self.session_dose = float(np.max(self._ear_session))
         self.session_seconds += dt_s
         self._processed += n
         self._recent.append((dt_s, p2))
@@ -128,11 +142,12 @@ class DoseMeter:
             self._recent_s -= d
         if len(self.bins) > self.window_h * 2:
             self._prune(hour)
-        return dose
+        return self.bins[hour] - before
 
     def _prune(self, now_hour: int) -> None:
         for h in [h for h in self.bins if h <= now_hour - self.window_h]:
             del self.bins[h]
+            self._ear_bins.pop(h, None)
 
     def _now_hour(self, now_s: Optional[float]) -> int:
         t = float(now_s) if now_s is not None else self.start_time_s + self._processed / self.sr
@@ -163,7 +178,7 @@ class DoseMeter:
         """LAeq over the last ~60 s of audio."""
         if self._recent_s <= 0:
             return -math.inf
-        p2 = sum(d * v for d, v in self._recent) / self._recent_s
+        p2 = float(np.max(sum(d * v for d, v in self._recent) / self._recent_s))   # the louder ear
         return 10.0 * math.log10(p2 / P_REF ** 2 + 1e-30)
 
     def remaining_hours(self, level_dba: Optional[float] = None, now_s: Optional[float] = None) -> float:

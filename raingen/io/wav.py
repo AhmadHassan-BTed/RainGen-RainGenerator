@@ -10,14 +10,17 @@ Layout written up front (never holding the audio in memory):
       bext                    EBU Tech 3285 v2: description, originator, date/time,
                               TimeReference (samples since midnight), UMID, loudness x100
                               (integrated, LRA, max true peak, max momentary, max short-term;
-                              0x7FFF = unknown), CodingHistory
+                              0x7FFF = not set, also used for -inf/NaN), CodingHistory
       iXML                    iXML 2.x with UCS fields and the full scene in <USER>
       data                    interleaved little-endian int16 / int24 / float32
 
-On close, when the RIFF size exceeds 2 GiB the header is rewritten in place to RF64
-(EBU Tech 3306): 'RIFF' -> 'RF64' (or 'BW64', ITU-R BS.2088), the JUNK chunk becomes
-'ds64' carrying the 64-bit RIFF/data sizes and sample count, and the 32-bit size fields
-are set to 0xFFFFFFFF.
+On close, when the RIFF size exceeds 2 GiB (or `rf64_threshold`; 0 forces RF64) the header
+is rewritten in place to RF64 (EBU Tech 3306): 'RIFF' -> 'RF64' (or 'BW64', ITU-R BS.2088),
+the JUNK chunk becomes 'ds64' carrying the 64-bit RIFF/data sizes and sample count, and the
+32-bit size fields are set to 0xFFFFFFFF.
+
+The writer itself writes in place; callers that need an atomic result write to a temporary
+name and move it with os.replace() (which, unlike os.rename, overwrites on Windows too).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import math
+import re
 import struct
 from typing import Any, Optional
 from xml.sax.saxutils import escape
@@ -56,14 +60,46 @@ def layout_channel_mask(layout: Optional[str], channels: int) -> int:
     return _DEFAULT_MASKS.get(int(channels), 0)
 
 
-def timecode_to_seconds(tc: str, fps: float) -> float:
-    """'HH:MM:SS:FF' (or ';' drop-frame separator, treated as nominal) -> seconds."""
-    parts = str(tc).replace(";", ":").replace(".", ":").split(":")
+def exact_fps(fps: float) -> float:
+    """Frame rate as used for real time: 29.97 -> 30000/1001, 23.976 -> 24000/1001, 25 -> 25."""
+    rate = float(fps)
+    if abs(rate - round(rate)) > 1e-6:
+        r1001 = rate * 1001.0 / 1000.0
+        if abs(r1001 - round(r1001)) < 0.01:
+            return round(r1001) * 1000.0 / 1001.0
+    return rate
+
+
+def timecode_to_frames(tc: str, fps: float) -> int:
+    """'HH:MM:SS:FF' -> frame count since 00:00:00:00.
+
+    A ';' before the frames marks SMPTE drop-frame (29.97 / 59.94): frame numbers 0-1 (0-3
+    at 59.94) are skipped every minute except every tenth (SMPTE ST 12-1).
+    """
+    text = str(tc).strip()
+    drop = ";" in text
+    parts = text.replace(";", ":").replace(".", ":").split(":")
     if len(parts) != 4:
         raise ValueError(f"bad timecode {tc!r}")
     h, m, s, f = (int(p) for p in parts)
-    nominal = round(float(fps))
-    return h * 3600.0 + m * 60.0 + s + f / float(nominal)
+    nominal = int(round(float(fps)))
+    frames = ((h * 60 + m) * 60 + s) * nominal + f
+    if drop:
+        if nominal not in (30, 60):
+            raise ValueError(f"drop-frame timecode needs 29.97 or 59.94 fps, got {fps}")
+        per_min = nominal // 15                       # 2 at 29.97, 4 at 59.94
+        minutes = h * 60 + m
+        frames -= per_min * (minutes - minutes // 10)
+    return frames
+
+
+def timecode_to_seconds(tc: str, fps: float) -> float:
+    """'HH:MM:SS:FF' -> seconds of real time (frames / fps, so 29.97 NDF runs 0.1 % slow).
+
+    ';' marks drop-frame. 01:00:00:00 at 25 fps -> 3600 s; at 29.97 NDF -> 3603.6 s; at
+    29.97 DF ('01:00:00;00') -> 3599.9964 s.
+    """
+    return timecode_to_frames(tc, fps) / exact_fps(fps)
 
 
 def _ascii(text: Any, size: int) -> bytes:
@@ -72,6 +108,11 @@ def _ascii(text: Any, size: int) -> bytes:
 
 
 def _loudness_x100(v: Optional[float]) -> int:
+    """Tech 3285 v2 loudness field: round(100 x value) as int16; 0x7FFF = not set.
+
+    Non-finite readings (-inf for silence, NaN) have no representable value and are written as
+    'not set', never as a fake -327.68 LUFS.
+    """
     if v is None:
         return _LOUDNESS_UNKNOWN
     try:
@@ -79,8 +120,8 @@ def _loudness_x100(v: Optional[float]) -> int:
     except (TypeError, ValueError):
         return _LOUDNESS_UNKNOWN
     if not math.isfinite(f):
-        return _LOUDNESS_UNKNOWN if f > 0 else -32768
-    return int(max(-32768, min(32766, round(f * 100.0))))
+        return _LOUDNESS_UNKNOWN
+    return int(max(-32768, min(_LOUDNESS_UNKNOWN - 1, round(f * 100.0))))
 
 
 def build_bext(bext: dict, sr: int, channels: int, bit_depth: int) -> bytes:
@@ -125,13 +166,32 @@ def build_bext(bext: dict, sr: int, channels: int, bit_depth: int) -> bytes:
     return payload
 
 
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
 def _xml(tag: str, value: Any, indent: str = "    ") -> str:
-    return f"{indent}<{tag}>{escape(str(value))}</{tag}>\n"
+    text = _XML_ILLEGAL.sub(" ", str(value))                  # XML 1.0 forbids most C0 controls
+    return f"{indent}<{tag}>{escape(text)}</{tag}>\n"
+
+
+def _xml_tag(name: Any) -> str:
+    tag = "".join(ch for ch in str(name).upper() if ch.isascii() and (ch.isalnum() or ch == "_")) or "FIELD"
+    if tag[0].isdigit() or tag.startswith("XML"):
+        tag = "F_" + tag                                      # names may not start with a digit or 'xml'
+    return tag
+
+
+def _timecode_rate(fps: float) -> str:
+    """iXML TIMECODE_RATE as a ratio: 25 -> '25/1', 29.97 -> '30000/1001', 23.976 -> '24000/1001'."""
+    f = float(fps)
+    if abs(f - round(f)) < 1e-6:
+        return f"{int(round(f))}/1"
+    return f"{int(round(f * 1001.0 / 1000.0)) * 1000}/1001"
 
 
 def build_ixml(ucs: Optional[dict] = None, scene: Any = None, channel_names: Optional[list] = None,
                project: str = "raingen", note: str = "", extra: Optional[dict] = None,
-               fps: Optional[float] = None, sr: Optional[int] = None) -> str:
+               fps: Optional[float] = None, sr: Optional[int] = None, drop_frame: bool = False) -> str:
     """iXML document with UCS fields and the scene JSON inside <USER>."""
     from .. import __version__ as engine_version
 
@@ -159,8 +219,8 @@ def build_ixml(ucs: Optional[dict] = None, scene: Any = None, channel_names: Opt
     if fps is not None or sr is not None:
         out.append("  <SPEED>\n")
         if fps is not None:
-            out.append(_xml("TIMECODE_RATE", f"{int(round(fps))}/1"))
-            out.append(_xml("TIMECODE_FLAG", "NDF"))
+            out.append(_xml("TIMECODE_RATE", _timecode_rate(fps)))
+            out.append(_xml("TIMECODE_FLAG", "DF" if drop_frame else "NDF"))
         if sr is not None:
             out.append(_xml("FILE_SAMPLE_RATE", int(sr)))
             out.append(_xml("DIGITIZER_SAMPLE_RATE", int(sr)))
@@ -192,8 +252,7 @@ def build_ixml(ucs: Optional[dict] = None, scene: Any = None, channel_names: Opt
     if seed is not None:
         out.append(_xml("RAINGEN_SEED", f"0x{int(seed):X}"))
     for k, v in (extra or {}).items():
-        tag = "".join(ch for ch in str(k).upper() if ch.isalnum() or ch == "_") or "FIELD"
-        out.append(_xml(tag, v if not isinstance(v, (dict, list)) else json.dumps(v)))
+        out.append(_xml(_xml_tag(k), v if not isinstance(v, (dict, list)) else json.dumps(v)))
     if scene_json is not None:
         out.append(_xml("RAINGEN_SCENE", scene_json))
     out.append("  </USER>\n</BWFXML>\n")
@@ -239,13 +298,20 @@ class StreamingWavWriter:
         if self.is_float:
             self._fact_pos = f.tell() + 8
             f.write(_chunk(b"fact", struct.pack("<I", 0)))
+        # Metadata chunks are kept even-sized so no RIFF pad byte follows them: libsndfile's
+        # RF64 reader does not skip pad bytes and would lose the 'data' chunk.
         self._bext_loudness_pos = None
         if bext is not None:
             payload = build_bext(bext, self.sr, self.channels, self.bit_depth)
+            if len(payload) % 2:
+                payload += b"\0"                               # NUL after the CodingHistory text
             self._bext_loudness_pos = f.tell() + 8 + _BEXT_LOUDNESS_OFFSET
             f.write(_chunk(b"bext", payload))
         if ixml:
-            f.write(_chunk(b"iXML", ixml.encode("utf-8")))
+            doc = ixml.encode("utf-8")
+            if len(doc) % 2:
+                doc += b"\n"                                   # trailing whitespace is legal XML
+            f.write(_chunk(b"iXML", doc))
         f.write(b"data")
         self._data_size_pos = f.tell()
         f.write(struct.pack("<I", 0))
@@ -444,15 +510,27 @@ class FlacWriter:
         return False
 
 
+def _target_ext(path: str) -> str:
+    """Extension of the final file, ignoring a temporary suffix ('x.flac.part' -> '.flac')."""
+    p = str(path).lower()
+    for tmp in (".part", ".tmp", ".partial"):
+        if p.endswith(tmp):
+            p = p[: -len(tmp)]
+    dot = p.rfind(".")
+    return p[dot:] if dot >= 0 else ""
+
+
 def open_writer(path: str, sr: int, channels: int, bit_depth: int = 24, metadata: Optional[dict] = None):
     """Open a streaming writer chosen by extension (.flac -> FLAC, else BWF/RF64 WAV).
 
+    A temporary suffix (.part/.tmp) is ignored when choosing, so 'x.flac.part' is FLAC.
+
     metadata keys (all optional): bext (dict), ixml (str), ucs (dict), scene (Scene|dict|str),
-    layout (str), channel_mask (int), channel_names (list), bw64 (bool), fps, start_tc,
-    title/artist/comment (FLAC).
+    layout (str), channel_mask (int), channel_names (list), bw64 (bool), rf64 (bool: force the
+    RF64/ds64 header even for a small file), fps, start_tc, title/artist/comment (FLAC).
     """
     md = dict(metadata or {})
-    if str(path).lower().endswith(".flac"):
+    if _target_ext(path) == ".flac":
         return FlacWriter(path, sr, channels, bit_depth, md)
     mask = md.get("channel_mask")
     if mask is None:
@@ -460,7 +538,8 @@ def open_writer(path: str, sr: int, channels: int, bit_depth: int = 24, metadata
     ixml = md.get("ixml")
     if ixml is None and (md.get("ucs") or md.get("scene") is not None):
         ixml = build_ixml(md.get("ucs"), md.get("scene"), md.get("channel_names"),
-                          fps=md.get("fps"), sr=sr, extra=md.get("ixml_extra"))
+                          fps=md.get("fps"), sr=sr, extra=md.get("ixml_extra"),
+                          drop_frame=";" in str(md.get("start_tc") or ""))
     bext = md.get("bext")
     if bext is None and (md.get("ucs") or md.get("scene") is not None or md.get("start_tc")):
         ucs = md.get("ucs") or {}
@@ -480,4 +559,5 @@ def open_writer(path: str, sr: int, channels: int, bit_depth: int = 24, metadata
             bext["start_tc"] = md["start_tc"]
             bext["fps"] = md.get("fps", 24)
     return StreamingWavWriter(path, sr, channels, bit_depth, bext=bext, ixml=ixml, channel_mask=mask,
+                              rf64_threshold=0 if md.get("rf64") else RF64_THRESHOLD,
                               bw64=bool(md.get("bw64", False)))

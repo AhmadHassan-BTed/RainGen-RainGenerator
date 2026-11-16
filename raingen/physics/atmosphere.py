@@ -30,6 +30,7 @@ from scipy.special import wofz
 from ..core.constants import SAMPLE_RATE, speed_of_sound
 
 _PASSTHROUGH = np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]])
+_DENORMAL_FLUSH = 1e-30       # filter states below this are zeroed (subnormal stalls)
 
 
 # ------------------------------------------------------------------ ISO 9613-1
@@ -117,44 +118,225 @@ def _sos_mag_db(sos: np.ndarray, f: np.ndarray, sr: float) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ absorption filter design
-_SHELF_CORNERS = (125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0)
-_MAX_LOSS_DB = 100.0
-_DIST_STEP = 1.02            # 2 % distance quantization of the design cache
+_FIT_DB = 40.0               # match ISO 9613-1 (< 1 dB) wherever the loss is at most this
+_DEEP_DB = 60.0              # beyond: penalise only too little attenuation (target min(loss, this))
+_DEEP_SLOPE = 24.0           # dB/oct: the deep target rises from 40 dB no faster than the low-pass can
+_DIST_STEP = 1.01            # 1 % distance quantization of the design cache
+_BW4_Q = (0.5411961, 1.3065630)     # 4th-order Butterworth as two biquads
+_LATTICE_OCT = 0.4           # shelf corners sit on 1000 Hz * 2^(0.4 k)
+_GAIN_STEP_DB = 0.25         # tabulated shelf cuts 0 .. _GAIN_MAX_DB
+_GAIN_MAX_DB = 80.0
+_LP_STEP_OCT = 0.05          # tabulated low-pass corners 100 Hz * 2^(0.05 j)
+_N_FIT_F = 96
 
 
-@lru_cache(maxsize=1024)
+def _shelf_bank(corners, cut_db, sr: float) -> np.ndarray:
+    """RBJ high shelves (S = 1) cutting `cut_db` (>= 0) at `corners`, vectorized -> (..., 6)."""
+    A = 10.0 ** (-np.asarray(cut_db, dtype=float) / 40.0)
+    w0 = 2.0 * np.pi * np.asarray(corners, dtype=float) / sr
+    cw, sw = np.cos(w0), np.sin(w0)
+    sa = np.sqrt(A) * sw * math.sqrt(2.0)
+    a0 = (A + 1) - (A - 1) * cw + sa
+    rows = np.stack([A * ((A + 1) + (A - 1) * cw + sa), -2.0 * A * ((A - 1) + (A + 1) * cw),
+                     A * ((A + 1) + (A - 1) * cw - sa), a0, 2.0 * ((A - 1) - (A + 1) * cw),
+                     (A + 1) - (A - 1) * cw - sa], axis=-1)
+    return rows / a0[..., None]
+
+
+def _butter4_lowpass(fc, sr: float) -> np.ndarray:
+    """4th-order Butterworth low-pass as two biquads; `fc` scalar -> (2, 6), array -> (..., 2, 6)."""
+    w0 = 2.0 * np.pi * np.asarray(fc, dtype=float) / sr
+    cw, sw = np.cos(w0), np.sin(w0)
+    rows = []
+    for q in _BW4_Q:
+        al = sw / (2.0 * q)
+        a0 = 1.0 + al
+        rows.append(np.stack([(1 - cw) / 2, 1 - cw, (1 - cw) / 2, a0, -2 * cw, 1 - al], axis=-1) / a0[..., None])
+    return np.stack(rows, axis=-2)
+
+
+def _att_db(rows: np.ndarray, c1: np.ndarray, c2: np.ndarray) -> np.ndarray:
+    """Attenuation (dB, > 0 = cut) of biquad rows (..., 6) at cos(w) = c1, cos(2w) = c2 -> (..., F)."""
+    b0, b1, b2, a0, a1, a2 = (rows[..., i][..., None] for i in range(6))
+    num = b0 * b0 + b1 * b1 + b2 * b2 + 2.0 * (b0 * b1 + b1 * b2) * c1 + 2.0 * b0 * b2 * c2
+    den = a0 * a0 + a1 * a1 + a2 * a2 + 2.0 * (a0 * a1 + a1 * a2) * c1 + 2.0 * a0 * a2 * c2
+    return 10.0 * np.log10(np.maximum(den, 1e-300) / np.maximum(num, 1e-300))
+
+
+class _DesignTables:
+    """Per-sample-rate lookup of shelf and low-pass responses on the fit frequency grid.
+
+    The fitter evaluates the cascade hundreds of times; tabulating each lattice shelf's
+    response against its cut (0.25 dB steps) and the low-pass against its corner (0.05 oct)
+    turns every evaluation (and its exact Jacobian) into a gather plus linear interpolation.
+    """
+
+    def __init__(self, sr: int):
+        self.sr = float(sr)
+        self.f = np.geomspace(20.0, 0.45 * sr, _N_FIT_F)
+        w = 2.0 * np.pi * self.f / sr
+        c1, c2 = np.cos(w), np.cos(2.0 * w)
+        k_lo = int(math.ceil(math.log2(25.0 / 1000.0) / _LATTICE_OCT))
+        k_hi = int(math.floor(math.log2(0.42 * sr / 1000.0) / _LATTICE_OCT))
+        self.corners = 1000.0 * 2.0 ** (_LATTICE_OCT * np.arange(k_lo, k_hi + 1))
+        self.gains = np.arange(0.0, _GAIN_MAX_DB + 0.5 * _GAIN_STEP_DB, _GAIN_STEP_DB)
+        rows = _shelf_bank(self.corners[:, None], self.gains[None, :], self.sr)        # (K, G, 6)
+        self.shelf = _att_db(rows, c1, c2)                                               # (K, G, F)
+        j_hi = int(math.floor(math.log2(0.46 * sr / 100.0) / _LP_STEP_OCT))
+        self.lp_log = math.log(100.0) + _LP_STEP_OCT * math.log(2.0) * np.arange(j_hi + 1)
+        self.lp = _att_db(_butter4_lowpass(np.exp(self.lp_log), self.sr), c1, c2).sum(axis=-2)   # (J, F)
+
+    def shelves(self, idx: np.ndarray, g: np.ndarray):
+        """(responses (K, F), d response / d gain (K, F)) of lattice shelves `idx` at cuts `g`."""
+        x = np.clip(g, 0.0, _GAIN_MAX_DB) / _GAIN_STEP_DB
+        i0 = np.minimum(x.astype(int), self.gains.size - 2)
+        t = (x - i0)[:, None]
+        lo = self.shelf[idx, i0]
+        hi = self.shelf[idx, i0 + 1]
+        return lo + (hi - lo) * t, (hi - lo) / _GAIN_STEP_DB
+
+    def lowpass(self, log_fc: float):
+        x = (log_fc - self.lp_log[0]) / (self.lp_log[1] - self.lp_log[0])
+        x = min(max(x, 0.0), self.lp_log.size - 1.000001)
+        j = int(x)
+        t = x - j
+        lo, hi = self.lp[j], self.lp[j + 1]
+        return lo + (hi - lo) * t, (hi - lo) / (self.lp_log[1] - self.lp_log[0])
+
+
+@lru_cache(maxsize=4)
+def _design_tables(sr: int) -> _DesignTables:
+    return _DesignTables(sr)
+
+
+def _fit_absorption(loss_db: np.ndarray, tab: _DesignTables) -> np.ndarray:
+    """Fit lattice high shelves (+ a Butterworth low-pass for the steep top) to `loss_db`.
+
+    The ISO loss grows ~f^2, i.e. its slope in dB/octave keeps growing (~55 dB/oct at a
+    40 dB loss), which no single second-order section can follow. Lattice corners are
+    used every 0.4 octave where the loss exceeds 10 dB, every 0.8 octave down to 2 dB and
+    every 1.6 octave below; their cuts (plus the low-pass corner when the top of the band
+    is lost anyway) are solved by Levenberg-Marquardt on the tabulated exact responses.
+    Inside the fit region (loss <= _FIT_DB) the residual is two-sided, above it only too
+    little attenuation is penalised, against a target that ramps from 40 dB at 24 dB/oct
+    (capped at min(loss, 60 dB)).
+    """
+    f, sr = tab.f, tab.sr
+    fit_sel = loss_db <= _FIT_DB
+    use_lp = bool(loss_db[-1] > _DEEP_DB)
+    f_lo = float(np.interp(0.03, loss_db, f)) if loss_db[0] < 0.03 else float(f[0])
+    f_hi = float(np.interp(_FIT_DB, loss_db, f)) if use_lp else float(tab.corners[-1])
+    lat = tab.corners
+    k_top = int(np.searchsorted(lat, f_hi * 2.0 ** (0.5 * _LATTICE_OCT)) - 1)
+    k_top = min(max(k_top, 0), lat.size - 1)
+    idx = [k_top]
+    while lat[idx[-1]] > f_lo and idx[-1] > 0:
+        lc = float(np.interp(lat[idx[-1]], f, loss_db))
+        idx.append(max(idx[-1] - (1 if lc >= 10.0 else (2 if lc >= 2.0 else 4)), 0))
+    idx = np.array(sorted(set(idx)), dtype=int)
+    K = idx.size
+    level = np.interp(np.log(lat[idx]), np.log(f), np.minimum(loss_db, _FIT_DB))
+    g0 = np.maximum(np.diff(np.concatenate(([0.0], level))), 0.0)
+    target = np.minimum(loss_db, _DEEP_DB)
+    if use_lp:
+        # past the knee the ISO loss climbs ~3x per octave (60+ dB/oct); asking the cascade to
+        # follow it forces the error into the fitted band, so the deep target ramps up from
+        # 40 dB at the 4th-order low-pass's own 24 dB/oct
+        ramp = _FIT_DB + _DEEP_SLOPE * np.log2(np.maximum(f / f_hi, 1.0))
+        target = np.where(fit_sel, target, np.minimum(target, ramp))
+    w = np.where(fit_sel, 1.0, 0.25)
+    lp_lo, lp_hi = float(tab.lp_log[0]), float(tab.lp_log[-1])
+
+    def evaluate(gv, lc):
+        P, dP = tab.shelves(idx, gv)
+        a = P.sum(axis=0)
+        dL = None
+        if use_lp:
+            L, dL = tab.lowpass(lc)
+            a = a + L
+        return a, dP, dL
+
+    def residual(a):
+        r = a - target
+        return np.where(fit_sel, r, np.minimum(r, 0.0)) * w
+
+    def solve(g, lpc):
+        a, dP, dL = evaluate(g, lpc)
+        r = residual(a)
+        cost = float(r @ r)
+        lam = 1e-3
+        for _ in range(40):
+            active = np.where(fit_sel, 1.0, (a < target).astype(float)) * w
+            J = dP * active
+            if use_lp:
+                J = np.vstack([J, (dL * active)[None, :]])
+            J = J.T
+            JtJ, Jtr = J.T @ J, J.T @ r
+            damp = np.diag(np.diag(JtJ)) + 1e-9 * np.eye(JtJ.shape[0])
+            improved, rel = False, 0.0
+            while lam < 1e9:
+                dx = -np.linalg.solve(JtJ + lam * damp, Jtr)
+                g2 = np.clip(g + dx[:K], 0.0, _GAIN_MAX_DB)
+                l2 = min(max(lpc + dx[K], lp_lo), lp_hi) if use_lp else lpc
+                a2, dP2, dL2 = evaluate(g2, l2)
+                r2 = residual(a2)
+                c2 = float(r2 @ r2)
+                if c2 < cost:
+                    rel = (cost - c2) / max(cost, 1e-12)
+                    g, lpc, a, dP, dL, r, cost = g2, l2, a2, dP2, dL2, r2, c2
+                    lam = max(lam / 5.0, 1e-9)
+                    improved = True
+                    break
+                lam *= 5.0
+            if not improved or rel < 2e-3 or cost < 1e-4:
+                break
+        return g, lpc, a, cost
+
+    def score(a):
+        # the contract: in-band error (to 10 kHz) first, then any shortfall in the deep band
+        sel = fit_sel & (f <= 10000.0)
+        e_fit = float(np.max(np.abs(a - loss_db)[sel], initial=0.0))
+        short = float(np.max((target - a)[~fit_sel], initial=0.0))
+        return e_fit + max(short - 2.0, 0.0)
+
+    lp0 = math.log(min(1.4 * f_hi, 0.45 * sr)) if use_lp else 0.0
+    g, lpc, a, _ = solve(g0, lp0)
+    if use_lp:
+        # the knee has local minima: if the fit is poor, restart the low-pass corner half an
+        # octave lower and higher and keep the best in-band fit
+        best = score(a)
+        for mult in (1.0, 2.0):
+            if best <= 0.8:
+                break
+            alt = solve(g0, min(max(math.log(mult * f_hi), lp_lo), lp_hi))
+            s = score(alt[2])
+            if s < best:
+                best = s
+                g, lpc, a, _ = alt
+    keep = g > 0.02
+    rows = _shelf_bank(lat[idx][keep], g[keep], sr) if np.any(keep) else _PASSTHROUGH.copy()
+    if use_lp:
+        rows = np.vstack([rows, _butter4_lowpass(math.exp(lpc), sr)])
+    return rows
+
+
+@lru_cache(maxsize=2048)
 def _air_sos_cached(dq: int, tq: int, hq: int, sr: int) -> tuple:
     d = _DIST_STEP ** dq
-    temp = tq * 0.5
-    rh = float(hq)
-    nyq_lim = 0.45 * sr
-    f = np.geomspace(20.0, nyq_lim, 96)
-    target = np.minimum(iso9613_alpha_db_per_m(f, temp, rh) * d, _MAX_LOSS_DB)
-    corners = [c for c in _SHELF_CORNERS if c < 0.42 * sr]
-    if not corners or float(target.max()) < 0.05:
+    tab = _design_tables(int(sr))
+    loss = iso9613_alpha_db_per_m(tab.f, tq * 0.5, float(hq)) * d
+    if float(loss.max()) < 0.05:
         return tuple(map(tuple, _PASSTHROUGH))
-    # basis: attenuation (dB > 0) per dB of shelf gain
-    basis = np.stack([-_sos_mag_db(_high_shelf(c, -6.0, sr)[None, :], f, sr) / 6.0 for c in corners], axis=1)
-    from scipy.optimize import nnls
-    g, _ = nnls(basis, target)
-    g = np.clip(g, 0.0, 80.0)
-
-    def build(gains):
-        rows = [_high_shelf(c, -gk, sr) for c, gk in zip(corners, gains) if gk > 0.05]
-        return np.array(rows) if rows else _PASSTHROUGH.copy()
-
-    for _ in range(3):
-        actual = -_sos_mag_db(build(g), f, sr)
-        resid = target - actual
-        dg, *_ = np.linalg.lstsq(basis, resid, rcond=None)
-        g = np.clip(g + dg, 0.0, 80.0)
-    return tuple(map(tuple, build(g)))
+    return tuple(map(tuple, _fit_absorption(loss, tab)))
 
 
 def air_absorption_sos(distance_m: float, temp_c: float, rh_pct: float, sr: int = SAMPLE_RATE) -> np.ndarray:
-    """Cascade of high-shelf biquads fitted to the ISO 9613-1 loss over `distance_m`.
+    """Biquad cascade matching the ISO 9613-1 loss over `distance_m` (see `_fit_absorption`).
 
-    Passthrough under 1 m. Designs are cached on a 2 % distance / 0.5 C / 1 % RH grid.
+    Within ~1 dB of alpha(f) * distance up to 10 kHz wherever that loss is <= 40 dB (worst
+    1.1 dB over a 600-design scan); where the loss is larger the filter attenuates by at
+    least ~38 dB, rising ~24 dB/oct towards min(loss, 60 dB). Passthrough under 1 m.
+    Designs are cached on a 1 % distance / 0.5 C / 1 % RH grid.
     """
     d = float(distance_m)
     if d < 1.0:
@@ -201,6 +383,13 @@ class AirAbsorptionFilter:
     def _zeros(self, sos: np.ndarray, x: np.ndarray) -> np.ndarray:
         return np.zeros((sos.shape[0],) + x.shape[:-1] + (2,))
 
+    @staticmethod
+    def _flush(zi: np.ndarray) -> np.ndarray:
+        # on silence the recursive state decays into subnormals (~1e-308), which run ~100x
+        # slower on x86; anything below 1e-30 is inaudible, so snap it to zero
+        np.copyto(zi, 0.0, where=np.abs(zi) < _DENORMAL_FLUSH)
+        return zi
+
     def process(self, x: np.ndarray, distance_m: float, temp_c: float, rh_pct: float) -> np.ndarray:
         x = np.asarray(x, dtype=float)
         if x.shape[-1] == 0:
@@ -212,7 +401,8 @@ class AirAbsorptionFilter:
             self._sos = air_absorption_sos(d, t, h, self.sr)
             self._zi = self._zeros(self._sos, x)
             self._params = (d, t, h)
-            y, self._zi = sosfilt(self._sos, x, axis=-1, zi=self._zi)
+            y, zi = sosfilt(self._sos, x, axis=-1, zi=self._zi)
+            self._zi = self._flush(zi)
         elif self._changed(d, t, h):
             new_sos = air_absorption_sos(d, t, h, self.sr)
             new_zi = self._zeros(new_sos, x)
@@ -222,9 +412,10 @@ class AirAbsorptionFilter:
             y_new, new_zi = sosfilt(new_sos, x, axis=-1, zi=new_zi)
             fade = np.linspace(0.0, 1.0, x.shape[-1])
             y = y_old * (1.0 - fade) + y_new * fade
-            self._sos, self._zi, self._params = new_sos, new_zi, (d, t, h)
+            self._sos, self._zi, self._params = new_sos, self._flush(new_zi), (d, t, h)
         else:
-            y, self._zi = sosfilt(self._sos, x, axis=-1, zi=self._zi)
+            y, zi = sosfilt(self._sos, x, axis=-1, zi=self._zi)
+            self._zi = self._flush(zi)
         self._tail = x[..., -self._WARM:].copy()
         return y
 

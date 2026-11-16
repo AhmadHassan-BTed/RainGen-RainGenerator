@@ -2,11 +2,21 @@
 
 Physics:
 * Fégeant (1999) and Bolin (2006, 2009): vegetation noise level scales as
-  L ~ 10*log10(U^(2*chi)) with chi = 1.5..2.7 depending on species.
+  L ~ 10*log10(U^(2*chi)) with chi = 1.5..2.7 depending on species; Bolin's conifer
+  stands measured 23-35 log10(U) (chi ~ 1.2-1.75). Calibration (level_db = SPL 10 m from
+  one crown at a crown-height mean wind of 5 m/s) is anchored on Bolin's KTH data: a
+  single 18 m spruce heard from 3 m at 6.3 m/s gave 47.2 dB(A), a 120 m x 30 m spruce edge
+  heard from 29 m at 5.1 m/s gave 55.2 dB(A) (both ~44 dB at 10 m from one crown at 5 m/s).
+  Levels follow the *mean* wind: the gust-weighted average E[g^(2 chi)] of the log-normal
+  gust multiplier is divided out, as the empirical laws are fitted to Leq vs mean wind.
+* Crowns sit higher than the ears, where turbulence intensity I_u = 1/ln(z/z0) is smaller:
+  the listener's gust multiplier is remapped to the crown's intensity with the same timing
+  (raingen.synth.wind.remap_gust). With it the level fluctuates by sigma_L ~ 8.7 chi s
+  ~ 3-5 dB, matching Bolin's measured 2.6-5.2 dB(A).
 * Conifers: a log-Gaussian "whoosh" centred on the needle Strouhal frequency
-  f = St*U/d_n (St ~ 0.2, needle diameter d_n ~ 1-1.5 mm).
-* Broadleaf trees: rustle = dense granular leaf-to-leaf impacts (grains) plus
-  foliage swish modulated by crown sway.
+  f = St*U/d_n (St ~ 0.2, needle diameter d_n ~ 1-1.5 mm): Gaussian, hiss-like.
+* Broadleaf trees: rustle = dense granular leaf-to-leaf impacts (sparse, crisp grains whose
+  band rises with the impact speed) plus foliage swish modulated by crown sway.
 * Bare (winter) branches: aeolian whistles f = 0.2*U/d for twigs d = 3..10 mm.
 * Beaufort ladder (WMO land descriptions, defined on the 10 m wind): leaves rustle
   from force 2, twigs/small branches move from force 3-4, branches whistle at
@@ -16,6 +26,12 @@ Physics:
 * Gusts are advected (Taylor): a stand of trees s metres upwind hears each gust
   s/U seconds before the listener (GustProcess.at_position), so gusts are heard
   sweeping across the scene.
+
+Synthesis is vectorised over every plant of the scene: one frequency-domain shaped-noise
+bank (swish, needles, whistles and ISO 9613-1 air absorption folded into one magnitude
+spectrum per plant), one batched FFT convolution for the leaf grains, and one static SH
+encode of all plants (the encoder's spread model), so the whole vegetation is a single
+ambisonic emission on stem 'wind'.
 """
 
 from __future__ import annotations
@@ -24,31 +40,38 @@ import math
 from typing import Optional
 
 import numpy as np
+from scipy import fft as sfft
 from scipy import signal
 
 from raingen.core.constants import SAMPLE_RATE
 from raingen.core.types import BlockContext, Emission, SourcePatch
-from raingen.physics.atmosphere import AirAbsorptionFilter, spreading_gain
-from raingen.physics.wind import wind_at_height
+from raingen.physics.atmosphere import iso9613_alpha_db_per_m
+from raingen.physics.wind import turbulence_intensity_for, wind_at_height
 
-from .wind import (GustField, PendingMixer, Ramp, StatefulSOS, bandpass_rms_gain, bandpass_sos, block_start_sample,
-                   db_spl, noise_rms_gain, poisson_offsets, scene_z0, shelter_of, smoothstep, upwind_distance)
+from .wind import (GustField, PendingMixer, ShapedNoiseOLA, StaticSHEncoder, bandpass_coefs, bandpass_mag2,
+                   bandpass_sos, biquad_response, block_start_sample, db_spl, ramp_frac, remap_gust, scene_z0,
+                   shelter_of, smoothstep)
 
-# level_db: SPL at 1 m from the crown centre for one plant at U = 5 m/s
+# level_db: SPL (dB re 20 uPa) 10 m from the crown centre of one plant at a crown-height mean wind
+# of 5 m/s (Bolin 2009 KTH data for conifers; the others relative to it, uncertain to +-5 dB).
 SPECIES = {
-    "deciduous": {"chi": 2.0, "level_db": 64.0, "tick": 1.0, "tick_rate": 2500.0, "swish": 0.55,
+    "deciduous": {"chi": 2.0, "level_db": 45.0, "tick": 1.0, "tick_rate": 2500.0, "swish": 0.55,
                   "needle": 0.0, "whistle": 0.12, "height": 10.0, "tree": True},
-    "conifer": {"chi": 2.3, "level_db": 62.0, "tick": 0.12, "tick_rate": 600.0, "swish": 0.3,
+    "conifer": {"chi": 1.5, "level_db": 44.0, "tick": 0.04, "tick_rate": 600.0, "swish": 0.3,
                 "needle": 1.0, "needle_d_mm": 1.2, "whistle": 0.18, "height": 14.0, "tree": True},
-    "bush": {"chi": 1.8, "level_db": 56.0, "tick": 0.8, "tick_rate": 1800.0, "swish": 0.6,
+    "bush": {"chi": 1.8, "level_db": 37.0, "tick": 0.8, "tick_rate": 1800.0, "swish": 0.6,
              "needle": 0.0, "whistle": 0.05, "height": 1.5, "tree": False},
-    "grass": {"chi": 1.6, "level_db": 50.0, "tick": 0.3, "tick_rate": 3000.0, "swish": 1.0,
+    "grass": {"chi": 1.6, "level_db": 32.0, "tick": 0.3, "tick_rate": 3000.0, "swish": 1.0,
               "needle": 0.0, "whistle": 0.0, "height": 0.4, "tree": False},
-    "palm": {"chi": 2.0, "level_db": 62.0, "tick": 0.6, "tick_rate": 900.0, "swish": 0.7,
+    "palm": {"chi": 2.0, "level_db": 44.0, "tick": 0.6, "tick_rate": 900.0, "swish": 0.7,
              "needle": 0.0, "whistle": 0.05, "height": 9.0, "tree": True},
-    "reeds": {"chi": 1.7, "level_db": 52.0, "tick": 0.5, "tick_rate": 2000.0, "swish": 0.9,
+    "reeds": {"chi": 1.7, "level_db": 34.0, "tick": 0.5, "tick_rate": 2000.0, "swish": 0.9,
               "needle": 0.4, "needle_d_mm": 5.0, "whistle": 0.0, "height": 1.8, "tree": False},
 }
+LEVEL_REF_M = 10.0          # distance of the level_db anchor
+LEVEL_REF_MPS = 5.0         # crown-height mean wind of the level_db anchor
+TICK_M2 = math.exp(2.0 * 0.7 ** 2)      # E[a^2] of the lognormal(0, 0.7) grain amplitudes
+TICK_TAIL = 512             # samples of grain ringing carried between blocks (>= 140 dB down)
 
 _ALIASES = {
     "tree": "deciduous", "broadleaf": "deciduous", "oak": "deciduous", "beech": "deciduous",
@@ -110,8 +133,24 @@ def _creak(rng: np.random.Generator, sr: int) -> np.ndarray:
     return y / peak if peak > 0 else y
 
 
+def _smooth(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Vectorised raingen.synth.wind.smoothstep."""
+    t = np.clip((np.asarray(x, dtype=float) - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _rfft_weights(N: int) -> np.ndarray:
+    """Parseval weights on an N-point rfft grid: variance = sum_k w_k |X_k|^2 / N for unit-variance bins."""
+    F = N // 2 + 1
+    w = np.full(F, 2.0 / N)
+    w[0] = 1.0 / N
+    if N % 2 == 0:
+        w[-1] = 1.0 / N
+    return w
+
+
 class _VegVoice:
-    """One vegetation patch (a tree, a stand, a hedge or a lawn)."""
+    """Configuration of one vegetation patch (a tree, a stand, a hedge or a lawn)."""
 
     def __init__(self, patch: SourcePatch, species: str, scene, rngf, sr: int, level_scale: float = 1.0):
         self.patch = patch
@@ -136,132 +175,21 @@ class _VegVoice:
         self.d_needle = float(p.get("needle_d_mm", self.spec.get("needle_d_mm", 1.2))) / 1000.0
         twig0 = float(p.get("twig_diameter_m", 0.004))
         self.twig_d = np.array([0.75, 1.25, 2.0]) * twig0 * cfg.uniform(0.85, 1.2, size=3)
-        self.whistle_jit = np.zeros(3)
         area = max(float(patch.area_m2), 1.0)
         self.radius = float(p.get("crown_radius_m", p.get("canopy_radius_m", math.sqrt(area / math.pi))))
         self.fixed_spread = p.get("spread")
-
-        self.crisp = StatefulSOS(bandpass_sos(self.f_crisp0, 1.4, sr))
-        self.body = StatefulSOS(bandpass_sos(self.f_body, 1.8, sr))
-        self._fc_crisp = self.f_crisp0
-        self._g_tick = math.sqrt(0.49 * noise_rms_gain(self.crisp.sos) ** 2 + 0.25 * noise_rms_gain(self.body.sos) ** 2)
-        self.swish = StatefulSOS(bandpass_sos(500.0, 0.7, sr))
-        self._fc_swish, self._g_swish = 500.0, noise_rms_gain(self.swish.sos)
-        self.needle = StatefulSOS(np.vstack([bandpass_sos(800.0, 1.0, sr)] * 2))
-        self._fc_needle, self._g_needle = 800.0, noise_rms_gain(self.needle.sos)
-        self.whistles = [StatefulSOS(bandpass_sos(400.0, 15.0, sr)) for _ in range(3)]
-        self._fc_wh = np.full(3, 400.0)
-        self._g_wh = np.full(3, bandpass_rms_gain(400.0, 15.0, sr))
-        self.gains = Ramp(np.zeros(6))
+        self.dist = float(patch.distance)
+        self.spread = float(self.fixed_spread) if self.fixed_spread is not None else \
+            min(max(self.radius / self.dist, 0.05), 0.95)
         self.creaks = PendingMixer(1)
-        self.air = AirAbsorptionFilter(sr)
-
-    def _retune(self, filt: StatefulSOS, sos: np.ndarray) -> float:
-        filt.set(sos)
-        return noise_rms_gain(sos)
-
-    def render(self, ctx: BlockContext, field: GustField, z0: float) -> Optional[Emission]:
-        w = ctx.weather
-        n, sr = ctx.n, ctx.sr
-        u_h = float(wind_at_height(w.wind_u10_mps, max(0.7 * self.height, 0.5), z0))
-        s = upwind_distance(self.patch.position, w.wind_azimuth)
-        g_loc = field.at(s, max(u_h, 0.5))
-        u = u_h * g_loc * self.exposure
-        u_bft = float(w.wind_u10_mps) * g_loc * self.exposure     # 10 m-equivalent wind at this plant
-        if u < 0.5 and u_bft < 1.2 and float(np.max(self.gains.value)) < 1e-8 and not self.creaks.active:
-            return None
-        rng = ctx.rng.get(f"veg.{self.patch.id}", ctx.index)
-        spec = self.spec
-        wet = float(w.wetness.get(self.patch.material, w.wetness.get("leaves", 0.0))) if w.wetness else 0.0
-
-        on_leaf = smoothstep(u_bft, 1.3, 3.0)       # Beaufort 2 (1.6-3.3 m/s): leaves rustle
-        on_twig = smoothstep(u_bft, 3.2, 6.5)       # Beaufort 3-4: twigs in constant motion
-        on_whistle = smoothstep(u_bft, 7.0, 11.0)   # Beaufort 5-6: branches move, whistle
-        if self.species in ("grass", "reeds"):
-            on_twig = on_leaf
-        A = db_spl(spec["level_db"]) * (max(u, 0.0) / 5.0) ** spec["chi"] * math.sqrt(self.count)
-        A *= smoothstep(u, 0.8, 2.0) * self.level_scale
-
-        t = (ctx.t0 + np.arange(n) / sr)
-        sway_depth = 0.25 + 0.45 * on_twig
-        sway = 1.0 + sway_depth * np.sin(2.0 * np.pi * self.sway_f * t + self.sway_phase)
-
-        # leaf ticks: dense granular impacts
-        f_crisp = self.f_crisp0 * (1.0 - 0.35 * wet)
-        if abs(f_crisp - self._fc_crisp) / self._fc_crisp > 0.03:
-            self._fc_crisp = f_crisp
-            self.crisp.set(bandpass_sos(f_crisp, 1.4, sr))
-            self._g_tick = math.sqrt(0.49 * noise_rms_gain(self.crisp.sos) ** 2 + 0.25 * noise_rms_gain(self.body.sos) ** 2)
-        rate = min(15000.0, spec["tick_rate"] * max(self.leaf, 0.02) * math.sqrt(self.count) * (max(u, 0.1) / 5.0) ** 1.3)
-        rate *= on_leaf
-        imp = np.zeros(n)
-        offs = poisson_offsets(rng, rate, n, sr)
-        if offs.size:
-            np.add.at(imp, offs, rng.lognormal(0.0, 0.7, size=offs.size) * rng.choice([-1.0, 1.0], size=offs.size))
-            imp *= sway
-        tick = 0.7 * self.crisp.process(imp) + 0.5 * self.body.process(imp)
-        tick /= self._g_tick * math.sqrt(max(rate, 1.0) / sr * 2.66)
-
-        # foliage / branch swish
-        fc_sw = 300.0 + 45.0 * u
-        if abs(fc_sw - self._fc_swish) / self._fc_swish > 0.03:
-            self._fc_swish = fc_sw
-            self._g_swish = self._retune(self.swish, bandpass_sos(fc_sw, 0.7, sr))
-        swish = self.swish.process(rng.standard_normal(n)) / self._g_swish * sway
-
-        # needle Strouhal whoosh (log-Gaussian-like peak from two cascaded resonances)
-        needle = np.zeros(n)
-        if spec["needle"] > 0.0:
-            f_n = min(max(0.2 * u / self.d_needle, 150.0), 12000.0)
-            if abs(f_n - self._fc_needle) / self._fc_needle > 0.03:
-                self._fc_needle = f_n
-                self.needle.set(np.vstack([bandpass_sos(f_n, 1.0, sr)] * 2))
-                self._g_needle = noise_rms_gain(self.needle.sos)
-            needle = self.needle.process(rng.standard_normal(n)) / self._g_needle * np.sqrt(sway)
-
-        # bare-branch aeolian whistles f = 0.2 U / d with turbulent jitter
-        a = math.exp(-(n / sr) / 0.7)
-        self.whistle_jit = a * self.whistle_jit + math.sqrt(1 - a * a) * rng.standard_normal(3)
-        whistles = np.zeros((3, n))
-        w_on = spec["whistle"] * on_whistle * (1.0 + 3.0 * (1.0 - self.leaf))
-        if w_on > 1e-4:
-            noise3 = rng.standard_normal((3, n))
-            for j in range(3):
-                f_j = min(max(0.2 * u / self.twig_d[j] * (1.0 + 0.03 * self.whistle_jit[j]), 60.0), 9000.0)
-                if abs(f_j - self._fc_wh[j]) / self._fc_wh[j] > 0.015:
-                    self._fc_wh[j] = f_j
-                    self.whistles[j].set(bandpass_sos(f_j, 15.0, sr))
-                    self._g_wh[j] = bandpass_rms_gain(f_j, 15.0, sr)
-                whistles[j] = self.whistles[j].process(noise3[j]) / self._g_wh[j]
-
-        leaf_w = spec["tick"] * self.leaf * on_leaf * (1.0 - 0.4 * wet)
-        swish_w = spec["swish"] * (0.25 + 0.75 * self.leaf) * on_twig * (1.0 + 0.3 * wet)
-        needle_w = spec["needle"] * on_leaf
-        wh = w_on / math.sqrt(3.0) * (0.5 + 0.5 * np.abs(self.whistle_jit))
-        g = self.gains(A * np.array([leaf_w, swish_w, needle_w, wh[0], wh[1], wh[2]]), n)
-        y = g[0] * tick + g[1] * swish + g[2] * needle + g[3] * whistles[0] + g[4] * whistles[1] + g[5] * whistles[2]
-
-        # creaks from Beaufort 8 (trees only)
-        if spec["tree"] and u_bft > 13.5:
-            crng = ctx.rng.get(f"veg.creak.{self.patch.id}", ctx.index)
-            c_rate = 0.05 * self.count * smoothstep(u_bft, 14.5, 23.0)
-            start = block_start_sample(ctx)
-            for off in poisson_offsets(crng, c_rate, n, sr):
-                self.creaks.add(start + int(off), _creak(crng, sr) * db_spl(72.0) * (u_bft / 20.0) * self.level_scale)
-        if self.creaks.active:
-            y = y + self.creaks.take(block_start_sample(ctx), n)
-
-        dist = self.patch.distance
-        y = y * spreading_gain(dist)
-        if dist > 3.0:
-            y = self.air.process(y, dist, w.temperature_c, w.humidity_pct)
-        spread = float(self.fixed_spread) if self.fixed_spread is not None else min(max(self.radius / dist, 0.05), 0.95)
-        return Emission(signal=y, azimuth=self.patch.azimuth, elevation=self.patch.elevation, distance=dist,
-                        spread=spread, stem="wind", source_id=f"veg.{self.patch.id}")
 
 
 class VegetationGenerator:
-    """All vegetation patches of the layout (plus a ground grass bed from the surface mix)."""
+    """All vegetation patches of the layout (plus a ground grass bed from the surface mix).
+
+    Every plant is a voice of one vectorised bank (see the module docstring); the output is
+    a single SH emission on stem 'wind'. Works for any block length.
+    """
 
     name = "vegetation"
 
@@ -269,6 +197,7 @@ class VegetationGenerator:
         self.sr = sr
         self.field = gust_field or GustField(scene, rngf, sr)
         self.z0 = scene_z0(scene)
+        self.listener_h = float(scene.listener.height_m)
         self.voices: list[_VegVoice] = []
         has_grass = False
         for patch in layout or []:
@@ -285,12 +214,233 @@ class VegetationGenerator:
                               position=(0.3, 0.0, -float(scene.listener.height_m) + 0.2), area_m2=60.0,
                               params={"species": "grass", "spread": 1.0, "height_m": 0.4})
             self.voices.append(_VegVoice(bed, "grass", scene, rngf, sr, level_scale=math.sqrt(share)))
+        self._build()
+
+    # -- static tables -----------------------------------------------------
+    def _build(self) -> None:
+        vs = self.voices
+        V = len(vs)
+        self.V = V
+        if not V:
+            return
+
+        def arr(f):
+            return np.array([f(v) for v in vs], dtype=float)
+
+        self.chi = arr(lambda v: v.spec["chi"])
+        dist = arr(lambda v: v.dist)
+        radius = arr(lambda v: v.radius)
+        self.dist = dist
+        # amplitude at the listener per unit (crown-wind / 5 m/s)^chi: anchor at 10 m, 1/r beyond the crown
+        r_eff = np.hypot(dist, 0.5 * radius)
+        self.level = arr(lambda v: db_spl(v.spec["level_db"]) * math.sqrt(v.count) * v.level_scale) \
+            * LEVEL_REF_M / r_eff
+        self.tick_w = arr(lambda v: v.spec["tick"] * v.leaf)
+        self.tick_rate = arr(lambda v: v.spec["tick_rate"] * max(v.leaf, 0.02) * math.sqrt(v.count))
+        self.swish_w = arr(lambda v: v.spec["swish"] * (0.25 + 0.75 * v.leaf))
+        self.needle_w = arr(lambda v: v.spec["needle"])
+        self.whistle_w = arr(lambda v: v.spec["whistle"] * (1.0 + 3.0 * (1.0 - v.leaf)))
+        self.grassy = np.array([v.species in ("grass", "reeds") for v in vs])
+        self.tree = np.array([bool(v.spec["tree"]) for v in vs])
+        self.exposure = arr(lambda v: v.exposure)
+        self.level_scale = arr(lambda v: v.level_scale)
+        self.count = arr(lambda v: v.count)
+        self.f_crisp0 = arr(lambda v: v.f_crisp0)
+        self.f_body = arr(lambda v: v.f_body)
+        self.sway_f = arr(lambda v: v.sway_f)
+        self.sway_phase = arr(lambda v: v.sway_phase)
+        self.d_needle = arr(lambda v: v.d_needle)
+        self.twig_d = np.stack([v.twig_d for v in vs])                    # (V, 3)
+        self.pos = np.array([v.patch.position for v in vs], dtype=float)
+        self.material = [v.patch.material for v in vs]
+        # crown-height wind per unit 10 m wind (log law is linear in u10) and turbulence ratio to the ears
+        z_crown = np.maximum(0.7 * arr(lambda v: v.height), 0.5)
+        self.u_ratio = np.array([wind_at_height(1.0, float(z), self.z0) for z in z_crown])
+        ti_ear = float(turbulence_intensity_for(self.z0, max(self.listener_h, 0.3)))
+        self.ti_ratio = np.array([float(turbulence_intensity_for(self.z0, float(z))) for z in z_crown]) \
+            / max(ti_ear, 1e-6)
+        self.encoder = StaticSHEncoder([v.patch.azimuth for v in vs], [v.patch.elevation for v in vs],
+                                       [v.spread for v in vs], sr=self.sr)
+        self.noise = ShapedNoiseOLA(V, self.sr)
+        self.whistle_jit = np.zeros((V, 3))
+        self._n = 0
+        self._air_key = None
+        self._air_noise: Optional[np.ndarray] = None
+        self._air_tick: Optional[np.ndarray] = None
+        self._fc_crisp = np.zeros(V)
+        self._kernel: Optional[np.ndarray] = None
+        self._body: Optional[np.ndarray] = None
+        self._carry: Optional[np.ndarray] = None
+        self._g_prev = np.zeros(V)
+        mats = sorted(set(self.material))
+        self._mat_names = mats
+        self._mat_idx = np.array([mats.index(m) for m in self.material], dtype=np.int64)
+
+    def _grids(self, n: int) -> None:
+        if n == self._n:
+            return
+        self._n = n
+        self.noise.setup(n)
+        self.f_noise = self.noise.freqs
+        self.N_tick = int(sfft.next_fast_len(n + TICK_TAIL, real=True))
+        self.f_tick = np.fft.rfftfreq(self.N_tick, 1.0 / self.sr)
+        self.w_tick = _rfft_weights(self.N_tick)
+        self.zinv_tick = np.exp(-2j * np.pi * self.f_tick / self.sr)
+        self._air_key = None
+        self._fc_crisp[:] = 0.0
+        self._kernel = None
+        self._body = None
+        self._carry = None
+
+    def _air(self, temp_c: float, rh: float) -> None:
+        """ISO 9613-1 absorption magnitudes per plant on both grids (re-evaluated on 1 C / 5 % RH changes)."""
+        key = (round(temp_c), round(rh / 5.0))
+        if key == self._air_key:
+            return
+        self._air_key = key
+        d = np.where(self.dist > 3.0, self.dist, 0.0)[:, None]
+        self._air_noise = 10.0 ** (-iso9613_alpha_db_per_m(self.f_noise, temp_c, rh)[None, :] * d / 20.0)
+        self._air_tick = 10.0 ** (-iso9613_alpha_db_per_m(self.f_tick, temp_c, rh)[None, :] * d / 20.0)
+        self._fc_crisp[:] = 0.0                         # tick kernels carry the absorption: rebuild
+
+    def _tick_kernels(self, f_crisp: np.ndarray) -> np.ndarray:
+        """Unit-white-gain grain kernels 0.7 crisp + 0.5 body band-pass (x air absorption), rebuilt on 5 % changes.
+
+        The body band of each plant is fixed: its response is computed once per grid.
+        """
+        stale = np.abs(f_crisp - self._fc_crisp) > 0.05 * np.maximum(self._fc_crisp, 1.0)
+        if self._kernel is None:
+            self._kernel = np.zeros((self.V, self.f_tick.size), dtype=complex)
+            bb, ab = bandpass_coefs(self.f_body, 1.8, self.sr)
+            self._body = 0.5 * biquad_response(bb, ab, self.zinv_tick)
+            stale[:] = True
+        if np.any(stale):
+            idx = np.nonzero(stale)[0]
+            bc, ac = bandpass_coefs(f_crisp[idx], 1.4, self.sr)
+            k = 0.7 * biquad_response(bc, ac, self.zinv_tick) + self._body[idx]
+            gain = np.sqrt((k.real ** 2 + k.imag ** 2) @ self.w_tick)
+            self._kernel[idx] = k * (self._air_tick[idx] / gain[:, None])
+            self._fc_crisp[idx] = f_crisp[idx]
+        return self._kernel
 
     def render(self, ctx: BlockContext) -> list[Emission]:
-        self.field.advance(ctx.index, ctx.weather)
-        out = []
-        for v in self.voices:
-            em = v.render(ctx, self.field, self.z0)
-            if em is not None:
-                out.append(em)
-        return out
+        w = ctx.weather
+        n, sr = ctx.n, ctx.sr
+        self.field.advance(ctx.index, w, n)
+        if not self.V:
+            return []
+        self._grids(n)
+        u10 = max(float(w.wind_u10_mps), 0.0)
+        u_h = u10 * self.u_ratio
+        s_up = self.pos[:, 0] * math.cos(w.wind_azimuth) + self.pos[:, 1] * math.sin(w.wind_azimuth)
+        ti_ear = max(float(w.turbulence_intensity), 0.0)
+        g_ear = self.field.at_many(s_up, np.maximum(u_h, 0.5))
+        ti_c = np.clip(ti_ear * self.ti_ratio, 0.0, 0.8)
+        g = remap_gust(g_ear, ti_ear, ti_c)
+        u = u_h * g * self.exposure                       # instantaneous crown wind
+        u_bft = u10 * g * self.exposure                   # 10 m-equivalent wind at this plant
+        active = (u >= 0.5) | (u_bft >= 1.2)
+        creaking = any(v.creaks.active for v in self.voices)
+        if not np.any(active) and not np.any(self._g_prev > 1e-8) and not self.noise.active \
+                and self._carry is None and not creaking:
+            return []
+        rng = ctx.rng.get("veg", ctx.index)
+
+        on_leaf = _smooth(u_bft, 1.3, 3.0)          # Beaufort 2 (1.6-3.3 m/s): leaves rustle
+        on_twig = _smooth(u_bft, 3.2, 6.5)          # Beaufort 3-4: twigs in constant motion
+        on_whistle = _smooth(u_bft, 7.0, 11.0)      # Beaufort 5-6: branches move, whistle
+        on_twig = np.where(self.grassy, on_leaf, on_twig)
+        # Leq follows the mean-wind law: divide out E[g^(2 chi)] = exp(chi (2 chi - 1) s^2)
+        s2 = np.log1p(ti_c * ti_c)
+        u_mean = u_h * self.exposure
+        A = self.level * (np.maximum(u_mean, 0.0) / LEVEL_REF_MPS) ** self.chi * g ** self.chi \
+            * np.exp(-0.5 * self.chi * (2.0 * self.chi - 1.0) * s2)
+        A *= _smooth(u, 0.8, 2.0) * active
+        wet_all = w.wetness or {}
+        wet_leaves = float(wet_all.get("leaves", 0.0))
+        wet = np.array([float(wet_all.get(m, wet_leaves)) for m in self._mat_names])[self._mat_idx]
+
+        # crown sway (slow, linear over the block)
+        t0, t1 = float(ctx.t0), float(ctx.t0) + n / sr
+        depth = 0.25 + 0.45 * on_twig
+        sw0 = 1.0 + depth * np.sin(2.0 * np.pi * self.sway_f * t0 + self.sway_phase)
+        sw1 = 1.0 + depth * np.sin(2.0 * np.pi * self.sway_f * t1 + self.sway_phase)
+        frac = ramp_frac(n)
+
+        # ---- noise layers: swish, needle whoosh and bare-twig whistles in one spectrum per plant ----
+        self._air(float(w.temperature_c), float(w.humidity_pct))
+        f = self.f_noise
+        swish_g = self.swish_w * on_twig * (1.0 + 0.3 * wet) * A
+        needle_g = self.needle_w * on_leaf * A
+        a = math.exp(-(n / sr) / 0.7)
+        self.whistle_jit = a * self.whistle_jit + math.sqrt(1.0 - a * a) * rng.standard_normal((self.V, 3))
+        wh_on = self.whistle_w * on_whistle
+        wh_g = (wh_on / math.sqrt(3.0))[:, None] * (0.5 + 0.5 * np.abs(self.whistle_jit)) * A[:, None]
+        mag2 = None
+        if np.any(swish_g > 0.0):
+            b = bandpass_mag2(f[None, :], (250.0 + 90.0 * u)[:, None], 0.7)
+            mag2 = (swish_g ** 2 / self.noise.power(b))[:, None] * b
+        if np.any(needle_g > 0.0):
+            f_n = np.clip(0.2 * u / self.d_needle, 150.0, 12000.0)
+            b = bandpass_mag2(f[None, :], f_n[:, None], 1.0) ** 2           # two cascaded resonances
+            term = (needle_g ** 2 / self.noise.power(b))[:, None] * b
+            mag2 = term if mag2 is None else mag2 + term
+        if np.any(wh_g > 0.0):
+            for j in range(3):
+                f_j = np.clip(0.2 * u / self.twig_d[:, j] * (1.0 + 0.03 * self.whistle_jit[:, j]), 60.0, 9000.0)
+                b = bandpass_mag2(f[None, :], f_j[:, None], 15.0)
+                term = (wh_g[:, j] ** 2 / self.noise.power(b))[:, None] * b
+                mag2 = term if mag2 is None else mag2 + term
+        mag = None if mag2 is None else np.sqrt(mag2) * self._air_noise
+        y = self.noise.process(rng, mag, n)
+        if mag is not None or self.noise.active:
+            m0 = 1.0 + 0.75 * (sw0 - 1.0)
+            m1 = 1.0 + 0.75 * (sw1 - 1.0)
+            y = y * (m0[:, None] + (m1 - m0)[:, None] * frac[None, :])
+
+        # ---- leaf grains: sparse signed impulses x sway, batched FFT convolution with carried tails ----
+        rate = np.minimum(15000.0, self.tick_rate * (np.maximum(u, 0.1) / 5.0) ** 1.3) * on_leaf * active
+        tick_g = self.tick_w * on_leaf * (1.0 - 0.4 * wet) * A
+        lam = rate * n / sr
+        counts = rng.poisson(lam) if np.any(lam > 0.0) else np.zeros(self.V, dtype=np.int64)
+        total = int(np.sum(counts))
+        if total > 0 or self._carry is not None:
+            # grains brighten with the impact speed (shorter contact): band x (U/5)^0.3, darker when wet
+            f_crisp = self.f_crisp0 * (1.0 - 0.35 * wet) * np.clip((np.maximum(u, 0.1) / 5.0) ** 0.3, 0.6, 1.6)
+            K = self._tick_kernels(f_crisp)
+            N = self.N_tick
+            if total > 0:
+                vi = np.repeat(np.arange(self.V), counts)
+                pos = rng.integers(0, n, size=total)
+                amp = rng.lognormal(0.0, 0.7, size=total) * rng.choice([-1.0, 1.0], size=total)
+                sway_at = sw0[vi] + (sw1 - sw0)[vi] * (pos + 1) / n
+                norm = tick_g / np.sqrt(np.maximum(rate, 1.0) / sr * TICK_M2)
+                imp = np.bincount(vi * n + pos, weights=amp * sway_at * norm[vi], minlength=self.V * n)
+                ticks = sfft.irfft(sfft.rfft(imp.reshape(self.V, n), N, axis=1) * K, N, axis=1)
+            else:
+                ticks = np.zeros((self.V, N))
+            if self._carry is not None:
+                c = self._carry.shape[1]
+                if c > N:
+                    ticks = np.concatenate([ticks, np.zeros((self.V, c - N))], axis=1)
+                ticks[:, :c] += self._carry
+            y = y + ticks[:, :n]
+            carry = ticks[:, n:]
+            self._carry = carry.copy() if np.max(np.abs(carry), initial=0.0) > 1e-12 else None
+
+        # ---- creaks from Beaufort 8 (trees only) ----
+        start = block_start_sample(ctx)
+        for v_i, v in enumerate(self.voices):
+            if self.tree[v_i] and u_bft[v_i] > 13.5:
+                c_rate = 0.05 * v.count * smoothstep(float(u_bft[v_i]), 14.5, 23.0)
+                lam_c = c_rate * n / sr
+                k = int(rng.poisson(lam_c)) if lam_c > 0.0 else 0
+                for off in np.sort(rng.integers(0, n, size=k)):
+                    amp_c = db_spl(72.0) * (u_bft[v_i] / 20.0) * self.level_scale[v_i] / max(self.dist[v_i], 1.0)
+                    v.creaks.add(start + int(off), _creak(rng, sr) * amp_c)
+            if v.creaks.active:
+                y[v_i] = y[v_i] + v.creaks.take(start, n)
+
+        self._g_prev = A
+        bus = self.encoder.process(y)
+        return [Emission(signal=bus, stem="wind", is_ambisonic=True, spread=1.0, source_id="vegetation")]

@@ -39,10 +39,9 @@ from scipy import signal
 
 from raingen.core.constants import RHO_AIR, SAMPLE_RATE, speed_of_sound
 from raingen.core.types import BlockContext, Emission, SourcePatch
-from raingen.physics.atmosphere import AirAbsorptionFilter
 from raingen.physics.wind import wind_at_height
 
-from .wind import (GustField, PendingMixer, Ramp, SparseModalBank, StatefulSOS, bandpass_rms_gain, bandpass_sos,
+from .wind import (AirPath, GustField, PendingMixer, Ramp, SparseModalBank, StatefulSOS, bandpass_rms_gain, bandpass_sos,
                    block_start_sample, db_spl, highpass_sos, lowpass_sos, noise_rms_gain, poisson_offsets, scene_z0,
                    shelter_of, smoothstep, upwind_distance)
 
@@ -92,7 +91,7 @@ class _Voice:
         self.dist = max(0.3, math.sqrt(x * x + y * y + z * z))
         self.az = math.atan2(y, x)
         self.el = math.atan2(z, math.hypot(x, y))
-        self.air = AirAbsorptionFilter(sr)
+        self.air = AirPath(self.dist, sr)
 
     def local_wind(self, w, field: GustField) -> tuple[float, float, float]:
         """(wind at the emitter's height incl. advected gust, 10 m-equivalent wind, gust multiplier)."""
@@ -101,8 +100,8 @@ class _Voice:
         return u_h * g * self.wind_exposure, float(w.wind_u10_mps) * g * self.wind_exposure, g
 
     def emit(self, y: np.ndarray, w, spread: Optional[float] = None) -> Emission:
-        if self.dist > 3.0 and self.stem != "interior":
-            y = self.air.process(y, self.dist, w.temperature_c, w.humidity_pct)
+        if self.stem != "interior":
+            y = self.air.process(y, w.temperature_c, w.humidity_pct)
         return Emission(signal=y, azimuth=self.az, elevation=self.el, distance=self.dist,
                         spread=self.spread if spread is None else float(spread), stem=self.stem,
                         source_id=f"aeolian.{self.id}")
@@ -669,7 +668,7 @@ class AeolianGenerator:
 
     # -- render --------------------------------------------------------------
     def render(self, ctx: BlockContext) -> list[Emission]:
-        self.field.advance(ctx.index, ctx.weather)
+        self.field.advance(ctx.index, ctx.weather, ctx.n)
         out = []
         for v in self.voices:
             em = v.render(ctx, self.field)

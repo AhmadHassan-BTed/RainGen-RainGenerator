@@ -4,12 +4,19 @@ Physics implemented here:
 
 * Wetness memory per material (Yu & Hopkins 2018: dry -> film -> puddle changes the
   impact mechanism): linear-reservoir film store filled by rain x exposure and drained
-  with a time constant proportional to the scene's aftermath tau; overflow beyond the
-  film capacity runs off and partly collects in hollows (puddle depth, mm).
+  with a time constant proportional to the scene's aftermath tau. Runoff collects in
+  hollows (puddle depth, mm): on sealed ground (asphalt, concrete, tile) everything that
+  leaves the film fills depression storage from the start of any rain; on pervious
+  ground only the infiltration excess beyond the film capacity ponds (Horton), so soil
+  and grass puddle only in heavier rain. Puddles drain with 4-8 x the aftermath tau.
   Reservoirs are integrated exactly (S_eq + (S - S_eq) e^{-dt/tau}) so any dt is stable.
-* Canopy interception (Rutter-type store): 10-40 % of incident rain is intercepted,
-  falling as the store fills, and released later as larger drip drops - including
-  after the rain stops.
+* Canopy interception (Rutter et al. 1971, 1975 store): 10-40 % of incident rain is
+  caught, falling to ~10 % as the store reaches its capacity S (~0.25 LAI mm). Drainage
+  (the drip) follows Rutter: D = Ds exp(b (C - S)) with Ds = 0.002 mm/min and
+  b = 3.7 mm^-1, plus fast (90 s) drainage of anything above S. Wet-canopy evaporation
+  is suppressed while it rains (~0.1-0.2 mm/h in heavy rain, Gash 1979) and dries the
+  store with 1.5 x the aftermath tau once it stops, so sustained rain saturates the
+  canopy and a wet canopy goes on dripping larger drops for minutes after the rain.
 * Roof -> gutter routing: roof film store plus a fast gutter reservoir; flow in L/s
   (1 mm on 1 m^2 = 1 L).
 * Drips (integrate-and-fire): a pendant drop grows on an edge until its weight beats
@@ -26,9 +33,7 @@ from __future__ import annotations
 import math
 from typing import Iterable
 
-import numpy as np
-
-from ..core.constants import G, RHO_WATER, SIGMA_WATER
+from ..core.constants import RHO_WATER, SIGMA_WATER, G
 from .dsd import fall_speed_from_height
 
 _HARKINS_BROWN = 0.6
@@ -79,6 +84,11 @@ _PUDDLE_CONCENTRATION = 4.0   # runoff from the surroundings collects in hollows
 _WATER_DEPTH_MM = 1000.0
 _ROOF_FILM_MM = 0.3
 _GUTTER_TAU_S = 25.0
+_CANOPY_TAU_FAST_S = 90.0
+_RUTTER_DS_MM_S = 0.002 / 60.0    # drainage at C = S (Rutter et al. 1975: 0.002 mm/min)
+_RUTTER_B_PER_MM = 3.7            # drainage e-folds every 0.27 mm below S (Rutter et al. 1975)
+_EVAP_RAIN_MM_H = 0.3             # rain rate that halves the post-rain canopy drying rate
+_IMPERVIOUS = frozenset(("asphalt", "concrete", "tile"))
 
 
 def _relax(s: float, inflow: float, tau: float, dt: float) -> float:
@@ -105,7 +115,9 @@ class WetnessStores:
         self._film = {m: 0.0 for m in self.materials}          # mm of water in the film
         self._puddle = {m: 0.0 for m in self.materials}        # extra puddle depth, mm
         self.canopy_mm = 0.0
-        self.canopy_drip_mm_h = 0.0        # release rate of the canopy (drives tree drips)
+        self.canopy_drip_mm_h = 0.0        # drainage of the canopy (drives tree drips)
+        self.canopy_evap_mm_h = 0.0        # wet-canopy evaporation
+        self.canopy_catch_mm_h = 0.0       # rain caught by the canopy (= drip + evap + storage change)
         self.throughfall_fraction = 1.0
         self._roof_film_l = 0.0
         self._gutter_l = 0.0
@@ -144,9 +156,10 @@ class WetnessStores:
                 self._puddle[m] = 0.0
                 self.runoff_mm_h[m] = 0.0
                 continue
-            scale, cap, drain, pond, pmax, ptau = self.params_for(m)
+            _, cap, drain, pond, pmax, ptau = self.params_for(m)
             tau_f = max(drain * tau, 5.0)
-            w = _relax(self._film[m], inflow, tau_f, dt)
+            w_prev = self._film[m]
+            w = _relax(w_prev, inflow, tau_f, dt)
             overflow = max(0.0, w - cap)
             w = min(w, cap)
             self._film[m] = w
@@ -158,34 +171,58 @@ class WetnessStores:
             elif m == "bucket":
                 self._puddle[m] = min(self._puddle[m] + inflow * dt, pmax)
             elif pond > 0.0 and pmax > 0.0:
-                p_in = pond * _PUDDLE_CONCENTRATION * overflow / dt
+                if m in _IMPERVIOUS:
+                    # sealed ground: everything leaving the film runs off and fills hollows
+                    # (depression storage fills from the first minutes of any rain)
+                    runoff = max(w_prev + inflow * dt - w, 0.0)
+                else:
+                    # pervious ground: only infiltration-excess (Horton) water ponds
+                    runoff = overflow
+                p_in = pond * _PUDDLE_CONCENTRATION * runoff / dt
                 self._puddle[m] = min(_relax(self._puddle[m], p_in, tau_p, dt), pmax)
             else:
                 self._puddle[m] = 0.0
 
-        # canopy interception store (Rutter-type)
+        # canopy interception store (Rutter et al. 1975)
         cover = min(max(float(exp_map.get("canopy", 0.0)), 0.0), 1.0)
         S = self.canopy_capacity_mm
         if cover > 0.0 or self.canopy_mm > 0.0:
-            fill = min(self.canopy_mm / S, 1.5)
-            f_int = min(max(0.10 + 0.30 * (1.0 - fill), 0.10), 0.40)
-            intercepted = f_int * rate / 3600.0 if cover > 0.0 else 0.0
-            tau_fast = 90.0
-            tau_slow = max(1.5 * tau, 30.0)
+            tau_fast = _CANOPY_TAU_FAST_S
+            # drying: full speed (1.5 aftermath tau) after the rain, suppressed while it rains
+            k_evap = _EVAP_RAIN_MM_H / (_EVAP_RAIN_MM_H + rate) / max(1.5 * tau, 30.0)
             c = self.canopy_mm
-            # fast drainage above ~25 % of capacity, slow drip/evaporation below
-            excess = max(0.0, c - 0.25 * S)
-            drain_rate = excess / tau_fast + c / tau_slow
-            c_new = c + (intercepted - drain_rate) * dt
-            if c_new > 1.5 * S:
-                c_new = 1.5 * S
-            c_new = max(c_new, 0.0)
-            released = max(c + intercepted * dt - c_new, 0.0)
-            self.canopy_mm = c_new
-            self.canopy_drip_mm_h = released / dt * 3600.0
-            self.throughfall_fraction = 1.0 - f_int
+            caught = drained = evaporated = 0.0
+            f_int = 0.10
+            # explicit sub-steps well inside the fast drainage time keep long dt stable
+            n_sub = max(1, int(math.ceil(dt / (0.1 * tau_fast))))
+            h = dt / n_sub
+            for _ in range(n_sub):
+                fill = min(c / S, 1.5)
+                f_int = min(max(0.10 + 0.30 * (1.0 - fill), 0.10), 0.40)
+                q_in = f_int * rate / 3600.0 if cover > 0.0 else 0.0
+                excess = c - S
+                drain = _RUTTER_DS_MM_S * math.exp(_RUTTER_B_PER_MM * min(excess, 0.0)) \
+                    + max(excess, 0.0) / tau_fast
+                evap = c * k_evap
+                out = (drain + evap) * h
+                avail = c + q_in * h
+                if out > avail:                       # cannot lose more than is there
+                    drain, evap = drain * avail / out, evap * avail / out
+                    out = avail
+                c = min(avail - out, 1.5 * S)
+                spill = avail - out - c                   # beyond 1.5 S falls straight through
+                caught += q_in * h
+                drained += drain * h + spill
+                evaporated += evap * h
+            self.canopy_mm = c
+            self.canopy_drip_mm_h = drained / dt * 3600.0
+            self.canopy_evap_mm_h = evaporated / dt * 3600.0
+            self.canopy_catch_mm_h = caught / dt * 3600.0
+            self.throughfall_fraction = 1.0 - f_int if cover > 0.0 else 1.0
         else:
             self.canopy_drip_mm_h = 0.0
+            self.canopy_evap_mm_h = 0.0
+            self.canopy_catch_mm_h = 0.0
             self.throughfall_fraction = 1.0
 
         # roof -> gutter
@@ -285,9 +322,12 @@ class DripNode:
         self.drops_total = 0
 
     def step(self, block_index: int, n: int, sr: int, inflow_mm_h: float, storage_mm: float = 0.0) -> list:
-        rng = self.rngf.get(self.layer, int(block_index))
+        # the block's generator is built only when the block draws (first call, or a drop
+        # detaches): most blocks of a slow drip draw nothing
+        rng = None
         V = self.volume_mm3
         if self._acc is None:
+            rng = self.rngf.get(self.layer, int(block_index))
             self._acc = float(rng.uniform(0.0, 0.9)) * V      # random initial phase
             self._threshold = V
             self._x = float(rng.uniform(0.2, 0.8))
@@ -317,6 +357,8 @@ class DripNode:
                 self._acc += q * (dur - t)
                 break
             t += dt_fire
+            if rng is None:
+                rng = self.rngf.get(self.layer, int(block_index))
             released = self._threshold * (1.0 - _RESIDUAL)
             self._acc = self._threshold * _RESIDUAL
             jitter = 1.0 + rng.normal(0.0, 0.015 + 0.08 * self.chaos)

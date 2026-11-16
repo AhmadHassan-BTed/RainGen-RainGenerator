@@ -22,8 +22,9 @@ with the manifest (strings may carry units: "30 km/h", "force 6", "8 mm/h"), the
 
 Loudness: the first `prime_s` seconds are rendered before playback starts and their
 integrated loudness (BS.1770-5) sets one static calibration gain toward `target_lufs`
-(None keeps the engine's calibrated level, 1.0 = 94 dB SPL). Later changes are heard at
-their physical level: heavier rain is louder, a closed window is quieter.
+(None keeps the engine's physical calibration, digital 1.0 = 1 Pa = 94 dB SPL, see
+raingen.core.constants.PA_PER_FULL_SCALE). Later changes are heard at their physical
+level: heavier rain is louder, a closed window is quieter.
 
 Markers (lightning, thunder, gusts, drips) are delivered to `on_marker` by `poll()` on the
 caller's thread when the audio carrying them is played, never from the engine's threads.
@@ -114,6 +115,65 @@ def _structure_key(scene: Scene) -> str:
         "tingle": vibe.get("tingle"),
     }
     return json.dumps(key, sort_keys=True, default=str)
+
+
+class _Delay:
+    """Fixed integer delay (C, n) -> (C, n), state carried between blocks."""
+
+    def __init__(self, samples: int, channels: int):
+        self.samples = max(int(samples), 0)
+        self._buf = np.zeros((int(channels), self.samples))
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if self.samples == 0:
+            return x
+        ext = np.concatenate([self._buf, x], axis=1)
+        n = x.shape[1]
+        self._buf = ext[:, n:].copy()
+        return ext[:, :n]
+
+
+class _GovernorSlot:
+    """The CalmGovernor (or none) padded to a fixed latency, so changing mode never moves the timeline.
+
+    Every path through the slot is delayed by the same `latency` (a governor's own look-ahead
+    plus padding), and a mode change crossfades the old path into the new one with the
+    structural crossfade's equal-power curve: no gap, no click, markers stay aligned.
+    """
+
+    def __init__(self, governor, channels: int, latency: int):
+        self.channels = int(channels)
+        self.latency = max(int(latency), int(getattr(governor, "latency", 0) or 0))
+        self.governor = governor
+        self._pad = _Delay(self.latency - int(getattr(governor, "latency", 0) or 0), channels)
+        self._old = None                     # (governor, pad, pos, len) while crossfading
+
+    def replace(self, governor, xfade: int) -> None:
+        if xfade <= 0:
+            self.governor = governor
+            self._pad = _Delay(self.latency - int(getattr(governor, "latency", 0) or 0), self.channels)
+            self._old = None
+            return
+        self._old = [self.governor, self._pad, 0, int(xfade)]
+        self.governor = governor
+        self._pad = _Delay(max(self.latency - int(getattr(governor, "latency", 0) or 0), 0), self.channels)
+
+    @staticmethod
+    def _run(governor, pad: _Delay, x: np.ndarray) -> np.ndarray:
+        return pad.process(governor.process(x) if governor is not None else x)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        y = self._run(self.governor, self._pad, x)
+        if self._old is not None:
+            gov, pad, pos, length = self._old
+            y_old = self._run(gov, pad, x)
+            n = x.shape[1]
+            w = np.clip((pos + np.arange(1, n + 1)) / length, 0.0, 1.0)
+            y = y_old * np.cos(0.5 * math.pi * w)[None, :] + y * np.sin(0.5 * math.pi * w)[None, :]
+            self._old[2] = pos + n
+            if self._old[2] >= length:
+                self._old = None
+        return y
 
 
 @dataclass
@@ -220,6 +280,7 @@ class Engine:
         self._build_gen = 0
         self._built: Optional[tuple] = None
         self._governor = None
+        self._gov_slot: Optional[_GovernorSlot] = None
         self._gov_key: tuple = ()
         self._limiter = None
         self._resampler = None
@@ -234,7 +295,10 @@ class Engine:
 
         self._cur: Optional[np.ndarray] = None
         self._cur_pos = 0
-        self._played = 0
+        self._played = 0                     # device frames handed out (incl. underrun silence)
+        self._consumed = 0                   # rendered frames handed out (the audio's own clock)
+        self._pushed = 0                     # rendered frames queued by the producer
+        self._g_prev: Optional[float] = None  # output gain at the end of the last block (per-sample ramps)
         self.underruns = 0
         self.xruns = 0
         self.cpu_load = 0.0
@@ -256,7 +320,11 @@ class Engine:
 
     @property
     def time(self) -> float:
-        """Seconds of scene time heard so far (output latency removed)."""
+        """Seconds of scene time heard so far (output latency removed).
+
+        Counted from the rendered frames actually played, so an underrun (silence the device
+        played while the producer was late) does not move the scene clock or the markers.
+        """
         dev = 0.0
         if self._stream is not None:
             try:
@@ -264,7 +332,7 @@ class Engine:
                 dev = float(lat if not isinstance(lat, (tuple, list)) else lat[-1])
             except Exception:
                 dev = 0.0
-        return max(0.0, self._played / self.sr_out - self._chain_latency / SAMPLE_RATE - dev)
+        return max(0.0, self._consumed / self.sr_out - self._chain_latency / SAMPLE_RATE - dev)
 
     @property
     def volume_db(self) -> float:
@@ -427,8 +495,7 @@ class Engine:
         out = np.zeros((frames, max(self.channels, 1)), dtype=np.float32)
         deadline = time.monotonic() + float(timeout)
         while True:
-            avail = (self._cur.shape[0] - self._cur_pos if self._cur is not None else 0) + \
-                sum(b.shape[0] for b in list(self._fifo))
+            avail = self._pushed - self._consumed
             if avail >= frames or self._stop.is_set():
                 break
             if self.error is not None:
@@ -460,6 +527,7 @@ class Engine:
             pos += take
             cpos += take
         self._cur, self._cur_pos = cur, cpos
+        self._consumed += pos
         self._played += frames
 
     # ------------------------------------------------------------------ building
@@ -489,8 +557,15 @@ class Engine:
         return (scene.mode, vibe.get("timer_min"), vibe.get("descent_min"), vibe.get("tingle"))
 
     def _update_latency(self) -> None:
-        self._chain_latency = int(self._pipe.latency) + int(getattr(self._governor, "latency", 0) or 0) + \
+        gov_lat = self._gov_slot.latency if self._gov_slot is not None else 0
+        self._chain_latency = int(self._pipe.latency) + int(gov_lat) + \
             int(self._limiter.latency if self._limiter is not None else 0)
+
+    @staticmethod
+    def _governor_latency() -> int:
+        """The largest look-ahead any CalmGovernor uses (every mode is padded to it)."""
+        from .wellness.modes import CalmGovernor
+        return int(round(float(getattr(CalmGovernor, "LOOKAHEAD_S", 0.0)) * SAMPLE_RATE))
 
     def _build_initial(self) -> None:
         from .master.limiter import TruePeakLimiter
@@ -505,6 +580,7 @@ class Engine:
         self._struct_key = _structure_key(eff)
         self.channels = int(self._pipe.channels)
         self._governor = self._make_governor(eff)
+        self._gov_slot = _GovernorSlot(self._governor, self.channels, self._governor_latency())
         self._limiter = TruePeakLimiter(SAMPLE_RATE, self.channels, self.ceiling_dbtp)
         self._resampler = StreamingResampler(SAMPLE_RATE, self.sr_out, self.channels) \
             if self.sr_out != SAMPLE_RATE else None
@@ -513,6 +589,13 @@ class Engine:
         self._index = 0
         self._ramps.clear()
         self._xf = None
+        # a (re)start plays the scene from t = 0
+        self._fifo.clear()
+        self._cur, self._cur_pos = None, 0
+        self._played = self._consumed = self._pushed = 0
+        self._g_prev = None
+        with self._marker_lock:
+            self._markers = []
 
     def _request_rebuild(self, eff: Scene) -> None:
         self._build_gen += 1
@@ -531,8 +614,8 @@ class Engine:
 
     def _swap_if_built(self) -> None:
         b = self._built
-        if b is None:
-            return
+        if b is None or self._xf is not None:
+            return                      # a crossfade in progress finishes first (dropping its old side clicks)
         self._built = None
         gen, pipe, scene = b
         if gen != self._build_gen or pipe.channels != self.channels:
@@ -553,8 +636,9 @@ class Engine:
         self._current = cur
         key = self._governor_key(scene)
         if key != self._gov_key:
-            # a new mode / timer: a fresh governor (its look-ahead restarts inside the crossfade)
+            # a new mode / timer: a fresh governor, crossfaded in at the same total latency
             self._governor = self._make_governor(scene)
+            self._gov_slot.replace(self._governor, max(1, int(self.xfade_s * SAMPLE_RATE)))
             self._gov_key = key
         self._update_latency()
 
@@ -698,7 +782,9 @@ class Engine:
             old = xf["pipe"].render_block(idx, scene_at_t=old_sc)
             n = y.shape[1]
             w = np.clip((xf["pos"] + np.arange(1, n + 1)) / xf["len"], 0.0, 1.0)
-            y = old.mix * np.cos(0.5 * math.pi * w)[None, :] + y * np.sin(0.5 * math.pi * w)[None, :]
+            a, b = np.cos(0.5 * math.pi * w), np.sin(0.5 * math.pi * w)
+            k = self._xf_compensation(old.mix, y, a, b, xf, done=bool(w[-1] >= 1.0))
+            y = (old.mix * a[None, :] + y * b[None, :]) * k[None, :]
             markers.extend(old.markers)
             xf["pos"] += n
             if xf["pos"] >= xf["len"]:
@@ -707,17 +793,50 @@ class Engine:
         if markers:
             with self._marker_lock:
                 self._markers.extend(markers)
-        if self._governor is not None:
-            y = self._governor.process(y)
+        y = self._gov_slot.process(y)
         self._index += 1
         dt = time.perf_counter() - t_start
         self.cpu_load = 0.9 * self.cpu_load + 0.1 * dt / (BLOCK / SAMPLE_RATE)
         return y
 
+    @staticmethod
+    def _xf_compensation(x_old: np.ndarray, x_new: np.ndarray, a: np.ndarray, b: np.ndarray, xf: dict,
+                         done: bool = False) -> np.ndarray:
+        """Per-sample gain that keeps an equal-power crossfade at constant power for correlated sides.
+
+        cos/sin weights hold the power of *uncorrelated* signals; a rebuilt pipeline shares most
+        layers with the old one (same seed, same wind, thunder, ambience), and a + b = sqrt 2 at
+        the midpoint would swell such a fade by up to +3 dB. The block's cross-power C gives the
+        actual power a^2 Po + b^2 Pn + 2ab C; scaling by sqrt(target / actual), target the
+        uncorrelated value, removes the swell (identical sides fade into themselves unchanged).
+        The factor is interpolated per sample from block to block and returns to 1 at the end.
+        """
+        n = x_new.shape[1]
+        k0 = float(xf.get("k", 1.0))
+        k1 = 1.0
+        if not done and n:
+            po = float(np.mean(x_old * x_old))
+            pn = float(np.mean(x_new * x_new))
+            c = float(np.mean(x_old * x_new))
+            target = float(np.mean(a * a)) * po + float(np.mean(b * b)) * pn
+            actual = target + 2.0 * float(np.mean(a * b)) * c
+            if target > 1e-30 and actual > 1e-30:
+                k1 = float(np.clip(math.sqrt(target / actual), 0.5, 2.0))
+        xf["k"] = k1
+        if k0 == k1:
+            return np.full(n, k1)
+        return k0 + (k1 - k0) * np.arange(1, n + 1) / max(n, 1)
+
     def _master(self, y: np.ndarray) -> np.ndarray:
         n = y.shape[1]
-        g_db = self._cal_db + self._vol_db
-        y = y * (10.0 ** (g_db / 20.0))
+        g = 10.0 ** ((self._cal_db + self._vol_db) / 20.0)
+        g0 = g if self._g_prev is None else self._g_prev
+        if g0 != g and n:
+            # volume glides move per block; ramp the gain per sample so they never zipper
+            y = y * (g0 + (g - g0) * np.arange(1, n + 1) / n)[None, :]
+        else:
+            y = y * g
+        self._g_prev = g
         y = self._limiter.process(y)
         if self._resampler is not None:
             y = self._resampler.process(y)
@@ -731,24 +850,33 @@ class Engine:
             meter = LoudnessMeter(SAMPLE_RATE, self.channels, layout=self.layout, true_peak=False)
             for b in blocks:
                 meter.process(b)
-            lufs = meter.integrated()
-            self._cal_db = float(np.clip(float(self.target_lufs) - lufs, -40.0, 40.0)) if math.isfinite(lufs) else 0.0
+            from .render import MAX_NORMALISATION_GAIN_DB as G, normalisation_loudness
+
+            lufs, _ = normalisation_loudness(meter)     # provisional under 400 ms; ungated below -70 LUFS
+            self._cal_db = float(np.clip(float(self.target_lufs) - lufs, -G, G)) if math.isfinite(lufs) else 0.0
             log.info("raingen engine: start loudness %.1f LUFS, calibration %+.1f dB", lufs, self._cal_db)
         for b in blocks:
-            self._fifo.append(self._master(b))
+            self._push(self._master(b))
+
+    def _push(self, block: np.ndarray) -> None:
+        self._fifo.append(block)
+        self._pushed += int(block.shape[0])
 
     def _produce(self) -> None:
         target_blocks = max(1, int(math.ceil(self.buffer_s * SAMPLE_RATE / BLOCK)))
         block_s = BLOCK / SAMPLE_RATE
+        from .render import limit_threads
+
         try:
-            self._prime()
-            self._primed.set()
-            while not self._stop.is_set():
-                self._drain()
-                if len(self._fifo) >= target_blocks:
-                    time.sleep(0.25 * block_s)
-                    continue
-                self._fifo.append(self._master(self._raw_block()))
+            with limit_threads(1):
+                self._prime()
+                self._primed.set()
+                while not self._stop.is_set():
+                    self._drain()
+                    if len(self._fifo) >= target_blocks:
+                        time.sleep(0.25 * block_s)
+                        continue
+                    self._push(self._master(self._raw_block()))
         except Exception as exc:
             log.exception("raingen engine producer failed")
             self.error = exc

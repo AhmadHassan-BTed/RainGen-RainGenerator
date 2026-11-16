@@ -44,7 +44,15 @@ _LAZY = {
     "cox_offsets": ("events", "cox_offsets"),
 }
 
-__all__ = sorted(_LAZY)
+__all__ = [
+    "AeolianGenerator", "BiophonyGenerator", "CarWipersGenerator", "DripGenerator", "GutterGenerator",
+    "HailGenerator", "KernelBank", "MATERIALS", "Material", "MicRumbleGenerator", "RainBedGenerator",
+    "RainPatchGenerator", "Room", "ShelterTransfer", "SnowGenerator", "ThunderGenerator", "TrafficGenerator",
+    "VegetationGenerator", "WindGenerator", "cox_offsets", "describe_generators", "generator_names",
+    "get_material", "lightning_channel", "make_environment_generators", "make_generators",
+    "make_rain_generators", "make_room", "make_shelter_transfer", "room_for_shelter",
+]
+assert sorted(_LAZY) == __all__
 
 
 def __getattr__(name: str):

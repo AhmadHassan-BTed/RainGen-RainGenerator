@@ -27,8 +27,12 @@ from .rng import RngFactory
 
 
 def bearing_to_azimuth(bearing_deg: float, heading_deg: float) -> float:
-    """Compass bearing (deg true, clockwise) of a direction -> listener azimuth (rad, CCW, 0=front)."""
-    return math.radians(-(bearing_deg - heading_deg))
+    """Compass bearing (deg true, clockwise) of a direction -> listener azimuth (rad, CCW, 0=front).
+
+    The result is wrapped to (-pi, pi] (directly behind is +pi), so equal directions compare equal.
+    """
+    az = math.remainder(math.radians(-(float(bearing_deg) - float(heading_deg))), 2.0 * math.pi)
+    return az + 2.0 * math.pi if az <= -math.pi else az
 
 
 @dataclass

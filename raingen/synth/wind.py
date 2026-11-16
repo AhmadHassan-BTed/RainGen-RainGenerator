@@ -3,16 +3,21 @@
 Physics implemented here:
 
 * Wind is heard through objects (MASTER_PLAN 3.6). The free-field "air movement"
-  bed models turbulence scattering around the head and near obstacles: aerodynamic
-  dipole sources radiate intensity ~U^6 (Curle 1955); for a bed dominated by
-  low-Mach turbulent flow over many obstacles we use pressure ~U^2.5 with a
-  brightness (spectral corner) rising with U.
+  bed models turbulence scattering around the head and near obstacles: compact
+  aerodynamic dipoles radiate intensity ~rho U^6 / c^3 (Curle 1955), so the bed's
+  pressure follows U^3 (60 dB per decade of wind) with a brightness (spectral corner)
+  rising with U; the felt low-frequency pseudo-sound follows dynamic pressure (U^2).
+  Levels are calibrated on the *mean* wind (the gust-weighted average of U^6 is
+  divided out), so a gustier day swings more around the same Leq.
 * Gusts follow a normalized Kaimal process (raingen.physics.wind.GustProcess) and
   are *advected* (Taylor's frozen-turbulence hypothesis): a point s metres upwind
   of the listener experiences a gust s/U seconds before the listener does. The
-  shared GustField re-runs the World's own gust stream (same RNG layer, same
-  integral time and turbulence intensity), so the gust heard in upwind trees is
-  exactly the one that reaches the listener's WeatherState.gust moments later.
+  shared GustField re-runs the World's own gust stream (same RNG layer 'wind.gust',
+  same constructor arguments, same per-block parameters and block length), so its
+  value at the listener equals WeatherState.gust exactly and the gust heard in upwind
+  trees is the one that reaches the listener moments later. Higher up, the same gust
+  has a smaller relative excursion (I_u = 1/ln(z/z0)): `remap_gust` rescales the
+  log-normal multiplier to another turbulence intensity with the same timing.
 * Beaufort ladder (WMO land descriptions): loose debris is set in motion from
   force 8 (17.2 m/s).
 * Microphone wind noise (optional "recorded-realism" artifact): turbulent
@@ -28,10 +33,17 @@ biophony,places} produces sound pressure in pascals at the listener
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
+from scipy import fft as sfft
 from scipy import signal
+
+try:                                    # the C kernel behind scipy.signal.sosfilt, without its
+    from scipy.signal._sosfilt import _sosfilt as _sosfilt_inplace    # ~150 us per-call wrapper
+except ImportError:                     # pragma: no cover - other scipy layouts
+    _sosfilt_inplace = None
 
 from raingen.core.constants import AMBI_ORDER, BLOCK, N_AMBI, SAMPLE_RATE
 from raingen.core.types import BlockContext, Emission, EventMarker
@@ -83,11 +95,32 @@ def peaking_sos(fc: float, gain_db: float, q: float, sr: int) -> np.ndarray:
                       1.0, -2.0 * c / a0, (1.0 - alpha / A) / a0]])
 
 
+def _butter_section(fc: float, sr: int, high: bool, order: int) -> np.ndarray:
+    """Closed-form bilinear Butterworth section of order 1 or 2 (what scipy.signal.butter returns, ~100x faster)."""
+    k = math.tan(math.pi * fc / sr)
+    if order == 1:
+        a1 = (k - 1.0) / (k + 1.0)
+        b0 = 1.0 / (k + 1.0) if high else k / (k + 1.0)
+        return np.array([[b0, -b0 if high else b0, 0.0, 1.0, a1, 0.0]])
+    q = math.sqrt(2.0)
+    norm = 1.0 / (1.0 + q * k + k * k)
+    a1 = 2.0 * (k * k - 1.0) * norm
+    a2 = (1.0 - q * k + k * k) * norm
+    if high:
+        return np.array([[norm, -2.0 * norm, norm, 1.0, a1, a2]])
+    b0 = k * k * norm
+    return np.array([[b0, 2.0 * b0, b0, 1.0, a1, a2]])
+
+
 def lowpass_sos(fc: float, sr: int, order: int = 2) -> np.ndarray:
+    if order in (1, 2):
+        return _butter_section(clip_f(fc, sr), sr, False, order)
     return signal.butter(order, clip_f(fc, sr), "low", fs=sr, output="sos")
 
 
 def highpass_sos(fc: float, sr: int, order: int = 2) -> np.ndarray:
+    if order in (1, 2):
+        return _butter_section(clip_f(fc, sr), sr, True, order)
     return signal.butter(order, clip_f(fc, sr), "high", fs=sr, output="sos")
 
 
@@ -140,18 +173,46 @@ def graphic_eq_sos(freqs, gains_db, sr: int, q: float = 1.41, iterations: int = 
 
 
 _NRG_W = np.unique(np.concatenate([np.geomspace(1e-5, math.pi, 1536), np.linspace(0.0, math.pi, 512)]))
+_NRG_Z1 = np.exp(-1j * _NRG_W)
+_NRG_Z2 = _NRG_Z1 * _NRG_Z1
+_NRG_DW = np.diff(_NRG_W)
 
 
 def noise_rms_gain(sos: np.ndarray) -> float:
     """RMS gain of a filter for white noise input: sqrt((1/pi) int_0^pi |H(w)|^2 dw).
 
     Integrated on a log+linear frequency grid so very narrow / very low filters
-    (a few Hz at 48 kHz) are measured accurately.
+    (a few Hz at 48 kHz) are measured accurately. The response is evaluated directly from the
+    sections (as scipy.signal.sosfreqz does, without its per-section overhead).
     """
-    _, h = signal.sosfreqz(np.atleast_2d(sos), worN=_NRG_W)
-    p = np.abs(h) ** 2
-    var = float(np.sum(0.5 * (p[1:] + p[:-1]) * np.diff(_NRG_W))) / math.pi
+    sos = np.atleast_2d(np.asarray(sos, dtype=np.float64))
+    num = sos[:, 0:1] + sos[:, 1:2] * _NRG_Z1 + sos[:, 2:3] * _NRG_Z2
+    den = sos[:, 3:4] + sos[:, 4:5] * _NRG_Z1 + sos[:, 5:6] * _NRG_Z2
+    p = np.prod((num.real ** 2 + num.imag ** 2) / np.maximum(den.real ** 2 + den.imag ** 2, 1e-300), axis=0)
+    var = float(np.dot(0.5 * (p[1:] + p[:-1]), _NRG_DW)) / math.pi
     return float(math.sqrt(max(var, 1e-24)))
+
+
+_DESIGNS: dict = {}
+
+
+def cached_design(kind: str, fc: float, sr: int, build, grid: float = 1.02) -> tuple[np.ndarray, float, float]:
+    """(sos, white-noise RMS gain, grid frequency) of `build(f)` with fc snapped to a log grid.
+
+    Per-block retuned filters (gust-driven corners) revisit the same frequencies, so designs and
+    their noise gains are shared across blocks and generator instances. `kind` must identify
+    everything `build` depends on besides the frequency (and the sample rate).
+    """
+    k = int(round(math.log(max(float(fc), 1.0)) / math.log(grid)))
+    key = (kind, int(sr), float(grid), k)
+    d = _DESIGNS.get(key)
+    if d is None:
+        f = grid ** k
+        sos = np.ascontiguousarray(np.atleast_2d(build(f)), dtype=np.float64)
+        d = (sos, noise_rms_gain(sos), f)
+        if len(_DESIGNS) < 8192:
+            _DESIGNS[key] = d
+    return d
 
 
 def bandpass_rms_gain(fc: float, q: float, sr: int, cascade: int = 1) -> float:
@@ -191,33 +252,95 @@ def upwind_distance(position, wind_azimuth: float) -> float:
     return x * math.cos(wind_azimuth) + y * math.sin(wind_azimuth)
 
 
+def sosfilt_inplace(sos: np.ndarray, x: np.ndarray, zi: np.ndarray) -> None:
+    """Filter the rows of C-contiguous float64 `x` (K, n) in place; `zi` (K, sections, 2) is updated.
+
+    Bit-identical to scipy.signal.sosfilt (same C kernel) but without its per-call array-API
+    validation, which costs several times the filtering itself on 1024-sample blocks.
+    """
+    if _sosfilt_inplace is not None:
+        _sosfilt_inplace(sos, x, zi)
+        return
+    y, zf = signal.sosfilt(sos, x, axis=-1, zi=np.moveaxis(zi, 1, 0))      # pragma: no cover
+    x[...] = y
+    zi[...] = np.moveaxis(zf, 0, 1)
+
+
 class StatefulSOS:
     """sosfilt with state carried across blocks, for (n,) or (C, n) signals.
 
     Coefficients may be replaced between blocks (gradual parameter changes); the
-    state is kept when the section count is unchanged.
+    state is kept when the section count is unchanged. The state is held as
+    (channels, sections, 2) and the filter runs in the sosfilt C kernel directly.
     """
 
     def __init__(self, sos: np.ndarray):
-        self.sos = np.atleast_2d(np.asarray(sos, dtype=float))
+        self.sos = np.ascontiguousarray(np.atleast_2d(np.asarray(sos, dtype=np.float64)))
         self.zi: Optional[np.ndarray] = None
 
     def set(self, sos: np.ndarray) -> None:
-        sos = np.atleast_2d(np.asarray(sos, dtype=float))
+        sos = np.ascontiguousarray(np.atleast_2d(np.asarray(sos, dtype=np.float64)))
         if sos.shape != self.sos.shape:
             self.zi = None
         self.sos = sos
 
     def process(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        shape = (self.sos.shape[0],) + x.shape[:-1] + (2,)
-        if self.zi is None or self.zi.shape != shape:
-            self.zi = np.zeros(shape)
-        y, self.zi = signal.sosfilt(self.sos, x, axis=-1, zi=self.zi)
-        return y
+        x = np.asarray(x, dtype=np.float64)
+        shape = x.shape
+        n = shape[-1]
+        k = int(np.prod(shape[:-1], dtype=np.int64)) if len(shape) > 1 else 1
+        y = np.array(x.reshape(k, n), dtype=np.float64, order="C", copy=True)
+        if self.zi is None or self.zi.shape != (k, self.sos.shape[0], 2):
+            self.zi = np.zeros((k, self.sos.shape[0], 2))
+        if n:
+            sosfilt_inplace(self.sos, y, self.zi)
+        return y.reshape(shape)
 
     def reset(self) -> None:
         self.zi = None
+
+
+_FRAC_CACHE: dict[int, np.ndarray] = {}
+
+
+def ramp_frac(n: int) -> np.ndarray:
+    """(1..n)/n, cached per block length (read-only)."""
+    r = _FRAC_CACHE.get(n)
+    if r is None:
+        r = np.arange(1, n + 1, dtype=float) / max(n, 1)
+        r.setflags(write=False)
+        _FRAC_CACHE[n] = r
+    return r
+
+
+class AirPath:
+    """ISO 9613-1 absorption over a fixed path for a static source (raingen.physics.atmosphere design).
+
+    Runs as a StatefulSOS (the sosfilt C kernel, no per-call wrapper) and is redesigned only when
+    the temperature moves by 1 C or the humidity by 5 %; paths up to `min_m` pass unchanged.
+    """
+
+    def __init__(self, distance_m: float, sr: int = SAMPLE_RATE, min_m: float = 3.0):
+        self.d = float(distance_m)
+        self.sr = int(sr)
+        self.min_m = float(min_m)
+        self.key = None
+        self.filt: Optional[StatefulSOS] = None
+
+    def process(self, x: np.ndarray, temp_c: float, rh_pct: float) -> np.ndarray:
+        if self.d <= self.min_m:
+            return x
+        key = (round(float(temp_c)), round(float(rh_pct) / 5.0))
+        if key != self.key:
+            from raingen.physics.atmosphere import air_absorption_sos
+
+            sos = air_absorption_sos(self.d, float(temp_c), float(rh_pct), self.sr)
+            if self.filt is None:
+                self.filt = StatefulSOS(sos)
+            else:
+                self.filt.set(sos)
+            self.key = key
+        return self.filt.process(x)
 
 
 class Ramp:
@@ -229,8 +352,7 @@ class Ramp:
     def __call__(self, target, n: int) -> np.ndarray:
         v1 = np.asarray(target, dtype=float)
         v0 = np.broadcast_to(self.value, v1.shape) if self.value.shape != v1.shape else self.value
-        frac = np.arange(1, n + 1, dtype=float) / n
-        out = v0[..., None] + (v1 - v0)[..., None] * frac
+        out = v0[..., None] + (v1 - v0)[..., None] * ramp_frac(n)
         self.value = v1.copy()
         return out
 
@@ -299,60 +421,393 @@ def gust_integral_time_s(wind, u10: float, z0: float, listener_h: float) -> floa
     return float(kaimal_integral_time_s(wind_at_height(u10, z, z0), max(z, 1.0)))
 
 
-def ear_turbulence_intensity(wind, z0: float, listener_h: float) -> float:
-    """Turbulence intensity at the ears; a user TI / gust factor refers to 10 m (neutral profile ratio)."""
+def ear_turbulence_intensity(wind, z0: float, listener_h: float, stability_factor: float = 1.0) -> float:
+    """Turbulence intensity at the ears; a user TI / gust factor refers to 10 m (neutral profile ratio).
+
+    With automatic turbulence the World also scales the intensity by its stability factor
+    (sqrt 2 unstable, 1 neutral, sqrt 0.5 stable; Bolin); pass it to reproduce the World exactly.
+    """
     ti10_auto = float(turbulence_intensity_for(z0, 10.0))
+    auto = False
     if getattr(wind, "turbulence_intensity", None) is not None:
         ti10 = float(wind.turbulence_intensity)
     elif getattr(wind, "gust_factor", None) is not None:
         ti10 = max(float(wind.gust_factor) - 1.0, 0.0) / 3.0
     else:
         ti10 = ti10_auto
+        auto = True
     ti = float(turbulence_intensity_for(z0, max(float(listener_h), 0.3))) * ti10 / max(ti10_auto, 1e-6)
+    if auto:
+        ti *= float(stability_factor)
     return float(min(max(ti, 0.0), 0.8))
+
+
+def initial_stability_factor(scene) -> float:
+    """The World's starting gust-variance stability factor for `scene` (raingen.physics.world)."""
+    from raingen.physics import world as _world
+
+    w0 = scene.weather
+    ptype = str(w0.precipitation.type).lower()
+    rate0 = 0.0 if ptype == "none" else max(float(w0.precipitation.rate_mm_h), 0.0)
+    day0 = _world.is_daytime(float(w0.hour), float(getattr(w0, "latitude_deg", 50.0)), str(w0.season))
+    stab0 = _world.stability_class(day0, float(w0.cloud_okta), max(float(w0.wind.speed_mps), 0.0), rate0)
+    table = getattr(_world, "_STABILITY_TI", {"unstable": math.sqrt(2.0), "neutral": 1.0, "stable": math.sqrt(0.5)})
+    return float(table.get(stab0, 1.0))
+
+
+def lognormal_sigma(ti: float) -> float:
+    """Log-std s of a mean-one log-normal multiplier with relative std `ti` (s^2 = ln(1 + ti^2))."""
+    return math.sqrt(math.log1p(max(float(ti), 0.0) ** 2))
+
+
+def remap_gust(g, ti_from: float, ti_to: float):
+    """Rescale a mean-one log-normal gust multiplier from turbulence intensity ti_from to ti_to.
+
+    g = exp(s Z - s^2/2) is mapped to exp(s' Z - s'^2/2) with the same Z, so the gust keeps its
+    timing and only its relative excursion changes (e.g. ears -> crown height, where
+    I_u = 1/ln(z/z0) is smaller). Works on scalars and arrays.
+    """
+    s0 = lognormal_sigma(ti_from)
+    s1 = np.sqrt(np.log1p(np.maximum(np.asarray(ti_to, dtype=float), 0.0) ** 2))
+    if s0 < 1e-6 or np.all(np.abs(s1 - s0) < 1e-9):
+        return g
+    z = (np.log(np.maximum(g, 1e-6)) + 0.5 * s0 * s0) / s0
+    out = np.exp(s1 * z - 0.5 * s1 * s1)
+    return float(out) if np.ndim(out) == 0 else out
+
+
+def gust_power_mean(exponent: float, ti: float) -> float:
+    """E[g^k] for a mean-one log-normal multiplier: exp(k (k - 1) s^2 / 2), s^2 = ln(1 + ti^2).
+
+    Dividing a U^k level law by this calibrates it on the mean wind (the empirical laws of
+    Curle-type and vegetation noise are fitted to Leq against the mean wind speed).
+    """
+    s2 = math.log1p(max(float(ti), 0.0) ** 2)
+    k = float(exponent)
+    return math.exp(0.5 * k * (k - 1.0) * s2)
 
 
 class GustField:
     """Advected along-wind gust field shared by every wind emitter (Taylor's hypothesis).
 
-    Re-runs the World's gust stream (RNG layer 'wind.gust', same integral time and
-    turbulence intensity, updated from each block's WeatherState), so `at(0, U)` equals
-    WeatherState.gust. A point `upwind_m` metres upwind sees the listener's gust
-    upwind_m / U seconds *earlier* (the GustProcess runs ahead by its lead time); a
-    downwind point sees it later. Upwind trees therefore rustle first and the gust then
-    sweeps past the listener.
+    Re-runs the World's gust stream: a GustProcess on the same RNG layer ('wind.gust') with the
+    same constructor arguments as raingen.physics.world.World (integral time, turbulence
+    intensity incl. the initial stability factor, control rate = sr / block), stepped with the
+    same per-block parameters taken from each block's WeatherState. `value` (= `at(0, U)`)
+    therefore equals WeatherState.gust exactly. The block length is adopted from the first
+    rendered block (`advance(..., n=ctx.n)`), so any engine block size stays in step.
+
+    A point `upwind_m` metres upwind sees the listener's gust upwind_m / U seconds *earlier*
+    (the GustProcess runs ahead by its lead time); a downwind point sees it later. Upwind
+    trees therefore rustle first and the gust then sweeps past the listener.
     """
 
-    LAYER = "wind.gust"
+    LAYER = "wind.gust"            # == raingen.physics.world.World.GUST_LAYER
 
     def __init__(self, scene, rngf, sr: int = SAMPLE_RATE, block: int = BLOCK):
+        from raingen.physics.world import World
+
+        self.LAYER = str(getattr(World, "GUST_LAYER", GustField.LAYER))
         w = scene.weather.wind
         self.wind = w
+        self.rngf = rngf
+        self.sr = int(sr)
         self.z0 = scene_z0(scene)
         self.listener_h = float(scene.listener.height_m)
         u10 = max(float(w.speed_mps), 0.0)
-        self.proc = GustProcess(rngf, self.LAYER,
-                                integral_time_s=gust_integral_time_s(w, u10, self.z0, self.listener_h),
-                                ti=ear_turbulence_intensity(w, self.z0, self.listener_h),
-                                control_rate=sr / block)
+        stab0 = initial_stability_factor(scene)
+        try:
+            # the World's own parameter code (run on a stand-in carrying its z0 and stability factor), so
+            # the constructor arguments match World.gusts by construction
+            shim = SimpleNamespace(z0=self.z0, _stab_factor=stab0)
+            T0, ti0 = World._gust_params(shim, w, self.listener_h)
+        except (AttributeError, TypeError):                              # pragma: no cover - older World
+            T0 = gust_integral_time_s(w, u10, self.z0, self.listener_h)
+            ti0 = ear_turbulence_intensity(w, self.z0, self.listener_h, stab0)
+        self._T0, self._ti0 = float(T0), float(ti0)
+        self.block = int(block)
+        self.proc = self._make_proc(self.block)
         self.lead_s = float(self.proc.lead_s)
         self.history_s = float(self.proc.history_s)
         self.value = 1.0
+        self.ti = float(self._ti0)
         self._last: Optional[int] = None
 
-    def advance(self, block_index: int, weather=None) -> None:
+    def _make_proc(self, block: int) -> GustProcess:
+        return GustProcess(self.rngf, self.LAYER, integral_time_s=self._T0, ti=self._ti0,
+                           control_rate=self.sr / max(int(block), 1))
+
+    def advance(self, block_index: int, weather=None, n: Optional[int] = None) -> None:
         b = int(block_index)
+        if n is not None and int(n) != self.block:
+            # the World steps its gusts once per engine block: follow its control rate
+            self.block = int(n)
+            self.proc = self._make_proc(self.block)
+            self._last = None
         if self._last == b:
             return
         if weather is not None:
             T = gust_integral_time_s(self.wind, max(float(weather.wind_u10_mps), 0.0), self.z0, self.listener_h)
-            self.proc.set_params(T, float(weather.turbulence_intensity))
+            self.ti = float(weather.turbulence_intensity)
+            self.proc.set_params(T, self.ti)
         self.value = float(self.proc.step(b))
         self._last = b
 
     def at(self, upwind_m: float, u_mps: float) -> float:
         """Gust multiplier at a point `upwind_m` metres upwind (negative = downwind) of the listener."""
         return max(0.05, float(self.proc.at_position(float(upwind_m), max(float(u_mps), 0.5))))
+
+    def at_many(self, upwind_m, u_mps) -> np.ndarray:
+        """`at` for arrays of points (one value per point), vectorised over the process history.
+
+        Same arithmetic as GustProcess.at_position / at_delay (linear interpolation of the control-rate
+        history, clamped to what is available), so each value equals the scalar `at` bit for bit.
+        """
+        up = np.atleast_1d(np.asarray(upwind_m, dtype=float))
+        u = np.broadcast_to(np.atleast_1d(np.asarray(u_mps, dtype=float)), up.shape)
+        p = self.proc
+        try:
+            block, buf, n_hist, rate = p._block, p._buf, p._n_hist, p.control_rate
+            lo, hi = p._available()
+        except AttributeError:                                           # pragma: no cover - other GustProcess
+            return np.array([self.at(a, b) for a, b in zip(up, u)])
+        if block < 0:
+            return np.ones(up.shape)
+        delay = -up / np.maximum(np.maximum(u, 0.5), 0.5)
+        pos = np.clip(block - delay * rate, float(lo), float(hi))
+        i0 = np.floor(pos).astype(np.int64)
+        frac = pos - i0
+        i1 = np.minimum(i0 + 1, hi)
+        v0 = buf[i0 % n_hist]
+        v1 = buf[i1 % n_hist]
+        return np.maximum(0.05, v0 + (v1 - v0) * frac)
+
+
+# --------------------------------------------------------------------------
+# Vectorised synthesis helpers (shaped-noise banks, static SH encoding)
+# --------------------------------------------------------------------------
+
+def bandpass_mag2(f: np.ndarray, fc, q) -> np.ndarray:
+    """|H|^2 of a 0 dB-peak analog band-pass, 1 / (1 + Q^2 (f/fc - fc/f)^2); broadcasts fc, q against f."""
+    fc = np.maximum(np.asarray(fc, dtype=float), 1e-3)
+    q = np.asarray(q, dtype=float)
+    ff = np.maximum(f, 1e-3)
+    x = q * (ff / fc - fc / ff)
+    return 1.0 / (1.0 + x * x)
+
+
+def bandpass_coefs(fc, q, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised RBJ 0 dB-peak band-pass: (b (..., 3), a (..., 3)) with a0 = 1."""
+    fc = np.clip(np.asarray(fc, dtype=float), 5.0, 0.45 * sr)
+    q = np.maximum(np.asarray(q, dtype=float), 0.05)
+    w0 = 2.0 * np.pi * fc / sr
+    alpha = np.sin(w0) / (2.0 * q)
+    a0 = 1.0 + alpha
+    zero = np.zeros_like(alpha)
+    b = np.stack([alpha / a0, zero, -alpha / a0], axis=-1)
+    a = np.stack([np.ones_like(alpha), -2.0 * np.cos(w0) / a0, (1.0 - alpha) / a0], axis=-1)
+    return b, a
+
+
+def biquad_response(b: np.ndarray, a: np.ndarray, zinv: np.ndarray) -> np.ndarray:
+    """Complex response of biquads (..., 3) on the unit-circle points z^-1 = `zinv` (F,) -> (..., F)."""
+    z1 = zinv
+    z2 = zinv * zinv
+    num = b[..., 0:1] + b[..., 1:2] * z1 + b[..., 2:3] * z2
+    den = a[..., 0:1] + a[..., 1:2] * z1 + a[..., 2:3] * z2
+    return num / den
+
+
+_U16_STD = math.sqrt((65536.0 ** 2 - 1.0) / 12.0)       # std of a uniform int16 (zero mean after +0.5)
+
+
+def white_spectrum(rng: np.random.Generator, rows: int, bins: int) -> np.ndarray:
+    """(rows, bins) complex white spectrum, zero-mean unit-variance parts, from uniform int16 draws.
+
+    A time-domain sample of the inverse FFT sums ~`bins` independent parts, so it is Gaussian by the
+    central limit theorem (excess kurtosis ~ -1.2 / bins) while the draws cost ~8x less than
+    standard normals from the Philox streams.
+    """
+    x = np.frombuffer(rng.bytes(4 * rows * bins), dtype=np.int16).astype(np.float64)
+    x += 0.5
+    x *= 1.0 / _U16_STD
+    return x.view(np.complex128).reshape(rows, bins)
+
+
+class ShapedNoiseOLA:
+    """Gaussian noise for V voices with a per-block magnitude spectrum each (vectorised).
+
+    Each block draws one random frame of 2n samples per voice directly in the frequency
+    domain (unit-variance white, `white_spectrum`), multiplies it by |H_v(f)| on the frame's rfft grid and
+    overlap-adds it with a sine window at 50 % overlap (w^2 sums to 1, so independent
+    frames keep the variance stationary). Spectral changes therefore crossfade over one
+    block without clicks, and a whole bank of differently filtered voices costs one batched
+    inverse FFT. Output variance of voice v is sum_k wgt_k |H_v,k|^2 (`power`), so a
+    component spectrum B is normalised to unit variance by dividing by sqrt(power(B)).
+    """
+
+    def __init__(self, voices: int, sr: int = SAMPLE_RATE):
+        self.V = int(voices)
+        self.sr = int(sr)
+        self.n = 0
+        self.tail: Optional[np.ndarray] = None
+
+    def setup(self, n: int) -> None:
+        if n == self.n:
+            return
+        self.n = int(n)
+        N = 2 * self.n
+        self.N = N
+        self.freqs = np.fft.rfftfreq(N, 1.0 / self.sr)
+        F = self.freqs.size
+        wgt = np.full(F, 2.0 / N)
+        wgt[0] = 1.0 / N
+        if N % 2 == 0:
+            wgt[-1] = 1.0 / N
+        self.wgt = wgt
+        self.window = np.sin(np.pi * (np.arange(N) + 0.5) / N)
+        self.zinv = np.exp(-2j * np.pi * self.freqs / self.sr)
+        # unit-variance white frame: complex bins carry N/2 per part, DC and Nyquist are real with N
+        # (irfft ignores their imaginary parts)
+        scale = np.full(F, math.sqrt(N / 2.0))
+        scale[0] = math.sqrt(N)
+        if N % 2 == 0:
+            scale[-1] = math.sqrt(N)
+        self.scale = scale
+        self.tail = None
+
+    def power(self, mag2: np.ndarray) -> np.ndarray:
+        """Output variance for squared magnitudes `mag2` (..., F) on this grid."""
+        return mag2 @ self.wgt
+
+    def process(self, rng: np.random.Generator, mag: Optional[np.ndarray], n: int) -> np.ndarray:
+        """(V, n) noise for magnitudes `mag` (V, F) (None = silence; the previous frame still decays)."""
+        self.setup(n)
+        N = self.N
+        if mag is None:
+            out = np.zeros((self.V, n)) if self.tail is None else self.tail
+            self.tail = None
+            return out
+        spec = white_spectrum(rng, self.V, self.freqs.size)
+        spec *= mag * self.scale
+        frame = sfft.irfft(spec, N, axis=1, overwrite_x=True)
+        frame *= self.window
+        out = frame[:, :n]
+        if self.tail is not None:
+            out += self.tail
+        self.tail = frame[:, n:]
+        return out
+
+    @property
+    def active(self) -> bool:
+        return self.tail is not None
+
+
+class FramedNoise:
+    """Gaussian noise for V voices with a slowly varying magnitude spectrum, independent of the block length.
+
+    Frames of 2 hop samples (sine window, 50 % overlap-add, w^2 sums to 1) are drawn in the frequency
+    domain (`white_spectrum`) and shaped by |H_v(f)|; frame k covers stream samples [k hop, k hop + 2 hop)
+    and `spectrum(k)` -> (rng, mag (V, F)) is asked once per frame, so a spectrum can follow a quantity at
+    the frame centre (k + 1) hop and the stream is the same for any engine block length. The fine
+    resolution sr / (2 hop) (5.9 Hz for hop 4096) suits low, narrow spectra such as thunder's sub-bass,
+    which a block-sized frame (23 Hz bins at 1024) would smear. Variance per voice is `power(|H|^2)`.
+    """
+
+    def __init__(self, voices: int, hop: int = 4096, sr: int = SAMPLE_RATE):
+        self.V = int(voices)
+        self.hop = int(hop)
+        self.sr = int(sr)
+        N = 2 * self.hop
+        self.N = N
+        self.freqs = np.fft.rfftfreq(N, 1.0 / self.sr)
+        F = self.freqs.size
+        wgt = np.full(F, 2.0 / N)
+        wgt[0] = 1.0 / N
+        wgt[-1] = 1.0 / N
+        self.wgt = wgt
+        self.window = np.sin(np.pi * (np.arange(N) + 0.5) / N)
+        scale = np.full(F, math.sqrt(N / 2.0))
+        scale[0] = scale[-1] = math.sqrt(N)
+        self.scale = scale
+        self.buf = np.zeros((self.V, 0))
+        self.tail = np.zeros((self.V, self.hop))
+        self.k = 0                                  # next frame index
+
+    def power(self, mag2: np.ndarray) -> np.ndarray:
+        return mag2 @ self.wgt
+
+    def process(self, n: int, spectrum) -> np.ndarray:
+        """The next n samples (V, n); `spectrum(k)` returns (rng, mag (V, F)) for frame k."""
+        parts = [self.buf]
+        have = self.buf.shape[1]
+        while have < n:
+            rng, mag = spectrum(self.k)
+            spec = white_spectrum(rng, self.V, self.freqs.size)
+            spec *= mag * self.scale
+            frame = sfft.irfft(spec, self.N, axis=1, overwrite_x=True)
+            frame *= self.window
+            parts.append(frame[:, : self.hop] + self.tail)
+            self.tail = frame[:, self.hop:]
+            have += self.hop
+            self.k += 1
+        allb = np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        self.buf = allb[:, n:]
+        return allb[:, :n]
+
+
+class StaticSHEncoder:
+    """V fixed mono sources (V, n) -> one (N_AMBI, n) bus, as raingen.spatial.encoder.Encoder would.
+
+    Uses the encoder's own spread model (`spread_gains`: cap-weighted coherent part plus a
+    spread^2 energy share rendered through the fixed decorrelator bank). Decorrelation is linear
+    and the same FIR per channel serves every source, so the diffuse parts of all voices are
+    summed per channel first and decorrelated once: one emission and one FFT pass per block
+    instead of one encoder call (and decorrelator pass) per voice.
+    """
+
+    DIFFUSE_FLOOR = 0.1        # spreads up to this keep no diffuse part (<= 1 % of their energy, -0.04 dB)
+
+    def __init__(self, az, el, spread, order: int = AMBI_ORDER, sr: int = SAMPLE_RATE):
+        from raingen.spatial.encoder import DecorrelatorBank, spread_gains
+
+        az = np.atleast_1d(np.asarray(az, dtype=float))
+        el = np.broadcast_to(np.atleast_1d(np.asarray(el, dtype=float)), az.shape)
+        sp = np.broadcast_to(np.atleast_1d(np.asarray(spread, dtype=float)), az.shape)
+        n_ch = (int(order) + 1) ** 2
+        g_coh = np.zeros((n_ch, az.size))
+        g_dif = np.zeros((n_ch, az.size))
+        for v in range(az.size):
+            c, d = spread_gains(int(order), float(az[v]), float(el[v]), float(sp[v]))
+            g_coh[:, v] = c
+            # near-point sources: skip the decorrelator pass for a diffuse share of at most spread^2
+            g_dif[:, v] = d if float(sp[v]) > self.DIFFUSE_FLOOR else 0.0
+        self.g_coh = g_coh
+        self.g_dif = g_dif[1:]
+        self.channels = n_ch
+        self.dec = DecorrelatorBank(n_ch - 1, sr) if float(np.max(self.g_dif, initial=0.0)) > 0.0 else None
+        self.tail: Optional[np.ndarray] = None
+
+    def process(self, y: np.ndarray) -> np.ndarray:
+        n = y.shape[1]
+        out = self.g_coh @ y
+        if self.dec is None:
+            return out
+        L = self.dec.length
+        d = self.g_dif @ y
+        if self.tail is None and not np.any(d):
+            return out
+        if hasattr(self.dec, "process_multi"):
+            wet, tail = self.dec.process_multi(d, self.tail)
+        else:                                                            # pragma: no cover - older encoder
+            nfft = 1 << max(1, int(n + L - 2).bit_length())
+            full = sfft.irfft(self.dec.spectrum(nfft) * sfft.rfft(d, nfft, axis=1), nfft, axis=1)[:, : n + L - 1]
+            if self.tail is not None:
+                full[:, : L - 1] += self.tail
+            wet, tail = full[:, :n], full[:, n:]
+        out[1:] += wet
+        self.tail = tail.copy() if np.any(tail) else None
+        return out
 
 
 class SparseModalBank:
@@ -417,11 +872,18 @@ class SparseModalBank:
 # Wind bed
 # --------------------------------------------------------------------------
 
+BED_REF_DB = 56.0          # omni air-movement bed at a mean ear-height wind of 10 m/s (dB SPL)
+BED_EXPONENT = 3.0         # p ~ U^3: compact aerodynamic dipoles, intensity ~ U^6 (Curle 1955)
+RUMBLE_REF_DB = 46.0       # low-frequency pseudo-sound at 10 m/s (dB SPL), p' ~ rho U u' ~ U^2 (below the bed)
+BED_ADVECT_M = 3.0         # each bed direction hears the turbulence of obstacles a few metres away
+BED_FLUTTER = 0.15         # independent per-direction flutter (log-std per unit turbulence intensity)
+
+
 def _bed_amplitude(u: float) -> float:
-    """RMS pressure of the omni air-movement bed vs wind at ear height (~56 dB at 10 m/s)."""
+    """RMS pressure of the omni air-movement bed vs wind at ear height (~56 dB at 10 m/s, U^3)."""
     if u <= 0.0:
         return 0.0
-    return db_spl(56.0) * (u / 10.0) ** 2.5 * smoothstep(u, 0.3, 1.5)
+    return db_spl(BED_REF_DB) * (u / 10.0) ** BED_EXPONENT * smoothstep(u, 0.3, 1.5)
 
 
 def _debris_burst(rng: np.random.Generator, sr: int) -> np.ndarray:
@@ -461,14 +923,14 @@ class WindGenerator:
         self.dir_az = 2.0 * np.pi * k / self.N_DIR
         self.dir_el = np.where(k % 2 == 0, 0.25, -0.1)
         self.Y = np.stack([sh_gains(a, e, spread=0.3) for a, e in zip(self.dir_az, self.dir_el)], axis=1)
-        self.pink_hp = StatefulSOS(np.vstack([slope_sos(-10.0, 20.0, 16000.0, sr), highpass_sos(18.0, sr)]))
+        self._pink = np.vstack([slope_sos(-10.0, 20.0, 16000.0, sr), highpass_sos(18.0, sr)])
         self._fc = 0.0
-        self.lp = StatefulSOS(lowpass_sos(500.0, sr))
+        self.shape = StatefulSOS(np.vstack([self._pink, lowpass_sos(500.0, sr)]))
         self._norm = 1.0
         self._set_brightness(500.0)
-        self.rumble = StatefulSOS(lowpass_sos(60.0, sr))
+        sos, self._rnorm, _ = cached_design("wind.rumble", 60.0, sr, lambda f: lowpass_sos(f, sr), grid=1.03)
+        self.rumble = StatefulSOS(sos)
         self._rfc = 60.0
-        self._rnorm = noise_rms_gain(self.rumble.sos)
         self.bed_ramp = Ramp(np.zeros(self.N_DIR))
         self.rumble_ramp = Ramp(0.0)
         self.turb = np.zeros(self.N_DIR)
@@ -479,9 +941,12 @@ class WindGenerator:
     def _set_brightness(self, fc: float) -> None:
         if self._fc and abs(fc - self._fc) / self._fc < 0.03:
             return
+        # designs are cached on a 2 % log-frequency grid: gusts revisit the same corners
+        sos, norm, _ = cached_design("wind.bed", fc, self.sr,
+                                     lambda f: np.vstack([self._pink, lowpass_sos(f, self.sr)]))
         self._fc = fc
-        self.lp.set(lowpass_sos(fc, self.sr))
-        self._norm = noise_rms_gain(np.vstack([self.pink_hp.sos, self.lp.sos]))
+        self.shape.set(sos)
+        self._norm = norm
 
     def _gust_marker(self, ctx: BlockContext, u: float, gust: float, ti: float) -> None:
         """EventMarker('gust') when the gust multiplier crosses ~1.6 sigma (with hysteresis)."""
@@ -502,7 +967,7 @@ class WindGenerator:
     def render(self, ctx: BlockContext) -> list[Emission]:
         w = ctx.weather
         n, sr = ctx.n, ctx.sr
-        self.field.advance(ctx.index, w)
+        self.field.advance(ctx.index, w, n)
         u = max(float(w.wind_listener_mps), 0.0)
         gust = max(float(w.gust), 0.05)
         u_mean = u / gust
@@ -517,30 +982,33 @@ class WindGenerator:
         a = math.exp(-(n / sr) / 2.0)
         self.turb = a * self.turb + math.sqrt(1.0 - a * a) * rng.standard_normal(self.N_DIR)
 
-        # each direction hears the air ~30 m away: upwind directions get the gust first
+        # each direction hears the obstacles a few metres away: upwind directions get the gust a
+        # fraction of a second first, so gusts sweep across the bed while it stays locked to the
+        # listener's gust; a small independent flutter per direction keeps the bed alive
         rel = np.cos(self.dir_az - w.wind_azimuth)
         weight = 0.35 + 0.65 * ((1.0 + rel) / 2.0) ** 2
         weight = weight / math.sqrt(float(np.sum(weight ** 2)))
-        amps = np.empty(self.N_DIR)
-        for k in range(self.N_DIR):
-            gk = self.field.at(30.0 * rel[k], u_mean)
-            uk = u_mean * gk * math.exp(0.3 * ti * self.turb[k])
-            amps[k] = _bed_amplitude(uk) * weight[k]
+        g_dir = self.field.at_many(BED_ADVECT_M * rel, u_mean) * np.exp(BED_FLUTTER * ti * self.turb)
+        # Leq follows the mean-wind law: divide out E[(g e^{flutter ti Z})^3^2] of the log-normal gusts
+        s2 = math.log1p(ti * ti)
+        norm = math.exp(0.5 * BED_EXPONENT * (BED_EXPONENT - 1.0) * s2 + 0.5 * (BED_FLUTTER * BED_EXPONENT * ti) ** 2)
+        amps = _bed_amplitude(u_mean) * g_dir ** BED_EXPONENT / math.sqrt(norm) * weight
 
         self._set_brightness(min(120.0 + 75.0 * u, 5000.0))
         noise = rng.standard_normal((self.N_DIR, n))
-        shaped = self.lp.process(self.pink_hp.process(noise)) / self._norm
-        bed = shaped * self.bed_ramp(amps, n)
-        bus = self.Y @ bed
+        shaped = self.shape.process(noise)
+        shaped *= self.bed_ramp(amps / self._norm, n)
+        bus = self.Y @ shaped
 
-        # Low broadband air movement (pressure fluctuation felt more than heard), omni
+        # Low broadband air movement (pressure fluctuation felt more than heard), omni, ~U^2
         rfc = 40.0 + 6.0 * u
         if abs(rfc - self._rfc) / self._rfc > 0.05:
             self._rfc = rfc
-            self.rumble.set(lowpass_sos(rfc, sr))
-            self._rnorm = noise_rms_gain(self.rumble.sos)
-        r_amp = db_spl(52.0) * (u / 10.0) ** 2 * smoothstep(u, 0.5, 3.0)
-        bus[0] += self.rumble.process(rng.standard_normal(n)) / self._rnorm * self.rumble_ramp(r_amp, n)
+            sos, self._rnorm, _ = cached_design("wind.rumble", rfc, sr, lambda f: lowpass_sos(f, sr), grid=1.03)
+            self.rumble.set(sos)
+        r_amp = (db_spl(RUMBLE_REF_DB) * (u_mean / 10.0) ** 2 * smoothstep(u_mean, 0.5, 3.0)
+                 * gust ** 2 / math.sqrt(gust_power_mean(4.0, ti)))
+        bus[0] += self.rumble.process(rng.standard_normal(n)) * self.rumble_ramp(r_amp / self._rnorm, n)
 
         # Debris from Beaufort 8 (17.2 m/s): twigs and litter skittering past
         if u > 15.0:
@@ -603,9 +1071,11 @@ class MicRumbleGenerator:
     def _design(self, fc: float) -> None:
         if self._fc and abs(fc - self._fc) / self._fc < 0.05:
             return
+        sos, norm, _ = cached_design("wind.mic", fc, self.sr, lambda f: np.vstack(
+            [self.tilt, signal.butter(1, clip_f(f, self.sr), "low", fs=self.sr, output="sos")]), grid=1.03)
         self._fc = fc
-        self.filt.set(np.vstack([self.tilt, signal.butter(1, clip_f(fc, self.sr), "low", fs=self.sr, output="sos")]))
-        self._norm = noise_rms_gain(self.filt.sos)
+        self.filt.set(sos)
+        self._norm = norm
 
     def render(self, ctx: BlockContext) -> list[Emission]:
         u = max(float(ctx.weather.wind_listener_mps), 0.0) * self.exposure

@@ -10,7 +10,9 @@ sleep / focus / asmr') and METAR present-weather groups ('+TSRA', 'VCTS',
 '-FZDZ'). A whole METAR pasted as text is routed to the METAR parser.
 
 `parse_text` returns what was recognised (for the "shown to the user before
-applying" step); `scene_from_text` applies it on top of a base scene.
+applying" step); `scene_from_text` applies it on top of a base scene. With
+`strict=True` both raise `TextParseError` when nothing in the text is known
+vocabulary, instead of silently returning the base scene.
 """
 
 from __future__ import annotations
@@ -27,6 +29,10 @@ from .schema import Scene
 _NUM = r"(\d+(?:[.,]\d+)?)"
 _SPEED_UNIT = r"(mph|km/h|kmh|kph|km\s*per\s*hour|kilometers per hour|kilometres per hour|kts?|knots?|kn|m/s|mps|meters per second|metres per second)"
 _DIST_UNIT = r"(km|kilometres?|kilometers?|mi|miles?|nm|nautical miles?|m|metres?|meters?)"
+
+
+class TextParseError(ValueError):
+    """Strict parsing found no known weather vocabulary in the text."""
 
 
 @dataclass
@@ -49,6 +55,11 @@ class ParseResult:
 
     def has(self, path: str) -> bool:
         return path in self.assignments
+
+    @property
+    def understood(self) -> bool:
+        """True when any phrase was recognised (a place, surface, emitter or assignment)."""
+        return bool(self.matched or self.assignments or self.place)
 
 
 def _find(pattern: str, text: str) -> Optional[re.Match]:
@@ -100,7 +111,8 @@ _PRECIP_RULES: list[tuple[str, str, Optional[float], dict]] = [
     (r"\b(?:heavy|hard)\s+showers?\b", "showers", 15.0, {"weather.precipitation.character": "showery"}),
     (r"\b(?:heavy|hard|driving|intense)\s+rain\w*\b", "rain", 20.0, {}),
     (r"\bheavy\s+drizzle\b", "drizzle", 0.8, {"weather.precipitation.drops": "fine"}),
-    (r"\blight\s+drizzle\b|\bmizzle\b|\bscotch\s+mist\b|\bmisty\s+rain\b", "drizzle", 0.1, {"weather.precipitation.drops": "fine"}),
+    # WMO slight drizzle is < 0.1 mm/h (moderate 0.1-0.5, heavy >= 0.5)
+    (r"\blight\s+drizzle\b|\bmizzle\b|\bscotch\s+mist\b|\bmisty\s+rain\b", "drizzle", 0.08, {"weather.precipitation.drops": "fine"}),
     (r"\bdrizzl\w*\b", "drizzle", 0.3, {"weather.precipitation.drops": "fine"}),
     (r"\b(?:light|gentle|soft|slight|fine|little|bit\s+of)\s+(?:rain|showers?)\b|\bspitting\b|\bsprinkl\w*\b", "rain", 1.2, {}),
     (r"\b(?:moderate|steady|constant|persistent|continuous)\s+rain\b", "rain", 5.0, {"weather.precipitation.character": "continuous"}),
@@ -511,8 +523,10 @@ def _mode_render(t: str, r: ParseResult) -> None:
         r.set("listener.render", "binaural", "asmr")
 
 
-def parse_text(text: str, base: Optional[Scene] = None) -> ParseResult:
-    """Recognise known weather vocabulary in `text` (deterministic, no network)."""
+def parse_text(text: str, base: Optional[Scene] = None, strict: bool = False) -> ParseResult:
+    """Recognise known weather vocabulary in `text` (deterministic, no network).
+
+    strict=True raises TextParseError when nothing at all is recognised."""
     base = base if base is not None else Scene()
     r = ParseResult(text=text)
     t = " " + re.sub(r"\s+", " ", text.strip()) + " "
@@ -532,6 +546,9 @@ def parse_text(text: str, base: Optional[Scene] = None) -> ParseResult:
         r.set("weather.precipitation.type", "snow", "below freezing", force=True)
         rate = r.assignments.get("weather.precipitation.rate_mm_h", base.weather.precipitation.rate_mm_h)
         r.set("weather.precipitation.rate_mm_h", min(5.0, float(rate) * 0.3), "snow water equivalent", force=True)
+    if strict and not r.understood:
+        raise TextParseError(f"nothing recognised in {text!r}; try words like 'heavy rain', 'tin roof', "
+                             f"'wind force 6 from the west', 'thunder 3 km' or 'night'")
     return r
 
 
@@ -584,8 +601,10 @@ def apply_parse(result: ParseResult, base: Optional[Scene] = None) -> Scene:
     return scene
 
 
-def scene_from_text(text: str, base: Optional[Scene] = None) -> Scene:
-    """'Describe your weather' -> Scene. A pasted METAR is parsed as a METAR."""
+def scene_from_text(text: str, base: Optional[Scene] = None, strict: bool = False) -> Scene:
+    """'Describe your weather' -> Scene. A pasted METAR is parsed as a METAR.
+
+    strict=True raises TextParseError for text with no known vocabulary."""
     if looks_like_metar(text):
         return scene_from_metar(text, base)
-    return apply_parse(parse_text(text, base), base)
+    return apply_parse(parse_text(text, base, strict=strict), base)

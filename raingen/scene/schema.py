@@ -108,7 +108,7 @@ class Listener:
     position: tuple[float, float, float] = (0.0, 0.0, 0.0)   # world metres; z = ground level at feet
     height_m: float = 1.7
     heading_deg: float = 0.0        # direction the listener faces, deg true
-    render: str = "stereo"          # stereo|binaural|5.1|7.1.4|foa|hoa3
+    render: str = "stereo"          # stereo|binaural|5.1|7.1.4|foa|hoa3|7.1|mono
     width: float = 1.0
     hrtf: str = "builtin"           # builtin spherical-head model | path to .sofa
 
@@ -128,7 +128,7 @@ class RenderSettings:
     ambi_order: int = 3
     k_objects: int = 64
     bit_depth: int = 24             # 16|24|32 (32 = float)
-    destination: str = "raw"        # raw|youtube|spotify|apple_music|podcast|sleep|broadcast_eu|broadcast_us|streaming_broadcaster|post_stems|game|vr
+    destination: str = "raw"        # raw|youtube|spotify|apple_music|podcast|sleep|broadcast_eu|broadcast_us|streaming_broadcaster|online_streaming|post_stems|game|vr
     stems: bool = False
 
 
@@ -177,7 +177,10 @@ class Scene:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Scene":
-        d = dict(d)
+        """Build a Scene from a `to_dict()`-style mapping. Unknown keys are ignored at every level;
+        the format version may be given as 'rainscene' (the file key) or 'version'. The input is
+        deep-copied, so the scene never shares mutable dicts or lists with the caller."""
+        d = copy.deepcopy(dict(d))
         if "rainscene" in d:
             d["version"] = d.pop("rainscene")
         return _build(cls, d)
@@ -210,13 +213,14 @@ def _build(tp, data):
     if not is_dataclass(tp) or not isinstance(data, dict):
         return data
     kwargs = {}
-    hints = {f.name: f for f in fields(tp)}
-    for name, f in hints.items():
+    for f in fields(tp):
+        name = f.name
         if name not in data:
             continue
         val = data[name]
-        ftype = f.type if not isinstance(f.type, str) else _SUBTYPES.get(f.type.split("[")[0].replace("Optional", "").strip("[] "), None)
         sub = _FIELD_TYPES.get((tp.__name__, name))
+        if sub is not None and val is None:
+            continue                        # an empty YAML section ("weather:") keeps the defaults
         if sub is not None:
             if isinstance(val, list):
                 val = [_build(sub, v) for v in val]
@@ -228,7 +232,8 @@ def _build(tp, data):
     return tp(**kwargs)
 
 
-_SUBTYPES: dict = {}
+# Nested dataclass fields (the annotations are strings under `from __future__ import annotations`,
+# so the mapping is explicit rather than introspected).
 _FIELD_TYPES = {
     ("Scene", "weather"): Weather,
     ("Scene", "place"): Place,

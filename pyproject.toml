@@ -37,7 +37,8 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.24",
-    "scipy>=1.10"
+    "scipy>=1.10",
+    "threadpoolctl>=3.1"
 ]
 
 [project.optional-dependencies]
@@ -67,7 +68,10 @@ all = [
 ]
 dev = [
     "pytest>=7.0.0",
-    "flake8>=5.0.0"
+    "flake8>=5.0.0",
+    "soundfile>=0.12",
+    "pyyaml>=6.0",
+    "python-osc>=1.8"
 ]
 
 [project.urls]
@@ -89,3 +93,6 @@ include = ["rain_generator*", "raingen*"]
 minversion = "7.0"
 addopts = "-ra -q"
 testpaths = ["tests"]
+markers = [
+    "slow: long renders or sweeps (deselect with -m 'not slow')",
+]

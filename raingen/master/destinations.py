@@ -2,9 +2,14 @@
 
 Targets: EBU R128 (2023 rev.) -23 LUFS / -1 dBTP; R128 s2 streaming broadcasters -18 LUFS
 (range -20..-16); ATSC A/85 -24 LKFS / -2 dBTP; music streaming -14 LUFS (YouTube's figure
-is unofficial), Apple Music ~-16 LUFS; Apple Podcasts -16 LKFS +-1, <= -1 dBTP, stereo.
-'sleep' is raingen's own quiet profile (-27 LUFS, LRA <= 4 LU). Post-production stems and
-game assets are deliberately NOT loudness-normalised (calibrated relative levels).
+is unofficial), Apple Music ~-16 LUFS; Apple Podcasts -16 LKFS +-1, <= -1 dBTP, stereo
+(AES TD1004: -16 LUFS stereo). Online streaming (A/85 Annex L / AES71) wants one target
+in -23..-27 LKFS: -24 is used (unverified pick inside the plan's range). 'sleep' is
+raingen's own quiet profile (-27 LUFS, LRA <= 4 LU). Post-production stems and game assets
+are deliberately NOT loudness-normalised (calibrated relative levels).
+
+Every pure weather render has no dialogue, so all targets are full-programme measurements
+(BS.1770 with the relative gate), which A/85 section 5.2.5 allows for dialogue-free content.
 """
 
 from __future__ import annotations
@@ -41,6 +46,10 @@ DESTINATIONS: dict[str, dict] = {
     "broadcast_us": dict(target_lufs=-24.0, tp_dbtp=-2.0, lra_max=None, sample_rate=48000, bit_depth=24,
                          format="wav", normalize=True, layout_hint=None,
                          notes="ATSC A/85: -24 LKFS +-2 integrated, true peak below -2 dBTP."),
+    "online_streaming": dict(target_lufs=-24.0, tp_dbtp=-2.0, lra_max=None, sample_rate=48000, bit_depth=24,
+                             format="wav", normalize=True, layout_hint=None,
+                             notes="Online streaming / OTT (ATSC A/85 Annex L, AES71): one target in -23..-27 LKFS; "
+                                   "-24 LKFS chosen, -2 dBTP."),
     "post_stems": dict(target_lufs=None, tp_dbtp=-2.0, lra_max=None, sample_rate=48000, bit_depth=24,
                        format="wav", normalize=False, layout_hint=None,
                        notes="Film/TV stems: calibrated, not normalised (dialogue-gated programme specs stay intact); "
@@ -54,9 +63,23 @@ DESTINATIONS: dict[str, dict] = {
 }
 
 
+ALIASES = {
+    "none": "raw", "music": "spotify", "apple": "apple_music", "applemusic": "apple_music",
+    "apple_podcasts": "podcast", "podcasts": "podcast", "ebu": "broadcast_eu", "r128": "broadcast_eu",
+    "ebu_r128": "broadcast_eu", "atsc": "broadcast_us", "a85": "broadcast_us", "atsc_a85": "broadcast_us",
+    "ott": "online_streaming", "aes71": "online_streaming", "film": "post_stems", "stems": "post_stems",
+    "360": "vr", "ambix": "vr",
+}
+
+
+def _key(name: Optional[str]) -> str:
+    key = str(name or "raw").strip().lower().replace("-", "_").replace(" ", "_").replace("/", "_")
+    return ALIASES.get(key, key)
+
+
 def get_destination(name: Optional[str]) -> dict:
-    """A copy of the destination profile (unknown/None -> 'raw')."""
-    key = (name or "raw").strip().lower().replace("-", "_").replace(" ", "_")
+    """A copy of the destination profile (unknown/None -> 'raw'); 'name' holds the canonical key."""
+    key = _key(name)
     return copy.deepcopy(DESTINATIONS.get(key, DESTINATIONS["raw"])) | {"name": key if key in DESTINATIONS else "raw"}
 
 

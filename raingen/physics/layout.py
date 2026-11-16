@@ -310,7 +310,7 @@ def _build_ground(ctx: _Ctx) -> list[SourcePatch]:
     shares = _surface_shares(place)
     ring_counts = _allocate_ring_counts(shares, len(RINGS), N_SECTORS)
     patches = []
-    for i, ((r1, r2), counts) in enumerate(zip(RINGS, ring_counts)):
+    for i, ((r1, r2), counts) in enumerate(zip(RINGS, ring_counts, strict=True)):
         mats = [m for m, _ in shares if counts.get(m, 0) > 0]
         perm = ctx.rng.permutation(len(mats)) if mats else []
         rot = int(ctx.rng.integers(0, N_SECTORS))
@@ -360,7 +360,7 @@ def ground_material_at(patches, x: float, y: float, default: str = "soil") -> st
     """Material of the ground ring patch under listener-frame point (x, y)."""
     r = math.hypot(x, y)
     i = len(RINGS) - 1
-    for k, (r1, r2) in enumerate(RINGS):
+    for k, (_, r2) in enumerate(RINGS):
         if r < r2:
             i = k
             break
@@ -958,7 +958,7 @@ def build_layout(scene) -> list[SourcePatch]:
         if n:
             p.id = f"{p.id}#{n}"
         seen[p.id.split("#")[0]] = n + 1
-        x, y, z = p.position
+        x, y, _ = p.position
         p.params.setdefault("upwind_m", float(ctx.upwind(x, y)))
         p.params.setdefault("world_position", listener_to_world(p.position, scene.listener))
         p.params.setdefault("shelter", ctx.shelter)

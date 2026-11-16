@@ -11,7 +11,9 @@ the previous point (the scene's own value at t = 0 for the first keyframe):
 * hold   - step: the previous value holds until the keyframe time, then jumps.
 
 Non-numeric paths (choices, booleans) always hold. After the last keyframe the
-value holds. Circular quantities (wind direction, hour of day) move the short
+value holds. Numeric values are clamped to the manifest range (circular ones
+wrapped); `validate(scene)` lists keyframes with unknown paths, curves, times
+or values that do not fit their parameter. Circular quantities (wind direction, hour of day) move the short
 way round (350 deg -> 10 deg passes through north). Keyframe times may be seconds or strings ('05:00', '01:02:03',
 '01:00:00:12' SMPTE at 24 fps). Values may carry units ('8 mm/h', 'force 5').
 Evaluation is pure: the same (scene, t) always gives the same result, so any
@@ -24,7 +26,7 @@ import math
 from typing import Any, Optional
 
 from . import units
-from .manifest import find_param
+from .manifest import clamp, coerce, find_param
 from .schema import Keyframe, Scene
 
 CURVES = ("linear", "log", "hold", "smooth")
@@ -64,9 +66,10 @@ def _coerce(path: str, value: Any, temp_c: float) -> Any:
     if isinstance(value, str):
         spec = find_param(path)
         if spec is not None and not spec.is_numeric:
-            if spec.type == "bool":
-                return units.parse_bool(value)
-            return value
+            try:
+                return coerce(spec, value, temp_c)         # 'on' -> True, 'tin roof' -> 'attic'
+            except ValueError:
+                return value
         try:
             return units.parse_value(path, value, temp_c)
         except ValueError:
@@ -83,7 +86,7 @@ def interpolate(a: Any, b: Any, u: float, curve: str) -> Any:
     if curve == "hold":
         return b if u >= 1.0 else a
     if isinstance(a, tuple) and isinstance(b, tuple) and len(a) == len(b):
-        return tuple(interpolate(x, y, u, "smooth" if curve == "smooth" else "linear") for x, y in zip(a, b))
+        return tuple(interpolate(x, y, u, "smooth" if curve == "smooth" else "linear") for x, y in zip(a, b, strict=True))
     if not (_is_number(a) and _is_number(b)):
         return b if u >= 1.0 else a
     a = float(a)
@@ -175,16 +178,68 @@ def evaluate(scene: Scene, t: float) -> Scene:
             period = float(spec.max - spec.min)
             lane = _unwrap_lane(base, lane, period)
         value = value_at(base, lane, t, numeric)
-        if spec is not None and spec.is_numeric and value is not None:
-            if spec.type == "int":
-                value = int(round(float(value)))
-            elif period > 0.0:
-                value = float(spec.min) + (float(value) - float(spec.min)) % period
+        if spec is not None and spec.is_numeric and _is_number(value):
+            value = clamp(spec, value)                     # range, wrap and int rounding from the manifest
         try:
             _set(out, path, value)
         except (AttributeError, KeyError, TypeError):
             continue
     return out
+
+
+def validate(scene: Scene, strict: bool = False) -> list[str]:
+    """Problems with the scene's keyframes, one message each: an unknown path, an unknown curve
+    name, a time that is not a duration or is negative, or a value that does not fit the
+    parameter (not a number, not one of its choices, outside its range). strict=True raises
+    ValueError listing them. An empty list means every lane evaluates as written."""
+    problems: list[str] = []
+    temp = float(scene.weather.temperature_c)
+    for i, kf in enumerate(scene.timeline or []):
+        where = f"keyframe {i}"
+        try:
+            raw_path = kf["path"] if isinstance(kf, dict) else kf.path
+            raw_curve = (kf.get("curve", "linear") if isinstance(kf, dict) else kf.curve) or "linear"
+            raw_value = kf.get("value") if isinstance(kf, dict) else kf.value
+        except (KeyError, AttributeError) as e:
+            problems.append(f"{where}: missing field {e}")
+            continue
+        where = f"keyframe {i} ({raw_path})"
+        try:
+            t = keyframe_time(kf)
+            if not math.isfinite(t) or t < 0.0:
+                problems.append(f"{where}: time {t!r} must be >= 0 s")
+        except (ValueError, TypeError) as e:
+            problems.append(f"{where}: bad time: {e}")
+        c = str(raw_curve).strip().lower()
+        if c not in CURVES and c not in _CURVE_ALIASES:
+            problems.append(f"{where}: unknown curve {raw_curve!r}; use one of {CURVES}")
+        spec = find_param(raw_path)
+        if spec is None:
+            try:
+                scene.get(raw_path)
+            except (KeyError, AttributeError, TypeError):
+                problems.append(f"{where}: unknown parameter path {raw_path!r}")
+            continue
+        value = _coerce(raw_path, raw_value, temp)
+        if value is None:
+            if not spec.nullable:
+                problems.append(f"{where}: value is missing")
+        elif spec.type == "vec3":
+            if not (isinstance(value, tuple) and len(value) == 3):
+                problems.append(f"{where}: needs three numbers (x, y, z), got {raw_value!r}")
+        elif spec.is_numeric:
+            if not _is_number(value):
+                problems.append(f"{where}: {raw_value!r} is not a value in {spec.unit or 'plain units'}")
+            elif not spec.wrap and spec.min is not None and spec.max is not None:
+                v = float(value)
+                if (v < spec.min and not (spec.zero_ok and v == 0.0)) or v > spec.max:
+                    problems.append(f"{where}: {v:g} is outside {spec.min:g}..{spec.max:g} {spec.unit} "
+                                    f"(it will be clamped)")
+        elif spec.choices and value not in spec.choices:
+            problems.append(f"{where}: {raw_value!r} is not one of {list(spec.choices)}")
+    if strict and problems:
+        raise ValueError("invalid timeline:\n  " + "\n  ".join(problems))
+    return problems
 
 
 def automated_paths(scene: Scene) -> set[str]:

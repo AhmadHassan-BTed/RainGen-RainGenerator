@@ -12,7 +12,7 @@ region-correct biophony. Presets that name a wellness mode pass through
 from __future__ import annotations
 
 import copy
-from typing import Any, Optional
+from typing import Optional
 
 from .schema import Scene
 
@@ -499,6 +499,11 @@ def preset(name: str) -> Scene:
     d = _deep_merge(d, copy.deepcopy(spec["scene"]))
     if spec.get("surfaces"):
         d["place"]["surfaces"] = dict(spec["surfaces"])
+    # surfaces are % ground coverage: a partial override ("wood": 15 on a 100 % template) is rescaled
+    # so the mix sums to 100 again, as the text parser does
+    surf = {k: float(v) for k, v in d["place"]["surfaces"].items() if float(v) > 0.0}
+    total = sum(surf.values()) or 1.0
+    d["place"]["surfaces"] = {k: round(100.0 * v / total, 2) for k, v in surf.items()}
     d["name"] = spec["title"]
     scene = Scene.from_dict(d)
     scene.listener.position = tuple(scene.listener.position)

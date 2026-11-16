@@ -94,6 +94,9 @@ _Z0_BY_PLACE = {
 }
 
 
+_KAIMAL_T_MIN_S = 0.5         # was 1.5 s, which forbade the ~6 s gust periods at 2 m and 7 m/s
+
+
 def _norm_name(name: str) -> str:
     return str(name or "").strip().lower().replace("-", "_").replace(" ", "_")
 
@@ -140,13 +143,18 @@ def gust_factor_for(z0: float, z_m: float = 10.0) -> float:
 
 
 def kaimal_integral_time_s(u_mps: float, z_m: float = 10.0) -> float:
-    """Gust correlation time from the Kaimal peak n = f z / U ~ 0.045: T = 1/(2 pi f_peak)."""
+    """Gust correlation time from the Kaimal peak n = f z / U ~ 0.045: T = 1/(2 pi f_peak).
+
+    Peak periods 1/f_peak: ~22 s at 10 m and 10 m/s, ~6.3 s at 2 m and 7 m/s (T ~ 1 s).
+    Clamped to 0.5 .. 60 s.
+    """
     f_peak = 0.045 * max(float(u_mps), 0.3) / max(float(z_m), 1.0)
-    return float(min(max(1.0 / (2.0 * math.pi * f_peak), 1.5), 60.0))
+    return float(min(max(1.0 / (2.0 * math.pi * f_peak), _KAIMAL_T_MIN_S), 60.0))
 
 
 # ------------------------------------------------------------------ gust process
 _KAIMAL_SLOPE = 5.0 / 3.0
+_MAX_CORNERS = 12             # OU corners per process (octaves from the integral scale up)
 
 
 class GustProcess:
@@ -158,9 +166,11 @@ class GustProcess:
     `at_position(upwind_m, wind_mps)` to get the gust for an emitter `upwind_m` metres
     upwind (positive) or downwind (negative) of the listener.
 
-    Every internal block draws its innovations from `rngf.get(layer, k)`; a sequential
-    run is bit-exact. Jumps of up to `max_replay_s` are replayed exactly; longer seeks
-    restart from a stationary state (statistically identical, not sample-identical).
+    Every internal block k draws its innovations from `rngf.get(layer, k)`, so the
+    sequence is a pure function of (seed, layer, params, block index): a sequential run is
+    bit-exact and a second process built with the same arguments reproduces it. Jumps of
+    up to `max_replay_s` are replayed exactly; longer seeks restart from a stationary
+    state (statistically identical, not sample-identical).
     """
 
     def __init__(self, rngf, layer: str, integral_time_s: float = 8.0, ti: float = 0.2,
@@ -196,7 +206,7 @@ class GustProcess:
                 f_c = 1.0 / (2.0 * math.pi * T)
                 f_max = min(self.control_rate / 4.0, 4.0)
                 corners = [f_c]
-                while corners[-1] * 2.0 <= f_max and len(corners) < 12:
+                while corners[-1] * 2.0 <= f_max and len(corners) < _MAX_CORNERS:
                     corners.append(corners[-1] * 2.0)
                 while len(corners) < 3:
                     corners.append(corners[-1] * 2.0)

@@ -310,7 +310,9 @@ class SettingsModal:
             if on_export_audio:
                 on_export_audio(dur)
             import time
-            self.export_status = f"Exported {int(dur)}s to rain_export.wav"
+            # the export runs in a background thread (ThunderstormSimulator.export_audio) and
+            # names the file rain_<preset>_<seconds>s.wav: nothing has been written yet
+            self.export_status = f"Exporting {int(dur)}s of audio in the background..."
             self.export_status_time = time.time() + 4.0
             return True
 
@@ -544,7 +546,7 @@ class AudioGeneratorModal:
             if on_generate:
                 on_generate(dur, self.selected_preset)
             import time
-            self.status_message = f"Saved {int(dur)}s audio to rain_{self.selected_preset}_{int(dur)}s.wav"
+            self.status_message = f"Rendering {int(dur)}s to rain_{self.selected_preset}_{int(dur)}s.wav ..."
             self.status_time = time.time() + 5.0
             return True
 

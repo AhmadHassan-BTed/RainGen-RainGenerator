@@ -15,23 +15,33 @@ Physics (MASTER_PLAN 7.1-7.5, 7.9, 9; Appendix A):
   radiation band; prompt-splash micro-impacts (2-10 weak impacts over 5-50 ms) on dry hard
   surfaces; a water film cushions the pulse and adds crown-splash hiss; puddles turn the
   impacts into water impacts (Yu & Hopkins 2018: dry click -> film splash -> puddle plinks).
-- Level of detail (Zhang, Raghuvanshi, Snyder & Marschner 2019): the nearest / loudest patches
-  get per-event modal synthesis; far rings get pre-baked grains at capped, energy-preserving
-  densities; beyond the rings a diffuse bed is synthesized directly in the SH domain.
+- Level of detail (Zhang, Raghuvanshi, Snyder & Marschner 2019; MASTER_PLAN 7.5, 9.5): all rain
+  patches of a scene are rendered by one vectorised field. Near "voice" panels get per-drop force
+  pulses through shared modal banks; far patches get pre-baked grains for their rare loud drops.
+  Per patch and drop class, a class whose expected overlap (impacts/s x response duration) is high,
+  or whose single impacts are inaudible next to the patch's loudest class, is rendered as matched
+  Gaussian noise with the same power spectrum (Campbell's theorem), so loudness and timbre match
+  the per-drop path in expectation; render quality sets the thresholds, caps and bank variants.
+  Beyond the rings a diffuse bed is synthesized directly in the SH domain.
 - Drips (integrate-and-fire, raingen.physics.wetness): a plink inside the regular-entrainment
   band 41.3 Fr^0.179 <= We <= 48.3 Fr^0.247 (Oguz & Prosperetti 1990), a splat otherwise; fed
   by rain, routed roof flow, canopy release or stored water, so they outlast the rain.
 - Gutters/downspouts: bubble cloud + turbulent rush exciting the open pipe's resonances
   f_k = k c / 2(L + 0.6 d), glugs in slug flow, an overflow sheet above the design capacity.
   No primary acoustic literature: a hypothesis model.
-- Interior panels struck on their far side (a roof above a ceiling, a deck) reach the room through
-  the field-incidence mass law TL = 20 log10(m'' f) - 47 dB (Cremer & Heckl).
+- Interior panels struck on their far side (a roof above an attic and a ceiling, a deck) reach the
+  room through the attic's diffuse build-up and the field-incidence mass law TL = 20 log10(m'' f) - 47 dB
+  of the ceiling, capped by its coincidence region (Cremer & Heckl).
 - Hail / ice pellets / graupel: Hertz contact with an ice-crushing limit, NOAA size and
   fall-speed bands, bounces with restitution. Snow: flake impulses m V spread over a crumple
   time (near silent), plus blowing-snow saltation hiss in cold wind.
 
 Units: every signal is sound pressure in pascals at the listener (digital 1.0 = 1 Pa = 94 dB SPL).
-All randomness comes from RngFactory.get(layer, block) with layers named f'rain/{patch.id}/{cls}' etc.
+All randomness comes from RngFactory.get(layer, block), one generator per layer and block (Philox
+construction is ~0.1 ms): the rain field draws every patch's impacts, and its matched-noise table position,
+from 'rain/field' plus one draw for its Cox modulator bank ('.../cox'); hail and snow draw all their patches
+from 'hail' / 'snow' in patch order; drips and gutters use layers named after their patch ('drip/{id}/sound',
+'gutter/{id}'). Noise beds read the deterministic noise table of raingen.synth.kernels at drawn positions.
 """
 
 from __future__ import annotations
@@ -39,19 +49,64 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import scipy.fft as sfft
 from scipy import signal
 
-from raingen.core.constants import G, N_AMBI, RHO_WATER, SAMPLE_RATE, SIGMA_WATER, speed_of_sound
+from raingen.core.constants import (
+    N_AMBI,
+    RHO_WATER,
+    SAMPLE_RATE,
+    SIGMA_WATER,
+    G,
+    speed_of_sound,
+)
 from raingen.core.rng import RngFactory
-from raingen.core.types import BlockContext, Emission, EventMarker, SourcePatch, WeatherState, bearing_to_azimuth
+from raingen.core.types import (
+    BlockContext,
+    Emission,
+    EventMarker,
+    SourcePatch,
+    WeatherState,
+    bearing_to_azimuth,
+)
 from raingen.physics import dsd as _dsd
-from raingen.physics.atmosphere import AirAbsorptionFilter, air_absorption_sos, spreading_gain
+from raingen.physics.atmosphere import (
+    AirAbsorptionFilter,
+    air_absorption_sos,
+    spreading_gain,
+)
 from raingen.physics.wetness import DripNode
 
-from .events import RateModulator, cox_offsets, thinned_offsets
-from .kernels import (D_REF_MM, V_REF, KernelBank, ModalBank, OverlapAdd, StatefulSOS, bubble_damping,
-                      fade_tail, force_peak, hertz_contact, impact_pulse, pulse_shape, radiation_sos,
-                      render_binned)
+from .events import (
+    RateModulator,
+    RateModulatorBank,
+    cox_offsets,
+    ramp_positions,
+    thinned_offsets,
+)
+from .kernels import (
+    D_REF_MM,
+    FAM_HERTZ,
+    FAM_PULSE,
+    V_REF,
+    KernelBank,
+    ModalBank,
+    ModalBatch,
+    OverlapAdd,
+    RowOLA,
+    StatefulSOS,
+    bubble_damping,
+    fade_tail,
+    fast_len,
+    force_peak,
+    hertz_contact,
+    impact_pulse,
+    noise_rows,
+    pulse_shape,
+    radiation_sos,
+    render_binned,
+    scatter_kernels,
+)
 from .materials import MATERIALS, Material, get_material
 
 __all__ = [
@@ -88,13 +143,7 @@ SNOW_TYPES = ("snow",)
 _RAIN_GATE = {"none": 0.0, "snow": 0.0, "graupel": 0.0, "sleet": 0.5, "hail": 0.5}
 # liquid share feeding drips / runoff (mirrors raingen.physics.world)
 _LIQUID = {"none": 0.0, "snow": 0.0, "graupel": 0.3, "sleet": 0.5, "hail": 0.5}
-LOD_K = {"mobile": 6, "game": 12, "studio": 24, "cinematic": 48}
-FULL_MAX_DIST_M = 12.0
-SLAB_RHO_KG_M3 = 2300.0          # concrete, for decks / slabs between the impact and the listener
-
-_GRAIN_RNG = RngFactory(0x67726169)   # 'grai'
 _CAL_CACHE: dict = {}
-_GRAIN_CACHE: dict = {}
 _ICE_VOL_CACHE: dict = {}
 
 
@@ -147,24 +196,50 @@ def _patch_geometry(patch: SourcePatch) -> tuple[float, float]:
     return max(r_eq, 0.1), spread
 
 
+CEILING_MASS_KG_M2 = 10.0        # 12.5 mm gypsum board ceiling (8.5-10.5 kg/m^2, Bies & Hansen table)
+CEILING_TL_MAX_DB = 32.0         # its coincidence region (fc ~2.5-3 kHz) caps the mass law (provisional)
+ATTIC_DEPTH_M = 1.2              # mean height of the attic space between roof and ceiling
+ATTIC_ABSORPTION = 0.4           # Sabine absorption of the attic per m^2 of roof (insulated floor, alpha ~0.8)
+
+
+def _mass_law_sos(mass_kg_m2: float, tl_max_db: float, sr: int) -> np.ndarray:
+    """First-order shelf following the field-incidence mass law TL = 20 log10(m f) - 47 dB from
+    TL = 0 (f_z = 10^(47/20) / m) up to a coincidence-limited plateau tl_max_db (Cremer & Heckl)."""
+    f_z = 10.0 ** (47.0 / 20.0) / max(mass_kg_m2, 1e-3)
+    f_p = f_z * 10.0 ** (max(tl_max_db, 0.0) / 20.0)
+    f_p = min(f_p, 0.45 * sr)
+    w_z, w_p = 2.0 * math.pi * f_z, 2.0 * math.pi * f_p
+    b, a = signal.bilinear([1.0 / w_p, 1.0], [1.0 / w_z, 1.0], fs=sr)
+    return signal.tf2sos(b, a)
+
+
 def _interior_transfer(patch: SourcePatch, sr: int):
     """(gain, sos or None): what reaches the room from an interior patch whose struck face is not
     the face radiating into the listener's space.
 
-    Ceilings / decks: field-incidence mass law TL = 20 log10(m'' f) - 47 dB (Cremer & Heckl),
-    realised as its value at 100 Hz plus a one-pole low-pass at 100 Hz (the 6 dB/octave mass-law
-    slope above it). Double / triple glazing: the struck outer pane reaches the room through the
-    cavity and the inner pane - a broadband loss and a high-frequency roll-off (provisional).
+    Roof above an attic and a ceiling ('through_ceiling'): the roof's underside fills the attic, whose
+    level re the patch's free field at r_eq is r_eq^2 (2 pi * 4 / A_attic + 1 / h_attic^2) (diffuse
+    field L_W + 10 log(4/A) plus the direct field at the attic depth; A_attic = 0.4 m^2 per m^2 of
+    roof); the ceiling then transmits with the field-incidence mass law TL = 20 log10(m'' f) - 47 dB
+    (Cremer & Heckl) of a gypsum board, capped by its coincidence region, into a room whose
+    10 log(S/A) term is ~0 dB for a furnished bedroom. Decks / slabs ('thickness_m'): concrete mass law
+    (the value at 100 Hz plus the 6 dB/octave slope). Double / triple glazing: the struck outer pane
+    reaches the room through the cavity and the inner pane - a broadband loss and a high-frequency
+    roll-off (~10 dB below single glazing for rain on skylights; provisional).
     """
     p = patch.params or {}
     if not patch.interior:
         return 1.0, None
-    mass = None
     if p.get("through_ceiling"):
-        mass = float(p.get("ceiling_mass_kg_m2", 25.0))
-    elif p.get("thickness_m"):
+        r_eq, _ = _patch_geometry(patch)
+        a_attic = max(ATTIC_ABSORPTION * float(patch.area_m2), 1.0)
+        h = float(p.get("attic_depth_m", ATTIC_DEPTH_M))
+        build_up = r_eq * math.sqrt(2.0 * math.pi * 4.0 / a_attic + 1.0 / (h * h))
+        mass = float(p.get("ceiling_mass_kg_m2", CEILING_MASS_KG_M2))
+        tl_max = float(p.get("ceiling_tl_max_db", CEILING_TL_MAX_DB))
+        return build_up, _mass_law_sos(mass, tl_max, sr)
+    if p.get("thickness_m"):
         mass = SLAB_RHO_KG_M3 * float(p["thickness_m"])
-    if mass is not None and mass > 0.0:
         f0 = 100.0
         tl0 = max(20.0 * math.log10(mass * f0) - 47.0, 0.0)
         return 10.0 ** (-tl0 / 20.0), signal.butter(1, f0, "lowpass", fs=sr, output="sos")
@@ -173,6 +248,13 @@ def _interior_transfer(patch: SourcePatch, sr: int):
         gain, fc = (0.4, 3500.0) if glazing == "double" else (0.25, 2500.0)
         return gain, signal.butter(1, fc, "lowpass", fs=sr, output="sos")
     return 1.0, None
+
+
+def _air(filt: AirAbsorptionFilter, y: np.ndarray, distance: float, w: WeatherState) -> np.ndarray:
+    """ISO 9613-1 air absorption of one source's signal; skipped nearer than AIR_MIN_DIST_M (< 1 dB at 16 kHz)."""
+    if distance < AIR_MIN_DIST_M:
+        return y
+    return filt.process(y, distance, w.temperature_c, w.humidity_pct)
 
 
 def _stem_for(patch: SourcePatch) -> str:
@@ -239,47 +321,15 @@ def _solid_calibration(mat: Material, sr: int) -> float:
     return c
 
 
-def _grain_kernels(mat: Material, sr: int) -> list[np.ndarray]:
-    """Pre-baked impact grains (unit F_max, already in Pa @1 m): 2 variants x 5 classes."""
-    key = (mat.name, int(sr))
-    ks = _GRAIN_CACHE.get(key)
-    if ks is not None:
-        return ks
-    cal = _solid_calibration(mat, sr)
-    rad = radiation_sos(mat, sr)
-    length = int(np.clip(0.8 * mat.max_t60, 0.008, 0.12) * sr)
-    rng = _GRAIN_RNG.get(f"grains/{mat.name}", 0)
-    n_modes = len(mat.modes)
-    irs = []
-    for v in range(2):
-        det = 1.0 if v == 0 or n_modes == 0 else np.exp(rng.normal(0.0, 0.1, n_modes))
-        bank = ModalBank(mat, sr, detune=det)
-        if bank.n_modes:
-            irs.append(bank.impulse_response(length))
-        else:
-            ir = np.zeros(length)
-            ir[0] = 1.0
-            irs.append(ir)
-    out = []
-    for v in range(2):
-        for cls in CLASSES:
-            dd = REP_D[cls]
-            vt = max(float(_fall_speed(dd)), 0.3)
-            k = np.convolve(pulse_shape(dd * 1e-3 / vt, sr), irs[v])
-            if rad.shape[0]:
-                k = signal.sosfilt(rad, k)
-            out.append(fade_tail(k, 0.3) * cal)
-    _GRAIN_CACHE[key] = out
-    return out
-
-
 # ---------------------------------------------------------------------------
 # water impacts (rain on water/puddles, drip splats, hail into water)
 
 _EPS_LO = np.array([0.01, 0.02, 0.005, 0.03, 0.04])
 _EPS_HI = np.array([0.02, 0.07, 0.02, 0.10, 0.12])
+_EPS2 = (_EPS_HI ** 2 - _EPS_LO ** 2) / (2.0 * np.log(_EPS_HI / _EPS_LO))     # E[eps^2], log-uniform eps
 _DELAY_LO_MS = np.array([1.0, 0.5, 2.0, 6.0, 10.0])
 _DELAY_HI_MS = np.array([2.0, 2.5, 8.0, 20.0, 30.0])
+_VL_EXTRA_BUBBLES = 0.8          # Poisson mean of extra bubbles per entraining very large drop
 
 
 def _entrainment_probability(d, ci, wind_mps: float) -> np.ndarray:
@@ -293,19 +343,28 @@ def _entrainment_probability(d, ci, wind_mps: float) -> np.ndarray:
     return p
 
 
+def _small_bubble_freq(d):
+    """Regular-entrainment ring of the small class: ~22 kHz at 0.8 mm falling to ~13 kHz at 1.1 mm."""
+    return np.clip(22e3 - (np.asarray(d, dtype=float) - 0.8) / 0.3 * 9e3, 12e3, 24e3)
+
+
+def _large_bubble_r1(d):
+    """Smallest radius of the large-drop bubble band (2-10 kHz, lower for bigger drops)."""
+    return 3.28 / (10e3 * (2.2 / np.maximum(np.asarray(d, dtype=float), 2.2)) ** 0.8)
+
+
 def _bubble_radius(rng, d, ci) -> np.ndarray:
     r = np.full(d.shape, 3e-4)
     m = ci == 1
     if np.any(m):   # regular entrainment: ~22 kHz at 0.8 mm falling to ~13 kHz at 1.1 mm
-        f = np.clip(22e3 - (d[m] - 0.8) / 0.3 * 9e3, 12e3, 24e3) * np.exp(rng.normal(0.0, 0.05, int(m.sum())))
+        f = _small_bubble_freq(d[m]) * np.exp(rng.normal(0.0, 0.05, int(m.sum())))
         r[m] = 3.28 / f
     m = (ci == 0) | (ci == 2)
     if np.any(m):
         r[m] = _loguniform(rng, 3e-4, 1.2e-3, int(m.sum()))
     m = ci >= 3
     if np.any(m):   # large: 2-10 kHz band, lower for bigger drops; r^-2.5 within it
-        f_hi = 10e3 * (2.2 / np.maximum(d[m], 2.2)) ** 0.8
-        r1 = 3.28 / f_hi
+        r1 = _large_bubble_r1(d[m])
         r[m] = _power_law(rng, r1, 4.0 * r1, 2.5, int(m.sum()))
     return r
 
@@ -318,20 +377,42 @@ def _bubble_keys(kb: KernelBank, radius, xi, damp_bin: int):
     return (kb.radius_bin(radius) * 64 + kb.xi_bin(xi)) * 8 + int(np.clip(damp_bin, 0, 7))
 
 
-def _water_impacts(kb: KernelBank, rng, off, d, u, ci, sc, ola: OverlapAdd, *, click_pa: float,
-                   depth_mm: float = 1000.0, wind_mps: float = 0.0, water_quality: float = 1.0,
-                   sr: int = SAMPLE_RATE, p_scale: float = 1.0):
-    """Click + probabilistic bubble (+ splat for big drops) for impacts on a water surface."""
+def _damp_bin(depth_mm):
+    """Extra bubble damping (0.01 steps) from a shallow puddle bottom."""
+    return np.round(0.02 * (1.0 - _smoothstep(depth_mm, 3.0, 15.0)) / 0.01).astype(np.int64)
+
+
+def _splat_amp(d, u, ci):
+    return SPLAT_PA * (d / 4.0) ** 2 * (u / 8.7) ** 3 * np.where(ci == 4, 1.0, 0.4)
+
+
+def _splat_dur(d):
+    return np.clip(0.003 * d / 3.0, 0.002, 0.012)
+
+
+def _water_events(kb: KernelBank, rng, off, d, u, ci, sc, *, click_pa, depth_mm=1000.0, wind_mps: float = 0.0,
+                  water_quality: float = 1.0, sr: int = SAMPLE_RATE, p_scale: float = 1.0):
+    """Impact click + probabilistic bubble (+ splat for big drops) of impacts on a water surface.
+
+    Returns (offsets, kernel codes, amplitudes in Pa @1 m, source-impact index) for the batched
+    renderer; bubble offsets include their delay after the impact, so they may lie past the block.
+    click_pa and depth_mm may be scalars or per-impact arrays.
+    """
+    off = np.asarray(off, dtype=np.int64)
     n_ev = int(off.size)
     if n_ev == 0:
-        return
-    off = np.asarray(off, dtype=np.int64)
-    sc = np.broadcast_to(np.asarray(sc, dtype=float), off.shape)
+        z = np.zeros(0, dtype=np.int64)
+        return z, z, np.zeros(0), z
+    d = np.asarray(d, dtype=float)
+    u = np.asarray(u, dtype=float)
     ci = np.asarray(ci, dtype=np.int64)
+    sc = np.broadcast_to(np.asarray(sc, dtype=float), off.shape)
+    cpa = np.broadcast_to(np.asarray(click_pa, dtype=float), off.shape)
+    depth = np.broadcast_to(np.asarray(depth_mm, dtype=float), off.shape)
     # impact click ~ D U^3 (U^3 is inside the click kernel)
-    amp = click_pa * (d / D_REF_MM) * sc * np.exp(rng.normal(0.0, 0.2, n_ev))
+    amp = cpa * (d / D_REF_MM) * sc * np.exp(rng.normal(0.0, 0.2, n_ev))
     amp = np.where(ci == 0, 0.3 * amp, amp)
-    render_binned(off, amp, kb.click_bin(u), kb.click_shape, ola)
+    offs, codes, amps, src = [off], [kb.click_code(u)], [amp], [np.arange(n_ev)]
 
     # entrained bubbles
     p = _entrainment_probability(d, ci, wind_mps) * float(np.clip(water_quality, 0.0, 1.0)) * p_scale
@@ -339,10 +420,12 @@ def _water_impacts(kb: KernelBank, rng, off, d, u, ci, sc, ola: OverlapAdd, *, c
     idx = np.nonzero(hit)[0]
     vl = np.nonzero(hit & (ci == 4))[0]
     if vl.size:
-        extra = rng.poisson(0.8, vl.size)
+        extra = rng.poisson(_VL_EXTRA_BUBBLES, vl.size)
         idx = np.concatenate([idx, np.repeat(vl, extra)])
-    fd = _smoothstep(depth_mm, 1.5, 8.0)                    # shallow puddles pinch bubbles off
-    if idx.size and fd > 0.0:
+    if idx.size:
+        fd = _smoothstep(depth[idx], 1.5, 8.0)               # shallow puddles pinch bubbles off
+        idx, fd = idx[fd > 0.0], fd[fd > 0.0]
+    if idx.size:
         m = idx.size
         cls = ci[idx]
         radius = _bubble_radius(rng, d[idx], cls)
@@ -350,20 +433,38 @@ def _water_impacts(kb: KernelBank, rng, off, d, u, ci, sc, ola: OverlapAdd, *, c
         eps = _loguniform(rng, _EPS_LO[cls], _EPS_HI[cls], m)
         delay = ((_DELAY_LO_MS[cls] + rng.random(m) * (_DELAY_HI_MS[cls] - _DELAY_LO_MS[cls]))
                  * 1e-3 * sr).astype(np.int64)
-        damp_bin = int(round(0.02 * (1.0 - _smoothstep(depth_mm, 3.0, 15.0)) / 0.01))
-        render_binned(off[idx] + delay, BUBBLE_PA_PER_M * eps * sc[idx] * fd,
-                      _bubble_keys(kb, radius, xi, damp_bin), _bubble_kernel_fn(kb), ola)
+        offs.append(off[idx] + delay)
+        codes.append(kb.bubble_code(radius, xi, _damp_bin(depth[idx])))
+        amps.append(BUBBLE_PA_PER_M * eps * sc[idx] * fd)
+        src.append(idx)
 
     # broadband splat of very large drops
     sp = np.nonzero((ci == 4) | ((ci == 3) & (d >= 3.0)))[0]
     if sp.size:
-        dd = d[sp]
-        uu = u[sp]
-        amp_s = (SPLAT_PA * (dd / 4.0) ** 2 * (uu / 8.7) ** 3 * sc[sp]
-                 * np.where(ci[sp] == 4, 1.0, 0.4) * np.exp(rng.normal(0.0, 0.25, sp.size)))
-        dur = np.clip(0.003 * dd / 3.0, 0.002, 0.012)
-        keys = kb.dur_bin(dur) * 16 + rng.integers(0, kb.SPLASH_VARIANTS, sp.size)
-        render_binned(off[sp], amp_s, keys, lambda k: kb.splash(k // 16, k % 16, True), ola)
+        amp_s = _splat_amp(d[sp], u[sp], ci[sp]) * sc[sp] * np.exp(rng.normal(0.0, 0.25, sp.size))
+        offs.append(off[sp])
+        codes.append(kb.splash_code(_splat_dur(d[sp]), rng.integers(0, kb.SPLASH_VARIANTS, sp.size), True))
+        amps.append(amp_s)
+        src.append(sp)
+    return np.concatenate(offs), np.concatenate(codes), np.concatenate(amps), np.concatenate(src)
+
+
+def _render_into(kb: KernelBank, ola: OverlapAdd, offs, codes, amps):
+    """Render (offset, code, amp) events of one stream into an OverlapAdd (block start = offset 0)."""
+    if np.size(offs) == 0:
+        return
+    offs = np.asarray(offs, dtype=np.int64)
+    _, Y = scatter_kernels(kb, int(offs.max()) + 1, np.zeros(offs.size, dtype=np.int64), codes, offs, amps)
+    ola.add(Y[0])
+
+
+def _water_impacts(kb: KernelBank, rng, off, d, u, ci, sc, ola: OverlapAdd, *, click_pa: float,
+                   depth_mm: float = 1000.0, wind_mps: float = 0.0, water_quality: float = 1.0,
+                   sr: int = SAMPLE_RATE, p_scale: float = 1.0):
+    """Click + probabilistic bubble (+ splat for big drops) for impacts on a water surface."""
+    offs, codes, amps, _ = _water_events(kb, rng, off, d, u, ci, sc, click_pa=click_pa, depth_mm=depth_mm,
+                                         wind_mps=wind_mps, water_quality=water_quality, sr=sr, p_scale=p_scale)
+    _render_into(kb, ola, offs, codes, amps)
 
 
 # ---------------------------------------------------------------------------
@@ -404,20 +505,19 @@ class _SolidVoice:
         return any(not bk.is_silent(1e-11) for bk in self.banks)
 
     def add_force(self, off, force, tau, family: str = "pulse", variant=None):
-        off = np.asarray(off, dtype=np.int64)
+        off = np.asarray(off, dtype=np.int64).ravel()
         if off.size == 0:
             return
-        keys = self.kb.tau_bin(tau)
-        fn = self.kb.pulse if family == "pulse" else self.kb.hertz
+        codes = self.kb.pulse_code(np.broadcast_to(np.asarray(tau, dtype=float), off.shape),
+                                   FAM_PULSE if family == "pulse" else FAM_HERTZ)
         if self.n_var == 1 or variant is None:
-            render_binned(off, force, keys, fn, self.olas[0])
-            return
-        force = np.broadcast_to(np.asarray(force, dtype=float), off.shape)
-        variant = np.asarray(variant)
-        for v in range(self.n_var):
-            m = variant == v
-            if np.any(m):
-                render_binned(off[m], force[m], keys[m], fn, self.olas[v])
+            rows = np.zeros(off.size, dtype=np.int64)
+        else:
+            rows = np.broadcast_to(np.asarray(variant, dtype=np.int64), off.shape)
+        # sparse short pulses: time-domain scatter (no FFT whose size would change with every call)
+        ur, Y = scatter_kernels(self.kb, int(off.max()) + 1, rows, codes, off, force)
+        for k, row in enumerate(ur.tolist()):
+            self.olas[row].add(Y[k])
 
     def render(self, n: int) -> np.ndarray:
         y = np.zeros(n)
@@ -445,16 +545,1072 @@ class _SolidVoice:
 
 
 # ---------------------------------------------------------------------------
-# rain on one surface patch
+# rain on surface patches: one vectorised field renders every patch of a scene
+
+# Level of detail per render quality (MASTER_PLAN 7.5, 9.5). Per patch and drop class, a class whose
+# expected overlap (impacts/s x effective response duration) reaches `dense` (a quarter of it for
+# granular patches), or whose single impacts are > 35 dB below the patch's loudest class, is rendered
+# as matched Gaussian noise: the same kernels and modal banks driven by white noise whose power equals
+# the impact train's (rate x E[amplitude^2] per second), so spectrum and loudness match the per-drop
+# path in expectation. The other classes keep per-drop synthesis, capped per 1024 frames; the excess
+# above a cap joins the matched-noise layer (a class that cannot reach the noise layer keeps its energy
+# by sqrt(expected / cap) amplitude scaling). `var` = modal-bank variants of a ground / vegetation voice
+# patch (variants are shared across the patches of a material; leaves detune by 25 %, so one bank is not
+# representative of a canopy and every quality keeps two); granular patches always use at least two, as
+# their grains are pre-baked.
+QUALITY_LOD = {
+    "mobile": {"k": 6, "voice_cap": (30, 80, 80, 40, 20), "gran_cap": (6, 16, 16, 10, 6), "dense": 3.0,
+               "var": (1, 2)},
+    "game": {"k": 12, "voice_cap": (60, 160, 160, 80, 40), "gran_cap": (10, 24, 24, 16, 10), "dense": 5.0,
+             "var": (1, 2)},
+    "studio": {"k": 24, "voice_cap": (150, 400, 400, 200, 100), "gran_cap": (20, 50, 50, 30, 16), "dense": 10.0,
+               "var": (2, 2)},
+    "cinematic": {"k": 48, "voice_cap": (600, 1500, 1500, 800, 400), "gran_cap": (40, 100, 100, 60, 30),
+                  "dense": 40.0, "var": (3, 4)},
+    # reference: every class per drop, no caps, studio's bank variants (tests and offline comparisons)
+    "reference": {"k": 1 << 20, "voice_cap": (1e9,) * 5, "gran_cap": (1e9,) * 5, "dense": math.inf,
+                  "var": (2, 2)},
+}
+LOD_K = {q: v["k"] for q, v in QUALITY_LOD.items() if q != "reference"}
+FULL_MAX_DIST_M = 12.0
+VOICE_MAX_AREA_M2 = 25.0         # larger surfaces are voices only within VOICE_NEAR_M
+VOICE_NEAR_M = 4.0
+SLAB_RHO_KG_M3 = 2300.0          # concrete, for decks / slabs between the impact and the listener
+
+_T_EFF_WATER = np.array([1e-4, 5e-4, 1e-4, 3e-3, 3e-3])   # s: click, small-drop ring, click, large rings
+_T_EFF_CAP = 5e-3                # onsets matter, not the whole ring, for "is it a crackle or a hiss"
+_SALIENCE = 10.0 ** (-35.0 / 10.0)
+_QUAD = 8                        # Gauss-Legendre diameter nodes per class for expectations (< 0.05 dB)
+_SIG_FORCE = 0.25                # log-normal force jitter (sigma)
+_SIG_CLICK = 0.2
+_SPLASH_REPS = 6.0               # mean of the 2..10 prompt-splash micro-impacts per eligible drop
+_SPLASH_A2 = (0.03 ** 2 - 0.005 ** 2) / (2.0 * math.log(0.03 / 0.005))   # E[a^2], a log-uniform 0.005..0.03
+_SPLASH_TAU = math.sqrt(5e-5 * 1.5e-4)
+_BLOCK_REF = 1024.0              # caps are stated per 1024 frames
+_LIVE_EPS = 1e-12                # Pa; quieter outputs are dropped and their filter states flushed
+AIR_MIN_DIST_M = 3.0             # ISO 9613-1 loss < 1 dB up to 16 kHz below this: no air filter
+
+
+def lod_settings(quality: str) -> dict:
+    return QUALITY_LOD.get(str(quality or "studio").lower(), QUALITY_LOD["studio"])
+
+
+class _ClassTable:
+    """Per-DSD class geometry: bounds, representative fall speeds, flux-weighted inverse CDF, quadrature."""
+
+    def __init__(self, dsd, scheme: str):
+        bounds = _dsd.class_bounds(scheme, d_max_mm=float(dsd.d_max_mm))
+        lo = np.array([bounds[c][0] if c in bounds else 0.0 for c in CLASSES], dtype=float)
+        hi = np.array([bounds[c][1] if c in bounds else 0.0 for c in CLASSES], dtype=float)
+        lo = np.maximum(lo, float(dsd.d_min_mm))
+        hi = np.minimum(hi, float(dsd.d_max_mm))
+        self.valid = hi > lo
+        d0, d1 = float(dsd.d_min_mm), max(float(dsd.d_max_mm), float(dsd.d_min_mm) + 1e-3)
+        grid = np.linspace(d0, d1, 768)
+        pdf = np.asarray(_dsd.number_density(dsd, grid), dtype=float) * _fall_speed(grid)
+        cdf = np.concatenate(([0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(grid))))
+        self.grid, self.cdf = grid, cdf
+        self.c_lo = np.interp(lo, grid, cdf)
+        self.c_hi = np.interp(hi, grid, cdf)
+        self.valid &= self.c_hi > self.c_lo
+        gm = np.where(lo > 0.0, np.sqrt(np.maximum(lo * hi, 1e-12)), 0.5 * hi)
+        self.vt_c = _fall_speed(gm)
+        x, wts = np.polynomial.legendre.leggauss(_QUAD)        # nodes / weights in the flux quantile
+        uq = 0.5 * (x + 1.0)
+        self.wq = 0.5 * wts
+        self.dq = self.sample(np.broadcast_to(uq, (len(CLASSES), _QUAD)), np.arange(len(CLASSES))[:, None])
+        self.dq = np.where(self.valid[:, None], self.dq, gm[:, None])
+        self.vtq = _fall_speed(self.dq)
+
+    def sample(self, u, ci) -> np.ndarray:
+        """Flux-weighted diameters (mm) of class ci for uniforms u (inverse CDF of N(D) V(D))."""
+        lo, hi = self.c_lo[ci], self.c_hi[ci]
+        return np.interp(lo + np.asarray(u) * (hi - lo), self.cdf, self.grid)
+
+
+def _dsd_key(dsd, scheme: str):
+    """Class-table key on a 2 % Dm / 0.1 mu / 0.02 mm (bounds) grid. The table is the flux-weighted size
+    distribution *within* each class, so Nw (a pure scale) does not enter, and the storm envelope's
+    block-to-block wobble of Dm moves the drop sizes it samples far below audibility (the class fluxes
+    themselves are always used exactly)."""
+    return (scheme, int(round(math.log(max(float(dsd.dm_mm), 1e-6)) / 0.02)), int(round(float(dsd.mu) / 0.1)),
+            int(round(float(dsd.d_min_mm) / 0.02)), int(round(float(dsd.d_max_mm) / 0.02)))
+
+
+_TEFF_CACHE: dict = {}
+
+
+def _response_teff(mat: Material, sr: int) -> float:
+    """Effective duration (s) of a material's impact response: (sum y^2)^2 / sum y^4, onset-capped."""
+    key = (mat.name, int(sr))
+    t = _TEFF_CACHE.get(key)
+    if t is None:
+        t = _TEFF_CACHE[key] = _response_teff_calc(mat, sr)
+    return t
+
+
+def _response_teff_calc(mat: Material, sr: int) -> float:
+    pulse = impact_pulse(D_REF_MM, V_REF, sr)
+    bank = ModalBank(mat, sr)
+    if bank.n_modes:
+        length = int(0.25 * sr)
+        y = np.convolve(pulse, bank.impulse_response(length))[:length]
+    else:
+        y = pulse
+    e2 = float(np.sum(y * y))
+    e4 = float(np.sum(y ** 4))
+    t = (e2 * e2 / e4) / sr if e4 > 0 else 1e-4
+    return float(np.clip(t, 2e-4, _T_EFF_CAP))
+
+
+def _bubble_color(kb: KernelBank, cls: int, d_q: np.ndarray, damp_bin: int, qw=None) -> np.ndarray:
+    """Zero-phase kernel whose power spectrum is the expected unit-eps bubble power spectrum of a class.
+
+    Radii follow the per-drop draws of _bubble_radius on weighted grids (bubble energy grows ~a^3, so
+    the large-radius tail must be integrated, not sampled at a few quantiles); d_q are the class's
+    quadrature diameters with weights qw (equal weights when omitted).
+    """
+    d_q = np.asarray(d_q, dtype=float)
+    qw = np.full(d_q.size, 1.0 / d_q.size) if qw is None else np.asarray(qw, dtype=float) / float(np.sum(qw))
+    g = (np.arange(24) + 0.5) / 24
+    if cls == 1:                          # ring frequency from the drop diameter, 5 % jitter
+        radii = (3.28 / _small_bubble_freq(d_q)[:, None] * np.exp(0.05 * np.array([-1.5, -0.5, 0.5, 1.5])
+                                                                  )[None, :]).ravel()
+        wts = np.repeat(qw / 4.0, 4)
+    elif cls >= 3:                        # r^-2.5 on [r1, 4 r1]: log grid, weight r^-2.5 dr ~ r^-1.5
+        r1 = _large_bubble_r1(d_q)[:, None]
+        radii = r1 * 4.0 ** g[None, :]
+        wts = radii ** -1.5
+        p_d = (0.05 + 0.60 * _smoothstep(d_q, 2.2, 4.0)) * qw    # bigger drops entrain more often (and lower)
+        wts = (wts / wts.sum(axis=1, keepdims=True) * (p_d / p_d.sum())[:, None]).ravel()
+        radii = radii.ravel()
+    else:                                 # log-uniform 0.3 .. 1.2 mm
+        radii = 3e-4 * 4.0 ** g
+        wts = np.full(radii.size, 1.0 / radii.size)
+    ks = [kb.bubble_shape(int(kb.radius_bin(r)), 4, int(damp_bin)) for r in radii]
+    L = max(len(k) for k in ks)
+    nfft = fast_len(2 * L)
+    S = np.zeros(nfft // 2 + 1)
+    energy = 0.0
+    for k, wt in zip(ks, wts):
+        S += wt * np.abs(sfft.rfft(k, nfft)) ** 2
+        energy += wt * float(np.sum(k * k))
+    k0 = sfft.irfft(np.sqrt(S), nfft)
+    k = np.concatenate([k0[-L:], k0[:L]])
+    taper = max(L // 8, 2)
+    win = np.ones(k.size)
+    win[:taper] = np.sin(0.5 * np.pi * (np.arange(taper) + 0.5) / taper) ** 2
+    win[-taper:] = win[:taper][::-1]
+    k *= win
+    e = float(np.sum(k * k))
+    return k * math.sqrt(energy / e) if e > 0 else k
+
+
+class _AirBatch:
+    """ISO 9613-1 air absorption for many rows sharing one distance; redesigns crossfade over a block."""
+
+    def __init__(self, distance_m: float, n_rows: int, sr: int):
+        self.distance = float(distance_m)
+        self.n_rows = int(n_rows)
+        self.sr = int(sr)
+        self.sos = None
+        self.zi = None
+        self.params = None
+
+    def reset(self):
+        if self.zi is not None:
+            self.zi[:] = 0.0
+
+    def process(self, x: np.ndarray, temp_c: float, rh_pct: float) -> np.ndarray:
+        params = (float(temp_c), float(rh_pct))
+        if self.sos is None:
+            self.sos = air_absorption_sos(self.distance, temp_c, rh_pct, self.sr)
+            self.zi = np.zeros((self.sos.shape[0], self.n_rows, 2))
+            self.params = params
+        t0, h0 = self.params
+        if abs(params[0] - t0) > 1.0 or abs(params[1] - h0) > 0.05 * max(h0, 1.0):
+            new = air_absorption_sos(self.distance, temp_c, rh_pct, self.sr)
+            y0, _ = signal.sosfilt(self.sos, x, axis=-1, zi=self.zi)
+            zi = np.zeros((new.shape[0], self.n_rows, 2))
+            y1, zi = signal.sosfilt(new, x, axis=-1, zi=zi)
+            ramp = np.linspace(0.0, 1.0, x.shape[-1])
+            np.copyto(zi, 0.0, where=np.abs(zi) < 1e-30)
+            self.sos, self.zi, self.params = new, zi, params
+            return y0 * (1.0 - ramp) + y1 * ramp
+        if self.sos.shape[0] == 1 and not np.any(self.sos[0, 1:3]) and not np.any(self.sos[0, 4:]):
+            return x * self.sos[0, 0]
+        y, self.zi = signal.sosfilt(self.sos, x, axis=-1, zi=self.zi)
+        np.copyto(self.zi, 0.0, where=np.abs(self.zi) < 1e-30)        # no denormal tails
+        return y
+
+
+def _bank_variation(rngf: RngFactory, name: str, spread: float, v: int):
+    """(detune, damping) factors of modal-bank variant v of a material (variant 0 is the nominal bank)."""
+    nm = len(get_material(name).modes)
+    if v == 0 or nm == 0:
+        return 1.0, 1.0
+    rng = rngf.get(f"rain/bank/{name}/{spread:g}/{v}", 0)
+    return np.exp(rng.normal(0.0, spread, nm)), np.exp(rng.normal(0.0, 0.15, nm))
+
+
+def _variant_modes(rngf: RngFactory, name: str, spread: float, v: int):
+    """Modes of bank variant v of a material (variant 0: the material itself): detuned and re-damped by
+    `_bank_variation`, each gain scaled by 1 / sqrt(damping factor) so every mode keeps its impulse energy
+    (~ g^2 T60): variants differ in pitch and decay, not in loudness, and match the nominal bank's level."""
+    mat = get_material(name)
+    det, dmp = _bank_variation(rngf, name, spread, v)
+    if np.ndim(det) == 0:
+        return mat
+    arr = np.asarray(mat.modes, dtype=float).reshape(-1, 3)
+    return [(f * a, t * b, g / math.sqrt(b)) for (f, t, g), a, b in zip(arr.tolist(), det.tolist(), dmp.tolist())]
+
+
+def _modal_ir(modes, sr: int, detune=1.0, damping=1.0):
+    """Impulse response of a modal bank (a material or a variant's mode list), truncated at its longest
+    T60 (<= 0.25 s)."""
+    bank = ModalBank(modes, sr, detune=detune, damping=damping)
+    if not bank.n_modes:
+        return None
+    length = int(np.clip(float(np.max(bank.t60)), 0.01, 0.25) * sr)
+    return bank.impulse_response(length)
+
+
+def _grain(kb: KernelBank, mat: Material, tau_s: float, detune=1.0, damping=1.0, ir=None) -> np.ndarray:
+    """Pre-baked impact grain in Pa @1 m per newton of peak force: pulse -> modes -> radiation -> calibration.
+
+    `ir` is the modal bank's impulse response (`_modal_ir`) when the caller caches it per bank variant."""
+    sr = kb.sr
+    pulse = pulse_shape(tau_s, sr)
+    if ir is None:
+        ir = _modal_ir(mat, sr, detune, damping)
+    if ir is not None:
+        k = signal.oaconvolve(pulse, ir) if pulse.size > 1 else pulse[0] * ir
+    else:
+        k = pulse.copy()
+    rad = radiation_sos(mat, sr)
+    if rad.shape[0]:
+        k = signal.sosfilt(rad, np.concatenate([k, np.zeros(int(0.004 * sr))]))
+    k *= _solid_calibration(mat, sr)
+    env = np.abs(k)
+    tail = np.nonzero(env > 1e-3 * env.max())[0]
+    k = k[: int(tail[-1]) + 1] if tail.size else k[:1]
+    return fade_tail(k, 0.1)
+
+
+class _Shaper:
+    """Matched-noise rows: per row Gaussian noise whose power spectrum is the sum of its components' spectra.
+
+    A row's components are (kernel code, variance per sample). The noise is synthesized frame by frame in
+    the frequency domain (weighted overlap-add): random complex spectra (from the deterministic noise
+    table) times the row's magnitude sqrt(sum_i v_i |K_i(f)|^2 / V) (energy-preserving pooled spectra),
+    one inverse FFT per row and block, a power-complementary window, and a per-frame gain sqrt(V m) at the
+    block's end, so successive frames crossfade the Cox modulation. Output power spectrum = sum_i v_i
+    |K_i|^2 = that of a Poisson train of kernel i at rate x E[amp^2] (Campbell's theorem). A row's
+    magnitude is rebuilt only when its mix changes. Frames span 2 m blocks (m = ceil(512 / n)), so the
+    spectral resolution stays <= 47 Hz for any block length.
+    """
+
+    W_TOL = 0.05                 # rebuild a row's magnitude when a component's share moves by more than this
+    MIN_HALF = 512               # frames are at least 2 x 512 samples long
+
+    def __init__(self, kb: KernelBank, half_len: int = 0):
+        self.kb = kb
+        self.cache: dict = {}
+        self._grp = None
+        self._spec = None            # [frame length, shares the row magnitudes were built for, magnitudes]
+        self._win = {}
+
+    def frame(self, n: int) -> tuple[int, int]:
+        """(frame length F, overlap factor m) for block length n: F = 2 m n."""
+        m = max(1, -(-self.MIN_HALF // max(int(n), 1)))
+        return 2 * m * int(n), m
+
+    def _window(self, F: int, m: int) -> np.ndarray:
+        w = self._win.get((F, m))
+        if w is None:
+            # periodic Hann at hop F / 2m sums to m: sqrt(hann / m) is power-complementary
+            w = np.sqrt((0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(F) / F)) / m)
+            self._win[(F, m)] = w
+        return w
+
+    def _magnitude(self, codes, w, half: int) -> np.ndarray:
+        psd = np.zeros(half + 1)
+        for c, wi in zip(codes, w):
+            psd += wi * self.kb.pooled_power(int(c), half)[0]
+        mag = np.sqrt(np.maximum(psd, 0.0))
+        mag[0] = 0.0                 # no DC: every rain kernel ends in a radiation high-pass or is a dipole
+        return mag
+
+    def _row_magnitude(self, r: int, cs, w, half: int, built: dict):
+        """Magnitude of row r for codes cs with shares w: the row's own (or one built in this pass for the
+        same mix) while every share stays within W_TOL of the one it was built for."""
+        key = tuple(cs.tolist())
+        ent = self.cache.get(r)
+        if ent is None or ent[0] != key or ent[2] != half or float(np.max(np.abs(ent[1] - w))) > self.W_TOL:
+            ent = None
+            for cand in built.get(key, ()):
+                if float(np.max(np.abs(cand[1] - w))) <= self.W_TOL:
+                    ent = cand
+                    break
+            if ent is None:
+                ent = (key, w.copy(), half, self._magnitude(cs, w, half))
+                built.setdefault(key, []).append(ent)
+            self.cache[r] = ent
+        return ent
+
+    def render(self, n: int, rows, codes, var, m0, m1, noise_base: int, layout_key=None):
+        """rows / codes / var (per sample, before the Cox modulation) entries; m1[row] the Cox value at the
+        block's end (m0, its start, is reached by the previous frame's fade).
+
+        `layout_key` (optional) names the (rows, codes) layout: while it repeats, the grouping is reused
+        and only the variances are summed. Rows whose variance is zero are skipped. Returns (rows_u, Y):
+        Y (len(rows_u), F) is this block's frame, to be overlap-added at the block start.
+        """
+        grp = self._grp
+        if layout_key is None or grp is None or grp[0] != layout_key:
+            pid = (np.asarray(rows, dtype=np.int64) << 44) | np.asarray(codes, dtype=np.int64)
+            uq, inv = np.unique(pid, return_inverse=True)
+            r_all, c_all = uq >> 44, uq & ((1 << 44) - 1)
+            rows_u, start = np.unique(r_all, return_index=True)
+            counts = np.diff(np.append(start, uq.size))
+            grp = (layout_key, np.asarray(inv).ravel(), uq.size, start, counts, rows_u, c_all)
+            self._grp = grp if layout_key is not None else None
+            self._spec = None
+        _, inv, nu, start, counts, rows_u, c_all = grp
+        F, m = self.frame(n)
+        half = F // 2
+        v = np.bincount(inv, weights=var, minlength=nu)
+        V = np.add.reduceat(v, start)
+        act = V > 0.0
+        if not np.any(act):
+            return rows_u[:0], np.zeros((0, F))
+        w_all = v / np.repeat(np.where(act, V, 1.0), counts)
+        sp = self._spec
+        if sp is None or sp[0] != F:
+            sp = self._spec = [F, np.full(nu, np.inf), np.zeros((rows_u.size, half + 1))]
+        dev = np.maximum.reduceat(np.abs(w_all - sp[1]), start)          # largest share drift per row
+        redo = np.nonzero(act & ~(dev <= self.W_TOL))[0]
+        if redo.size:
+            stop = np.append(start[1:], nu)
+            built: dict = {}
+            for k in redo.tolist():
+                a, b = start[k], stop[k]
+                ent = self._row_magnitude(int(rows_u[k]), c_all[a:b], w_all[a:b], half, built)
+                sp[1][a:b] = ent[1]
+                sp[2][k] = ent[3]
+        ia = np.nonzero(act)[0]
+        r_a = rows_u[ia]
+        m1 = np.asarray(m1, dtype=float)
+        m1 = np.full(ia.size, float(m1)) if m1.ndim == 0 else m1[r_a]
+        # random spectra with E|Z_k|^2 = F (irfft then gives unit variance per unit kernel energy), the
+        # row magnitude and the frame gain sqrt(V m) folded into one real factor per bin
+        z = noise_rows(noise_base + np.arange(ia.size, dtype=np.int64) * (2 * half + 2), 2 * half + 2)
+        a = sp[2][ia] * (math.sqrt(F / 2.0) * np.sqrt(V[ia] * np.maximum(m1, 0.0)))[:, None]
+        a[:, half] *= math.sqrt(2.0)                      # the Nyquist bin is real
+        Z = np.empty((ia.size, half + 1), dtype=complex)
+        np.multiply(z[:, : half + 1], a, out=Z.real)
+        np.multiply(z[:, half + 1:], a, out=Z.imag)
+        Z.imag[:, half] = 0.0
+        Y = sfft.irfft(Z, F, axis=-1)
+        Y *= self._window(F, m)[None, :]
+        return r_a, Y
+
+
+class _RainField:
+    """Vectorised renderer behind every RainPatchGenerator of a scene (MASTER_PLAN 7.5, 9.5).
+
+    The first patch generator asked for a block renders all member patches at once: one Cox
+    modulator bank and one event draw per block for the whole field; sparse impacts scattered as
+    short kernels; dense classes as one matched-noise row per patch; one batched modal-bank
+    recursion per (material, variant) for near "voice" panels; one radiation filter per material and
+    one air-absorption filter per distance group. Far ("granular") solid patches use pre-baked grains
+    (pulse -> modes -> radiation) for their few sparse big drops. Every patch then picks up its own
+    Emission. Results do not depend on which member asks first; the same seed gives the same output.
+    """
+
+    def __init__(self, rngf: RngFactory, quality: str = "studio", kernels: KernelBank | None = None,
+                 sr: int = SAMPLE_RATE, layer: str = "rain/field"):
+        self.rngf = rngf
+        self.quality = str(quality or "studio").lower()
+        self.lod = lod_settings(self.quality)
+        self.layer = layer
+        self.members: list = []
+        self._kb = kernels
+        self.sr = int(sr)
+        self._built_sr = None
+        self._key = None
+        self._epoch = 0
+        self._out: list = []
+
+    def add(self, gen) -> int:
+        self.members.append(gen)
+        self._built_sr = None
+        return len(self.members) - 1
+
+    # -- setup ---------------------------------------------------------------
+    def _build(self, sr: int):
+        self.sr = int(sr)
+        self.kb = self._kb if (self._kb is not None and self._kb.sr == self.sr) else KernelBank(self.sr)
+        M = self.members
+        P = len(M)
+        self.P = P
+        lod = self.lod
+        self.is_water = np.array([g.kind == "water" for g in M], dtype=bool)
+        self.voice = np.array([g.lod == "full" for g in M], dtype=bool)
+        self.modal = self.voice & ~self.is_water          # near solid panels: per-drop force -> modal banks
+        nrm = np.array([g.normal for g in M], dtype=float).reshape(P, 3)
+        self.nx, self.ny, self.nz = nrm[:, 0], nrm[:, 1], nrm[:, 2]
+        self.base = np.array([g.patch.area_m2 * max(g.patch.exposure, 0.0) for g in M], dtype=float)
+        self.spreading = np.array([float(spreading_gain(g.r_eq)) for g in M])
+        self.caps = np.array([lod["voice_cap"] if v else lod["gran_cap"] for v in self.voice],
+                             dtype=float).reshape(P, len(CLASSES))
+        # far solid patches: only the rare impacts that stand out of their own bed stay per-drop (as grains)
+        self.dense_thr = np.where(self.voice, lod["dense"], np.where(self.is_water, 0.25, 0.02) * lod["dense"])
+        mats = [g.mat for g in M]
+        self.mats = mats
+        self.hiss_pa = np.array([float(db_to_pa(m.level_db + FILM_HISS_REL_DB)) for m in mats])
+        self.click_pa = np.array([g.click_pa for g in M])
+        self.kind = [g.kind for g in M]
+        self.snow = np.array([k == "snow" for k in self.kind])
+        self.hiss_ok = np.array([k in ("solid", "porous", "membrane") for k in self.kind])
+        self.hiss_scale = np.where(np.array([k == "membrane" for k in self.kind]), 0.5, 1.0)
+        self.splash_p = np.array([m.splash if (m.splash > 0.0 and m.hardness >= 0.45 and g.kind not in ("snow", "water"))
+                                  else 0.0 for g, m in zip(M, mats)])
+        self.puddle_ok = np.array([k not in ("vegetation", "membrane", "snow", "water") for k in self.kind])
+        self.porous = np.array([k == "porous" for k in self.kind])
+        self.mat_names = [m.name for m in mats]
+        self._uniq_names = sorted(set(self.mat_names))
+        self._name_idx = np.array([self._uniq_names.index(nm) for nm in self.mat_names], dtype=np.int64)
+        self._water_pats = np.nonzero(self.is_water)[0].tolist()
+        teff_cache: dict = {}
+        teff = np.zeros((P, len(CLASSES)))
+        for i, g in enumerate(M):
+            if g.kind == "water":
+                teff[i] = _T_EFF_WATER
+            else:
+                t = teff_cache.get(g.mat.name)
+                if t is None:
+                    t = _response_teff(g.mat, self.sr)
+                    teff_cache[g.mat.name] = t
+                teff[i] = t
+        self.teff = teff
+        # force rows (voice solid panels): (patch, variant); modal banks shared per (material, spread, variant)
+        row_patch, n_var, row0 = [], np.zeros(P, dtype=np.int64), np.full(P, -1, dtype=np.int64)
+        groups: dict = {}
+        g_rows: list = []
+        self.spread_p = np.zeros(P)
+        for i, g in enumerate(M):
+            if self.is_water[i]:
+                continue
+            if g.single_panel:
+                nv, spread = 1, 0.03
+            else:
+                nv = lod["var"][1] if g.kind == "vegetation" else lod["var"][0]
+                if not self.modal[i]:
+                    nv = max(nv, 2)          # grains are pre-baked: a second variant costs nothing per block
+                spread = 0.25 if g.kind == "vegetation" else 0.08
+            n_var[i] = nv
+            self.spread_p[i] = spread
+            if not self.modal[i]:
+                continue
+            row0[i] = len(row_patch)
+            for v in range(nv):
+                key = (g.mat.name, spread if v else 0.0, v)
+                gi = groups.get(key)
+                if gi is None:
+                    gi = len(g_rows)
+                    groups[key] = gi
+                    g_rows.append([])
+                g_rows[gi].append(len(row_patch))
+                row_patch.append(i)
+        self.n_var, self.row0 = n_var, row0
+        self.row_patch = np.array(row_patch, dtype=np.int64)
+        self.S = len(row_patch)
+        self.row_starts = np.array([row0[i] for i in range(P) if self.modal[i]], dtype=np.int64)
+        self.modal_pats = np.nonzero(self.modal)[0]
+        self.banks = []
+        for key, gi in sorted(groups.items(), key=lambda kv: kv[1]):
+            name, spread, v = key
+            bank = ModalBank(_variant_modes(self.rngf, name, spread, v), self.sr)
+            self.banks.append((np.array(g_rows[gi], dtype=np.int64), ModalBatch(bank, len(g_rows[gi]))))
+        # radiation + calibration per material (voice solid patch subsets)
+        self.rad = []
+        spos = {int(p): k for k, p in enumerate(self.modal_pats)}
+        for name in sorted({self.mat_names[i] for i in self.modal_pats}):
+            pats = np.array([i for i in self.modal_pats if self.mat_names[i] == name], dtype=np.int64)
+            mat = get_material(name)
+            sos = radiation_sos(mat, self.sr)
+            zi = np.zeros((sos.shape[0], pats.size, 2)) if sos.shape[0] else None
+            sel = np.array([spos[int(p)] for p in pats], dtype=np.int64)
+            self.rad.append([pats, sos, zi, _solid_calibration(mat, self.sr), sel])
+        # interior transfer and air absorption
+        self.xfer = []
+        for i, g in enumerate(M):
+            if g.xfer is not None or g.xfer_gain != 1.0:
+                self.xfer.append((i, g.xfer_gain, StatefulSOS(g.xfer.sos) if g.xfer is not None else None))
+        # air absorption: 1/6-octave distance groups (< 0.5 dB error at 16 kHz and 20 m). The pressure-domain
+        # rows get it folded into their kernels and noise spectra (no filter per block); the modal panels'
+        # outputs are filtered per group
+        step = math.log(2.0) / 6.0
+        dq = np.array([int(round(math.log(max(g.r_eq, 0.1)) / step)) for g in M], dtype=np.int64)
+        groups_q = sorted(q for q in set(dq.tolist()) if math.exp(q * step) >= AIR_MIN_DIST_M)
+        self.air_d = [math.exp(q * step) for q in groups_q]
+        self.air_g = np.array([groups_q.index(q) if q in groups_q else -1 for q in dq.tolist()], dtype=np.int64)
+        self.air = []
+        for gi, d in enumerate(self.air_d):
+            pats = np.nonzero((self.air_g == gi) & self.modal)[0]
+            if pats.size:
+                self.air.append((pats, _AirBatch(d, pats.size, self.sr)))
+        self._air_th = None                  # (temperature, RH) the folded air kernels were built for
+        self._air_map: dict = {}
+        self.force_ola = RowOLA(max(self.S, 1))
+        self.direct_ola = RowOLA(P)
+        self.force_shaper = _Shaper(self.kb)
+        self.direct_shaper = _Shaper(self.kb)
+        self.mod = RateModulatorBank(self.rngf, f"{self.layer}/cox", P, sigma=0.22, sr=self.sr)
+        self.pend_f = (np.zeros(0, dtype=np.int64),) * 3 + (np.zeros(0),)
+        self.pend_d = (np.zeros(0, dtype=np.int64),) * 3 + (np.zeros(0),)
+        self._tables: dict = {}
+        self._tab_cur = None
+        self._mfir = None
+        self._grain_codes: dict = {}
+        self._grain_ir: dict = {}
+        self.stats: dict = {}
+        self._dn_key = None                  # quantized state the cached matched-noise entries were built for
+        self._lod_prev = None                # (dense, spill) of the previous block (threshold hysteresis)
+        self._dn_entries: tuple = ([], [])
+        self._dn_epoch = 0
+        self._noise_base = 0
+        self._built_sr = self.sr
+
+    # -- per-block helpers ---------------------------------------------------
+    def _modal_fir(self, n: int):
+        """(nfft, H (S, nfft // 2 + 1)): every force row's bank response spectrum for blocks of n samples."""
+        if self._mfir is None or self._mfir[0] != n:
+            nfft = fast_len(2 * n - 1)
+            H = np.zeros((self.S, nfft // 2 + 1), dtype=complex)
+            for rows, mb in self.banks:
+                _, h = mb.fir(n)
+                if h is not None:
+                    H[rows] = h
+            self._mfir = (n, nfft, H)
+        return self._mfir[1], self._mfir[2]
+
+    def _table(self, w: WeatherState, scheme: str) -> _ClassTable:
+        """Class table of the current DSD; the table in use is kept while Dm stays within 2 % and mu within
+        0.1 of the DSD it was built for (hysteresis: no flapping between two grid cells)."""
+        cur = self._tab_cur
+        dsd = w.dsd
+        if (cur is not None and cur[0] == scheme and abs(math.log(max(float(dsd.dm_mm), 1e-6) / cur[1])) <= 0.02
+                and abs(float(dsd.mu) - cur[2]) <= 0.1 and cur[3] == (round(float(dsd.d_min_mm), 2),
+                                                                     round(float(dsd.d_max_mm), 2))):
+            return cur[4]
+        key = _dsd_key(dsd, scheme)
+        t = self._tables.get(key)
+        if t is None:
+            if len(self._tables) > 64:
+                self._tables.clear()
+            t = _ClassTable(dsd, scheme)
+            self._tables[key] = t
+        self._tab_cur = (scheme, max(float(dsd.dm_mm), 1e-6), float(dsd.mu),
+                         (round(float(dsd.d_min_mm), 2), round(float(dsd.d_max_mm), 2)), t)
+        return t
+
+    def _grain_code(self, pats, pulse_codes, variants) -> np.ndarray:
+        """Codes of the pre-baked grains of (patch material + bank variant, pulse code) (built on first use)."""
+        kb = self.kb
+        pats = np.asarray(pats, dtype=np.int64).ravel()
+        if pats.size == 0:
+            return np.zeros(0, dtype=np.int64)
+        pulse_codes = np.broadcast_to(np.asarray(pulse_codes, dtype=np.int64), pats.shape)
+        variants = np.broadcast_to(np.asarray(variants, dtype=np.int64), pats.shape)
+        # pulse codes are < 2^43 and variants < 8: one int64 key per (patch, pulse code, variant)
+        uk, inv = np.unique((pats << 46) | (pulse_codes << 3) | variants, return_inverse=True)
+        out = np.empty(uk.size, dtype=np.int64)
+        for k, key in enumerate(uk.tolist()):
+            c = self._grain_codes.get(key)
+            if c is None:
+                pi, pc, v = key >> 46, (key >> 3) & ((1 << 43) - 1), key & 7
+                mat = self.mats[pi]
+                spread = float(self.spread_p[pi]) if v else 0.0
+                tau = kb.tau_center((pc & ((1 << 40) - 1)) - 256)
+
+                def make(mat=mat, tau=tau, spread=spread, v=v):
+                    ik = (mat.name, round(spread, 4), int(v))
+                    ir = self._grain_ir.get(ik)
+                    if ir is None:
+                        ir = _modal_ir(_variant_modes(self.rngf, mat.name, spread, v), kb.sr)
+                        self._grain_ir[ik] = ir
+                    return _grain(kb, mat, tau, ir=ir)
+
+                c = kb.register(("grain", mat.name, round(spread, 4), int(v), int(pc)), make)
+                self._grain_codes[key] = c
+            out[k] = c
+        return out[np.asarray(inv).ravel()]
+
+    def _surface_state(self, w: WeatherState):
+        """Per patch: wetness, puddle cover and depth, water depth, glaze flag (from the weather).
+
+        Wetness and puddle depth are read on a 1/64 and 0.25 mm grid: they drift slowly and key the
+        cached matched-noise entries."""
+        glazed = w.precip_type == "freezing_rain" and w.temperature_c <= 0.5
+        wetd = w.wetness or {}
+        pud = w.puddle_depth_mm or {}
+        names = self._uniq_names
+        wet_m = np.array([round(float(np.clip(wetd.get(nm, 0.0) or 0.0, 0.0, 1.0)) * 64.0) / 64.0 for nm in names])
+        pud_m = np.array([round(float(pud.get(nm, 0.0) or 0.0) * 4.0) / 4.0 for nm in names])
+        wet = np.zeros(self.P) if glazed else wet_m[self._name_idx]
+        dd = pud_m[self._name_idx]
+        has = (dd > 0.2) & self.puddle_ok & (not glazed)
+        cover = np.where(has, np.minimum(1.0, dd / 8.0) ** 0.8 * np.where(self.porous, 0.5, 1.0), 0.0)
+        depth = np.where(has, np.maximum(dd, 2.0), 1000.0)
+        wet = np.where(self.is_water, 0.0, wet)
+        for i in self._water_pats:
+            depth[i] = round(self.members[i]._water_depth(w) * 4.0) / 4.0
+        return wet, cover, depth, glazed
+
+    @staticmethod
+    def _take_due(pend, t_abs0: int, n: int):
+        t, rows, codes, amps = pend
+        if t.size == 0:
+            return None, pend
+        due = t < t_abs0 + n
+        if not np.any(due):
+            return None, pend
+        keep = ~due
+        cur = (t[due] - t_abs0, rows[due], codes[due], amps[due])
+        return cur, (t[keep], rows[keep], codes[keep], amps[keep])
+
+    def _push(self, ev, pend_name, t_abs0, n, offs, rows, codes, amps):
+        now = offs < n
+        if np.all(now):
+            ev.append((offs, rows, codes, amps))
+            return
+        ev.append((offs[now], rows[now], codes[now], amps[now]))
+        later = ~now
+        t, r, c, a = getattr(self, pend_name)
+        setattr(self, pend_name, (np.concatenate([t, offs[later] + t_abs0]), np.concatenate([r, rows[later]]),
+                                  np.concatenate([c, codes[later]]), np.concatenate([a, amps[later]])))
+
+    # -- one block -------------------------------------------------------------
+    def render(self, gen, ctx: BlockContext):
+        if self._built_sr != ctx.sr:
+            self._build(int(ctx.sr))
+            self._key = None
+        key = (int(ctx.index), int(ctx.n), round(float(ctx.t0), 9))
+        if key != self._key or gen._field_epoch == self._epoch:
+            self._compute(ctx)
+            self._key = key
+            self._epoch += 1
+        gen._field_epoch = self._epoch
+        return self._out[gen._field_index]
+
+    def _compute(self, ctx: BlockContext):
+        w = ctx.weather
+        n, sr, b = int(ctx.n), int(ctx.sr), int(ctx.index)
+        kb = self.kb
+        P = self.P
+        t_abs0 = int(round(float(ctx.t0) * sr))
+        m1 = self.mod.step(b, n)
+        m0 = self.mod.prev
+        f_ev, d_ev, f_dn, d_dn = [], [], [], []      # events (offs, rows, codes, amps); dense (rows, codes, var)
+        cur, self.pend_f = self._take_due(self.pend_f, t_abs0, n)
+        if cur is not None:
+            f_ev.append(cur)
+        cur, self.pend_d = self._take_due(self.pend_d, t_abs0, n)
+        if cur is not None:
+            d_ev.append(cur)
+        gate = _RAIN_GATE.get(w.precip_type, 1.0)
+        self.stats = {}
+        self._noise_base = 0
+        if self._air_update(w):
+            self._dn_key = None                  # the cached noise entries carry folded air kernels
+        if gate > 0.0 and w.class_flux and w.dsd is not None and P:
+            self._events(ctx, gate, m0, m1, f_ev, d_ev, f_dn, d_dn, t_abs0)
+
+        base = self._noise_base
+        for dom, ev, dn, ola, shaper, to_pat in ((0, f_ev, f_dn, self.force_ola, self.force_shaper, self.row_patch),
+                                                (1, d_ev, d_dn, self.direct_ola, self.direct_shaper, None)):
+            if ev:
+                offs = np.concatenate([e[0] for e in ev])
+                if offs.size:
+                    rows = np.concatenate([e[1] for e in ev])
+                    codes = np.concatenate([e[2] for e in ev])
+                    if dom == 1:
+                        codes = self._air_codes(codes, rows)
+                    rows_u, Y = scatter_kernels(kb, n, rows, codes, offs, np.concatenate([e[3] for e in ev]))
+                    ola.add(rows_u, Y)
+            if dn:
+                rows = np.concatenate([d[0] for d in dn])
+                codes = np.concatenate([d[1] for d in dn])
+                var = np.concatenate([d[2] for d in dn])
+                mr0, mr1 = (m0, m1) if to_pat is None else (m0[to_pat], m1[to_pat])
+                rows_u, Y = shaper.render(n, rows, codes, var, mr0, mr1, base, layout_key=(self._dn_epoch, dom))
+                if rows_u.size:
+                    ola.add(rows_u, Y)
+                    base += Y.shape[0] * (Y.shape[1] + 2)              # next rows read fresh table noise
+
+        y = np.zeros((P, n))
+        if self.S:
+            force = self.force_ola.pop(n)
+            has = np.any(force, axis=1)
+            rows_y = np.zeros((self.S, n))
+            fir = None
+            if np.any(has):                         # every bank's in-block convolution in one batched FFT
+                idx = np.nonzero(has)[0]
+                nfft, H = self._modal_fir(n)
+                fir = np.zeros((self.S, n))
+                fir[idx] = sfft.irfft(sfft.rfft(force[idx], nfft, axis=-1) * H[idx], nfft, axis=-1)[:, :n]
+            for rows, mb in self.banks:
+                fin = bool(np.any(has[rows]))
+                if not fin and mb.silent(1e-11):
+                    continue
+                if mb.bank.n_modes == 0:
+                    rows_y[rows] = force[rows]
+                else:
+                    rows_y[rows] = mb.process(force[rows], has_input=fin, fir=fir[rows] if fin else None)
+            solid = np.add.reduceat(rows_y, self.row_starts, axis=0)        # (voice solid patches, n)
+            for item in self.rad:
+                pats, sos, zi, cal, sel = item
+                x = solid[sel]
+                if not np.any(x) and (zi is None or not np.any(zi)):
+                    continue
+                if zi is not None:
+                    x, zi = signal.sosfilt(sos, x, axis=-1, zi=zi)
+                    np.copyto(zi, 0.0, where=np.abs(zi) < 1e-30)        # no denormal tails
+                    item[2] = zi
+                y[pats] = x * cal
+            for pats, air in self.air:                  # air absorption of the modal panels' radiation
+                x = y[pats]
+                if not np.any(x) and (air.zi is None or not np.any(air.zi)):
+                    continue
+                y[pats] = air.process(x, w.temperature_c, w.humidity_pct)
+        if self.direct_ola.active:
+            y += self.direct_ola.pop(n)
+        else:
+            self.direct_ola.pop(n)
+        for i, gain, xs in self.xfer:
+            if xs is not None:
+                y[i] = xs.process(y[i])
+            y[i] *= gain
+        y *= self.spreading[:, None]
+        live = np.max(np.abs(y), axis=1) > _LIVE_EPS
+        self._out = [y[i] if live[i] else None for i in range(P)]
+        if not np.all(live):
+            self._flush(~live)
+
+    def _flush(self, quiet: np.ndarray):
+        """Zero the filter states of silent patches whose inputs have died out (no denormal tails)."""
+        f_act = self.force_ola.active_rows()
+        for pats, air in self.air:
+            if air.zi is None:
+                continue
+            q = quiet[pats]
+            if self.S:
+                q &= np.array([not np.any(f_act[self.row0[p]:self.row0[p] + max(self.n_var[p], 1)]) for p in pats])
+            if np.any(q):
+                air.zi[:, q, :] = 0.0
+
+    # -- air absorption folded into the pressure-domain kernels ---------------------
+    def _air_update(self, w: WeatherState) -> bool:
+        """Track the air state; True when the folded kernels must be rebuilt (> 1 C or > 5 % RH away)."""
+        t, h = float(w.temperature_c), float(w.humidity_pct)
+        cur = self._air_th
+        if cur is not None and abs(t - cur[0]) <= 1.0 and abs(h - cur[1]) <= 0.05 * max(cur[1], 1.0):
+            return False
+        self._air_th = (round(t * 2.0) / 2.0, float(round(h)))
+        self._air_map = {}
+        return True
+
+    def _air_codes(self, codes, rows) -> np.ndarray:
+        """Kernel codes with each row's ISO 9613-1 air absorption folded in (rows nearer than
+        AIR_MIN_DIST_M keep the plain kernel); the filtered kernels are built once per air state."""
+        codes = np.asarray(codes, dtype=np.int64)
+        g = self.air_g[np.asarray(rows, dtype=np.int64)]
+        far = g >= 0
+        if not np.any(far) or self._air_th is None:
+            return codes
+        codes = codes.copy()
+        uk, inv = np.unique((codes[far] << 8) | g[far], return_inverse=True)   # codes < 2^44
+        out = np.empty(uk.size, dtype=np.int64)
+        amap = self._air_map
+        kb = self.kb
+        t, h = self._air_th
+        for i, k in enumerate(uk.tolist()):
+            c = amap.get(k)
+            if c is None:
+                code, d = k >> 8, self.air_d[k & 255]
+
+                def make(code=code, d=d):
+                    ker = kb.kernel(code)
+                    y = signal.sosfilt(air_absorption_sos(d, t, h, kb.sr), np.concatenate([ker, np.zeros(512)]))
+                    env = np.abs(y)
+                    nz = np.nonzero(env > 1e-5 * max(float(env.max()), 1e-300))[0]
+                    return y[: max(int(nz[-1]) + 1 if nz.size else 1, len(ker))]
+
+                c = amap[k] = kb.register(("air", int(code), round(d, 4), t, h), make)
+            out[i] = c
+        codes[far] = out[np.asarray(inv).ravel()]
+        return codes
+
+    # -- events -----------------------------------------------------------------
+    def _events(self, ctx, gate, m0, m1, f_ev, d_ev, f_dn, d_dn, t_abs0):
+        w = ctx.weather
+        n, sr, b = int(ctx.n), int(ctx.sr), int(ctx.index)
+        kb = self.kb
+        scheme = self.members[0].scheme
+        tab = self._table(w, scheme)
+        uh = _wind_vector(w)
+        wn = self.nx * uh[0] + self.ny * uh[1]                         # wind component along each normal
+        flux = np.array([float(w.class_flux.get(c, 0.0) or 0.0) for c in CLASSES]) * tab.valid
+        ff = np.maximum(0.0, self.nz[:, None] - wn[:, None] / np.maximum(tab.vt_c, 0.3)[None, :])
+        rate = flux[None, :] * (self.base * gate)[:, None] * ff        # impacts/s per patch and class
+        if not np.any(rate > 0.0):
+            return
+        mmean = 0.5 * (m0 + m1)
+        wet, cover, depth, glazed = self._surface_state(w)
+        wind10 = float(w.wind_u10_mps) * max(float(w.gust), 0.0)
+        wq = float(self.members[0].water_quality)
+
+        # quadrature over each class: normal impact speed and peak force per patch
+        unq = np.maximum(tab.vtq[None, :, :] * self.nz[:, None, None] - wn[:, None, None],
+                         0.2 * tab.vtq[None, :, :])                    # (P, 5, Q)
+        dq = np.broadcast_to(tab.dq[None, :, :], unq.shape)
+        fq = force_peak(dq, unq)
+        # LOD decisions use the unmodulated rate, so they hold while the weather does (the Cox modulation
+        # only scales the per-drop counts and the matched-noise variance)
+        overlap = rate * self.teff
+        cap = self.caps * (n / _BLOCK_REF)
+        if math.isfinite(self.lod["dense"]):
+            # salience by impact force holds on solids; on water the small class rings loudest (Medwin 1992)
+            e_rel = fq * fq @ tab.wq
+            e_rel = e_rel / np.maximum(e_rel.max(axis=1, keepdims=True), 1e-30)
+            # +-15 % hysteresis on every threshold: a class near one does not flip from block to block
+            pd, ps = self._lod_prev if self._lod_prev is not None else (np.zeros_like(rate, bool),) * 2
+            hy_d = np.where(pd, 0.85, 1.15)
+            faint = (e_rel < _SALIENCE) & (overlap >= 0.3 * hy_d) & ~self.is_water[:, None]
+            dense = (rate > 0.0) & ((overlap >= self.dense_thr[:, None] * hy_d) | faint)
+            # sparse classes that reach their per-drop cap send the excess to the matched-noise layer
+            # (cap / rate ratio is block-length free: caps are stated per 1024 frames)
+            spill = (rate > 0.0) & ~dense & (rate * (_BLOCK_REF / sr) > 0.5 * self.caps * np.where(ps, 0.85, 1.15))
+            self._lod_prev = (dense, spill)
+        else:
+            dense = np.zeros(rate.shape, dtype=bool)
+            spill = dense
+
+        # ---- sparse classes: Poisson counts; above the cap the excess is matched noise ------------
+        lam = np.where(dense, 0.0, rate * (n / sr) * mmean[:, None])
+        capped = lam > cap
+        lam_draw = np.where(capped, cap, lam)
+        excess = np.where(capped, 1.0 - cap / np.maximum(lam, 1e-12), 0.0)
+        # a capped class without a noise layer keeps its energy by sqrt(expected / cap) amplitude scaling
+        scale = np.where(capped & ~spill, np.sqrt(lam / np.maximum(cap, 1e-12)), 1.0)
+        rng = self.rngf.get(self.layer, b)
+        self._noise_base = int(rng.integers(0, 1 << 30))              # matched-noise table position
+        counts = rng.poisson(lam_draw)
+        tot = int(counts.sum())
+        # per block, per patch and class: expected impacts, per-drop draws, dense flags, matched-noise
+        # share of the energy (tests, meters)
+        share = np.where(dense, 1.0, np.where(spill, excess, 0.0))
+        self.stats = {"expected": rate * (n / sr) * mmean[:, None], "drawn": counts, "dense": dense,
+                      "scale": scale, "noise_share": share}
+        if tot:
+            flat = counts.ravel()
+            pc = np.repeat(np.arange(flat.size), flat)
+            pe, ce = pc // len(CLASSES), pc % len(CLASSES)
+            se = scale.ravel()[pc]
+            off = (ramp_positions(rng.random(tot), m0[pe], m1[pe]) * n).astype(np.int64)
+            d = tab.sample(rng.random(tot), ce)
+            vt = _fall_speed(d)
+            un = np.maximum(vt * self.nz[pe] - wn[pe], 0.2 * vt)
+            to_water = self.is_water[pe] | (rng.random(tot) < cover[pe])
+            wi = np.nonzero(to_water)[0]
+            if wi.size:
+                p_w = pe[wi]
+                offs, codes, amps, src = _water_events(
+                    kb, rng, off[wi], d[wi], un[wi], ce[wi], se[wi], click_pa=self.click_pa[p_w],
+                    depth_mm=depth[p_w], wind_mps=wind10, water_quality=wq, sr=sr)
+                self._push(d_ev, "pend_d", t_abs0, n, offs, p_w[src], codes, amps)
+            si = np.nonzero(~to_water)[0]
+            if si.size:
+                self._solid_events(rng, si, pe, off, d, un, se, wet, glazed, f_ev, d_ev, t_abs0, n, sr)
+
+        # ---- dense classes and capped excess: matched noise --------------------------------
+        # the entries (rows, kernels, variance per unit rate) depend only on the quantized surface / DSD /
+        # wind state and the noise set, so they are rebuilt only when that state moves
+        noisy = dense | spill
+        if np.any(noisy):
+            # rebuilt when the table, the noise set, the quantized surface state or the glaze change, the
+            # wind along any patch normal moves by > 0.15 m/s, or the wind inside the small-drop ring's
+            # 7.5-10 m/s cut-off band moves by > 0.2 m/s
+            wind_e = min(max(wind10, 7.5), 10.0)
+            key = (id(tab), bool(glazed), dense.tobytes(), spill.tobytes(), np.asarray(wet).tobytes(),
+                   cover.tobytes(), depth.tobytes())
+            st = self._dn_key
+            if (st is None or st[0] != key or float(np.max(np.abs(wn - st[1]), initial=0.0)) > 0.15
+                    or abs(wind_e - st[2]) > 0.2):
+                self._dn_entries = self._dense(noisy, tab.wq, dq, unq, fq, wet, cover, depth, glazed, wind_e, wq)
+                self._dn_key = (key, wn.copy(), wind_e, tab)
+                self._dn_epoch += 1
+            rf = (rate * share).ravel() / sr                           # noise impacts per sample per (patch, class)
+            for out, entries in ((f_dn, self._dn_entries[0]), (d_dn, self._dn_entries[1])):
+                for rows, codes, coef, src in entries:
+                    out.append((rows, codes, coef * rf[src]))
+
+    def _solid_events(self, rng, si, pe, off, d, un, se, wet, glazed, f_ev, d_ev, t_abs0, n, sr):
+        kb = self.kb
+        p = pe[si]
+        dd, uu, oo, ss = d[si], un[si], off[si], se[si]
+        m = si.size
+        wp = wet[p]
+        f_phys = force_peak(dd, uu)
+        tau = dd * 1e-3 / np.maximum(uu, 0.05) * (1.0 + 0.6 * wp) * (0.7 if glazed else 1.0)
+        force = f_phys * ss * np.exp(rng.normal(0.0, _SIG_FORCE, m)) * (1.0 - 0.35 * wp)
+        sn = self.snow[p]
+        if np.any(sn):                       # rain onto a snow cover: soft, swallowed
+            force = np.where(sn, 0.2 * force, force)
+            tau = np.where(sn, 4.0 * tau, tau)
+        codes = kb.pulse_code(tau)
+        mod = self.modal[p]
+        var = (rng.random(m) * np.maximum(self.n_var[p], 1)).astype(np.int64)
+        rows = np.where(mod, self.row0[p] + var, p)
+        # prompt-splash micro-impacts on dry hard surfaces
+        ps = self.splash_p[p] * (1.0 - wp) ** 2 * _smoothstep(dd, 0.6, 1.6) * (wp < 0.95)
+        sel = np.nonzero(rng.random(m) < ps)[0]
+        if sel.size:
+            rep = np.repeat(sel, rng.integers(2, 11, sel.size))
+            k = rep.size
+            delay = (np.exp(rng.uniform(math.log(0.005), math.log(0.05), k)) * sr).astype(np.int64)
+            amp = force[rep] * np.exp(rng.uniform(math.log(0.005), math.log(0.03), k))
+            s_codes = kb.pulse_code(np.exp(rng.uniform(math.log(5e-5), math.log(1.5e-4), k)))
+            rm = mod[rep]
+            if np.any(rm):
+                j = np.nonzero(rm)[0]
+                self._push(f_ev, "pend_f", t_abs0, n, oo[rep][j] + delay[j], rows[rep][j], s_codes[j], amp[j])
+            if not np.all(rm):
+                j = np.nonzero(~rm)[0]
+                self._push(d_ev, "pend_d", t_abs0, n, oo[rep][j] + delay[j], rows[rep][j],
+                           self._grain_code(p[rep][j], s_codes[j], var[rep][j]), amp[j])
+        if np.any(mod):
+            j = np.nonzero(mod)[0]
+            f_ev.append((oo[j], rows[j], codes[j], force[j]))
+        if not np.all(mod):
+            j = np.nonzero(~mod)[0]
+            d_ev.append((oo[j], rows[j], self._grain_code(p[j], codes[j], var[j]), force[j]))
+        # crown / dome splash hiss on a wet film (no bubbles)
+        h = np.nonzero((wp > 0.05) & self.hiss_ok[p])[0]
+        if h.size:
+            ph = p[h]
+            amp = self.hiss_pa[ph] * wp[h] * (f_phys[h] / F_REF) ** 0.75 * ss[h] * self.hiss_scale[ph]
+            dur = np.clip(0.0025 * np.sqrt(dd[h] / 2.0), 0.0015, 0.008)
+            d_ev.append((oo[h], ph, kb.splash_code(dur, rng.integers(0, kb.SPLASH_VARIANTS, h.size), True), amp))
+
+    def _dense(self, noisy, qw, dq, unq, fq, wet, cover, depth, glazed, wind10, wq):
+        """Matched-noise entries of the (patch, class) pairs in `noisy` for a unit impact rate (1 per sample).
+
+        qw are the class quadrature weights (Gauss-Legendre in the flux-weighted size quantile). Solid
+        force pulses keep one kernel per quadrature node, so the noise has the per-drop spectrum of the
+        whole size range. Returns (force entries, direct entries), each a list of (rows, kernel codes,
+        variance per unit rate, flat patch * 5 + class index); the caller scales by the current rates.
+        """
+        kb = self.kb
+        f_out, d_out = [], []
+        Q = qw.size
+        pi, ci = np.nonzero(noisy)
+        src = pi * len(CLASSES) + ci
+        fqq, dqq, uqq = fq[pi, ci], dq[pi, ci], unq[pi, ci]     # (k, Q)
+        water_share = np.where(self.is_water[pi], 1.0, cover[pi])
+        solid_share = 1.0 - water_share
+        # -- solid: force noise into the voice panel's banks, or grains for far patches -----
+        s = np.nonzero(solid_share > 0.0)[0]
+        if s.size:
+            p = pi[s]
+            ss_ = src[s]
+            wp = wet[p]
+            sn = self.snow[p]
+            f2 = (fqq[s] ** 2 * math.exp(2.0 * _SIG_FORCE ** 2)
+                  * ((1.0 - 0.35 * wp) ** 2 * np.where(sn, 0.04, 1.0))[:, None])
+            tauq = (dqq[s] * 1e-3 / np.maximum(uqq[s], 0.05)
+                    * ((1.0 + 0.6 * wp) * (0.7 if glazed else 1.0) * np.where(sn, 4.0, 1.0))[:, None])
+            rs = solid_share[s]
+            v_fq = rs[:, None] * f2 * qw[None, :]                      # (k, Q) per quadrature node
+            ps = (self.splash_p[p][:, None] * ((1.0 - wp) ** 2 * (wp < 0.95))[:, None]
+                  * _smoothstep(dqq[s], 0.6, 1.6))
+            v_s = rs * ((ps * f2) @ qw) * _SPLASH_REPS * _SPLASH_A2
+            codes_q = kb.pulse_code(tauq)                              # (k, Q)
+            s_code = np.full(p.size, kb.pulse_code(_SPLASH_TAU), dtype=np.int64)
+            mod = self.modal[p]
+            nv = np.maximum(self.n_var[p], 1)
+            jj = np.repeat(np.arange(p.size), nv)                       # one entry per bank variant
+            vv = np.concatenate([np.arange(k) for k in nv])
+            share = 1.0 / nv[jj]
+            m_ = mod[jj]
+            for sel, out in ((m_, f_out), (~m_, d_out)):
+                if not np.any(sel):
+                    continue
+                j, v = jj[sel], vv[sel]
+                if out is f_out:
+                    rows = self.row0[p[j]] + v
+                    cq, cs = codes_q[j].ravel(), s_code[j]
+                else:
+                    rows = p[j]
+                    cq = self._grain_code(np.repeat(p[j], Q), codes_q[j].ravel(), np.repeat(v, Q))
+                    cs = self._grain_code(p[j], s_code[j], v)
+                out.append((np.concatenate([np.repeat(rows, Q), rows]), np.concatenate([cq, cs]),
+                            np.concatenate([(v_fq[j] * share[sel][:, None]).ravel(), v_s[j] * share[sel]]),
+                            np.concatenate([np.repeat(ss_[j], Q), ss_[j]])))
+            h = np.nonzero((wp > 0.05) & self.hiss_ok[p])[0]
+            if h.size:
+                ph = p[h]
+                a2 = (self.hiss_pa[ph] * wp[h] * self.hiss_scale[ph]) ** 2 * (((fqq[s][h] / F_REF) ** 1.5) @ qw)
+                dur = np.clip(0.0025 * np.sqrt((dqq[s][h] @ qw) / 2.0), 0.0015, 0.008)
+                d_out.append((ph, kb.splash_code(dur, 0, True), rs[h] * a2, ss_[h]))
+        # -- water: clicks, bubbles and splats as coloured noise ---------------------
+        wsel = np.nonzero(water_share > 0.0)[0]
+        if wsel.size:
+            p, c, sw = pi[wsel], ci[wsel], src[wsel]
+            rw = water_share[wsel]
+            dd, uu = dqq[wsel], uqq[wsel]
+            u_e = np.sqrt(((dd ** 2 * uu ** 8) @ qw) / np.maximum((dd ** 2 * uu ** 6) @ qw, 1e-30))
+            u_bin = kb.click_bin(u_e) * kb.CLICK_STEP
+            a2 = (self.click_pa[p] ** 2 * math.exp(2.0 * _SIG_CLICK ** 2) * np.where(c == 0, 0.09, 1.0)
+                  * (((dd / D_REF_MM) ** 2 * (uu / u_bin[:, None]) ** 6) @ qw))
+            d_out.append((p, kb.click_code(u_e), rw * a2, sw))
+            pent = _entrainment_probability(dd, np.repeat(c[:, None], dd.shape[1], axis=1), wind10) @ qw
+            pent = pent * float(np.clip(wq, 0.0, 1.0)) * np.where(c == 4, 1.0 + _VL_EXTRA_BUBBLES, 1.0)
+            fd = _smoothstep(depth[p], 1.5, 8.0)
+            vb = rw * pent * (BUBBLE_PA_PER_M * fd) ** 2 * _EPS2[c]
+            ok = np.nonzero(vb > 0.0)[0]
+            if ok.size:
+                db = _damp_bin(depth[p[ok]])
+                codes = np.array([kb.register(("bubble_color", int(c[j]), int(round(float(dd[j] @ qw) / 0.05)),
+                                               int(db[k])),
+                                              lambda j=j, k=k: _bubble_color(kb, int(c[j]), dd[j], int(db[k]), qw))
+                                  for k, j in enumerate(ok)], dtype=np.int64)
+                d_out.append((p[ok], codes, vb[ok], sw[ok]))
+            k = np.nonzero(c >= 3)[0]
+            if k.size:
+                ind = np.where(c[k, None] == 4, 1.0, (dd[k] >= 3.0).astype(float))
+                a2s = ((ind * _splat_amp(dd[k], uu[k], c[k, None]) ** 2) @ qw) * math.exp(2.0 * 0.25 ** 2)
+                if np.any(a2s > 0.0):
+                    d_out.append((p[k], kb.splash_code(_splat_dur(dd[k] @ qw), 0, True), rw[k] * a2s, sw[k]))
+        d_out = [(r, self._air_codes(c, r), v, i) for r, c, v, i in d_out]
+        return f_out, d_out
+
 
 class RainPatchGenerator:
-    """Rain on one SourcePatch: per-class Cox event streams -> water / solid / granular synthesis."""
+    """Rain on one SourcePatch: per-class Cox event streams -> water / solid / matched-noise synthesis.
 
-    CAPS_FULL = (600, 1500, 1500, 800, 400)        # max events per block per class
-    CAPS_GRANULAR = (40, 100, 100, 60, 30)
+    Patches built together by make_rain_generators share one _RainField, which renders all of them in
+    a single vectorised pass per block; a patch built on its own gets a private field.
+    """
+
+    CAPS_FULL = QUALITY_LOD["studio"]["voice_cap"]          # max per-drop events per 1024 frames per class
+    CAPS_GRANULAR = QUALITY_LOD["studio"]["gran_cap"]
 
     def __init__(self, scene, patch: SourcePatch, rngf: RngFactory, lod: str = "full",
-                 kernels: KernelBank | None = None, sr: int = SAMPLE_RATE):
+                 kernels: KernelBank | None = None, sr: int = SAMPLE_RATE, *, field: _RainField | None = None,
+                 quality: str | None = None):
         self.name = f"rain/{patch.id}"
         self.patch = patch
         self.rngf = rngf
@@ -471,56 +1627,21 @@ class RainPatchGenerator:
         # one panel rings with one set of modes; a ground sector is many independent pieces
         self.single_panel = (patch.kind in ("membrane", "vehicle_body", "gutter") or patch.interior
                              or (patch.area_m2 <= 2.5 and not (patch.params or {}).get("ground")))
-        self.caps = self.CAPS_FULL if self.lod == "full" else self.CAPS_GRANULAR
-        self._kb = kernels
-        self._bounds_key = None
-        self._bounds: dict = {}
-        self.sr = None
-        self._setup(int(sr))
-
-    def _setup(self, sr: int):
-        self.sr = int(sr)
-        self.kb = self._kb if (self._kb is not None and self._kb.sr == self.sr) else KernelBank(self.sr)
-        self.direct = OverlapAdd()
-        self.voice = None
-        self.grains = None
-        pid = self.patch.id
-        if self.kind != "water":
-            if self.lod == "full":
-                nv = 1 if self.single_panel else (4 if self.kind == "vegetation" else 3)
-                spread = 0.25 if self.kind == "vegetation" else (0.03 if self.single_panel else 0.08)
-                self.voice = _SolidVoice(self.mat, self.sr, self.kb, self.rngf, f"rain/{pid}", nv, spread)
-            else:
-                self.grains = _grain_kernels(self.mat, self.sr)
-        self.air = AirAbsorptionFilter(self.sr)
-        self.mod = RateModulator(self.rngf, f"rain/{pid}/cox", sigma=0.22, sr=self.sr)
         click_db = self.mat.level_db if self.kind == "water" else MATERIALS["puddle"].level_db
         self.click_pa = float(db_to_pa(click_db))
+        self.sr = int(sr)
         self.xfer_gain, xs = _interior_transfer(self.patch, self.sr)
         self.xfer = StatefulSOS(xs) if xs is not None else None
+        if field is None:
+            q = quality or str(getattr(getattr(scene, "render", None), "quality", "studio") or "studio")
+            field = _RainField(rngf, q, kernels, self.sr, layer=f"rain/{patch.id}/field")
+        self.field = field
+        self._field_index = field.add(self)
+        self._field_epoch = -1
 
-    # -- geometry / weather helpers ------------------------------------------
-    def _class_bounds(self, dsd) -> dict:
-        key = round(float(dsd.d_max_mm), 3)
-        if key != self._bounds_key:
-            self._bounds = _dsd.class_bounds(self.scheme, d_max_mm=float(dsd.d_max_mm))
-            self._bounds_key = key
-        return self._bounds
-
-    def _flux_factor(self, vt: float, uh) -> float:
-        nx, ny, nz = self.normal
-        return max(0.0, nz - (nx * uh[0] + ny * uh[1]) / max(vt, 0.3))
-
-    def _puddle_cover(self, w: WeatherState) -> tuple[float, float]:
-        if self.kind in ("vegetation", "membrane", "snow"):
-            return 0.0, 0.0
-        depth = float((w.puddle_depth_mm or {}).get(self.mat.name, 0.0) or 0.0)
-        if depth <= 0.2:
-            return 0.0, 0.0
-        cover = min(1.0, depth / 8.0) ** 0.8
-        if self.kind == "porous":
-            cover *= 0.5
-        return cover, max(depth, 2.0)
+    @property
+    def caps(self):
+        return tuple(self.field.lod["voice_cap" if self.lod == "full" else "gran_cap"])
 
     def _water_depth(self, w: WeatherState) -> float:
         if self.mat.name == "water" or self.patch.params.get("deep"):
@@ -530,129 +1651,10 @@ class RainPatchGenerator:
             d = self.patch.params.get("depth_mm", 12.0)
         return max(float(d), 0.5)
 
-    # -- events --------------------------------------------------------------
-    def _events(self, ctx: BlockContext):
-        w = ctx.weather
-        gate = _RAIN_GATE.get(w.precip_type, 1.0)
-        if gate <= 0.0 or not w.class_flux or self.patch.exposure <= 0.0 or w.dsd is None:
-            return None
-        n, sr, b = ctx.n, ctx.sr, ctx.index
-        uh = _wind_vector(w)
-        curve = self.mod.curve(b, n)
-        base = self.patch.area_m2 * max(self.patch.exposure, 0.0) * gate
-        bounds = self._class_bounds(w.dsd)
-        nx, ny, nz = self.normal
-        pieces = []
-        for i, cls in enumerate(CLASSES):
-            flux = float(w.class_flux.get(cls, 0.0) or 0.0)
-            if flux <= 0.0 or cls not in bounds:
-                continue
-            lo, hi = bounds[cls]
-            lo = max(float(lo), float(w.dsd.d_min_mm))
-            hi = min(float(hi), float(w.dsd.d_max_mm))
-            if hi <= lo:
-                continue
-            vt_c = float(_fall_speed(math.sqrt(lo * hi) if lo > 0 else 0.5 * hi))
-            rate = flux * base * self._flux_factor(vt_c, uh)
-            if rate <= 0.0:
-                continue
-            rng = self.rngf.get(f"rain/{self.patch.id}/{cls}", b)
-            off, scale = thinned_offsets(rng, rate, n, sr, self.caps[i], curve)
-            if off.size == 0:
-                continue
-            d = np.asarray(_dsd.sample_diameters(rng, w.dsd, lo, hi, off.size), dtype=float).ravel()[: off.size]
-            if d.size < off.size:
-                d = np.resize(d, off.size) if d.size else np.full(off.size, math.sqrt(lo * hi))
-            vt = _fall_speed(d)
-            un = np.maximum(vt * nz - (nx * uh[0] + ny * uh[1]), 0.2 * vt)
-            pieces.append((off, d, un, np.full(off.size, i, dtype=np.int64), np.full(off.size, scale)))
-        if not pieces:
-            return None
-        return tuple(np.concatenate([p[k] for p in pieces]) for k in range(5))
-
-    # -- synthesis -----------------------------------------------------------
-    def _synthesize(self, ctx: BlockContext, ev):
-        off, d, u, ci, sc = ev
-        w = ctx.weather
-        sr = ctx.sr
-        rng = self.rngf.get(f"rain/{self.patch.id}/surface", ctx.index)
-        wind10 = float(w.wind_u10_mps) * max(float(w.gust), 0.0)
-        if self.kind == "water":
-            _water_impacts(self.kb, rng, off, d, u, ci, sc, self.direct, click_pa=self.click_pa,
-                           depth_mm=self._water_depth(w), wind_mps=wind10,
-                           water_quality=self.water_quality, sr=sr)
-            return
-
-        glazed = w.precip_type == "freezing_rain" and w.temperature_c <= 0.5
-        cover, depth = (0.0, 0.0) if glazed else self._puddle_cover(w)
-        if cover > 0.0:
-            wm = rng.random(off.size) < cover
-            if np.any(wm):
-                _water_impacts(self.kb, rng, off[wm], d[wm], u[wm], ci[wm], sc[wm], self.direct,
-                               click_pa=self.click_pa, depth_mm=depth, wind_mps=wind10,
-                               water_quality=self.water_quality, sr=sr)
-                keep = ~wm
-                off, d, u, ci, sc = off[keep], d[keep], u[keep], ci[keep], sc[keep]
-        n_ev = off.size
-        if n_ev == 0:
-            return
-
-        wet = 0.0 if glazed else float(np.clip((w.wetness or {}).get(self.mat.name, 0.0), 0.0, 1.0))
-        f_phys = force_peak(d, u)
-        tau = d * 1e-3 / np.maximum(u, 0.05) * (1.0 + 0.6 * wet) * (0.7 if glazed else 1.0)
-        force = f_phys * sc * np.exp(rng.normal(0.0, 0.25, n_ev)) * (1.0 - 0.35 * wet)
-        if self.kind == "snow":          # rain onto a snow cover: soft, swallowed
-            force = force * 0.2
-            tau = tau * 4.0
-
-        if self.voice is not None:
-            var = rng.integers(0, self.voice.n_var, n_ev) if self.voice.n_var > 1 else None
-            self.voice.add_force(off, force, tau, "pulse", var)
-            # prompt-splash micro-impacts on dry hard surfaces
-            if self.mat.splash > 0.0 and self.mat.hardness >= 0.45 and wet < 0.95 and self.kind != "snow":
-                p = self.mat.splash * (1.0 - wet) ** 2 * _smoothstep(d, 0.6, 1.6)
-                sel = np.nonzero(rng.random(n_ev) < p)[0]
-                if sel.size:
-                    rep = np.repeat(sel, rng.integers(2, 11, sel.size))
-                    m = rep.size
-                    delay = (np.exp(rng.uniform(math.log(0.005), math.log(0.05), m)) * sr).astype(np.int64)
-                    amp = force[rep] * np.exp(rng.uniform(math.log(0.005), math.log(0.03), m))
-                    tau_s = np.exp(rng.uniform(math.log(5e-5), math.log(1.5e-4), m))
-                    self.voice.add_force(off[rep] + delay, amp, tau_s, "pulse",
-                                         None if var is None else var[rep])
-        elif self.grains is not None:
-            var = rng.integers(0, 2, n_ev)
-            render_binned(off, force, var * len(CLASSES) + ci, self.grains.__getitem__, self.direct)
-
-        # crown / dome splash hiss on a wet film (no bubbles)
-        if wet > 0.05 and self.kind in ("solid", "porous", "membrane"):
-            amp = (float(db_to_pa(self.mat.level_db + FILM_HISS_REL_DB)) * wet
-                   * (f_phys / F_REF) ** 0.75 * sc * (0.5 if self.kind == "membrane" else 1.0))
-            dur = np.clip(0.0025 * np.sqrt(d / 2.0), 0.0015, 0.008)
-            keys = self.kb.dur_bin(dur) * 16 + rng.integers(0, self.kb.SPLASH_VARIANTS, n_ev)
-            render_binned(off, amp, keys, lambda k: self.kb.splash(k // 16, k % 16, True), self.direct)
-
     def render(self, ctx: BlockContext) -> list[Emission]:
-        if ctx.sr != self.sr:
-            self._setup(int(ctx.sr))
-        w = ctx.weather
-        ev = self._events(ctx)
-        if ev is not None:
-            self._synthesize(ctx, ev)
-        n = ctx.n
-        y = np.zeros(n)
-        live = False
-        if self.voice is not None and self.voice.active:
-            y += self.voice.render(n)
-            live = True
-        if self.direct.active:
-            y += self.direct.pop(n)
-            live = True
-        if not live:
+        y = self.field.render(self, ctx)
+        if y is None:
             return []
-        if self.xfer is not None:
-            y = self.xfer.process(y) * self.xfer_gain
-        y = self.air.process(y * float(spreading_gain(self.r_eq)), self.r_eq, w.temperature_c, w.humidity_pct)
         return [Emission(signal=y, azimuth=self.patch.azimuth, elevation=self.patch.elevation,
                          distance=self.patch.distance, spread=self.spread, stem=self.stem,
                          is_ambisonic=False, source_id=self.name)]
@@ -660,32 +1662,6 @@ class RainPatchGenerator:
 
 # ---------------------------------------------------------------------------
 # far-field diffuse bed, synthesized in the SH domain
-
-class _XfadeSOS:
-    """Multichannel air-absorption filter, redesigned on weather change with a one-block crossfade."""
-
-    def __init__(self, distance_m: float):
-        self.distance = float(distance_m)
-        self.cur = None
-        self.params = None
-
-    def process(self, x: np.ndarray, temp_c: float, rh_pct: float, sr: int) -> np.ndarray:
-        params = (float(temp_c), float(rh_pct))
-        if self.cur is None:
-            self.cur = StatefulSOS(air_absorption_sos(self.distance, temp_c, rh_pct, sr))
-            self.params = params
-            return self.cur.process(x)
-        t0, h0 = self.params
-        if abs(params[0] - t0) > 2.0 or abs(params[1] - h0) > 0.05 * max(h0, 1.0):
-            new = StatefulSOS(air_absorption_sos(self.distance, temp_c, rh_pct, sr))
-            y0 = self.cur.process(x)
-            y1 = new.process(x)
-            ramp = np.linspace(0.0, 1.0, x.shape[-1])
-            self.cur = new
-            self.params = params
-            return y0 * (1.0 - ramp) + y1 * ramp
-        return self.cur.process(x)
-
 
 class RainBedGenerator:
     """Diffuse rain beyond the near rings: N_AMBI independent shaped noises, low-order anisotropy.
@@ -761,7 +1737,8 @@ class RainBedGenerator:
 
     def _setup(self, sr: int):
         self.sr = int(sr)
-        self.bands = []
+        self.kb = KernelBank(self.sr)
+        self.band_sos = []
         self.band_e = np.zeros(len(self.BANDS))
         imp = np.zeros(16384)
         imp[0] = 1.0
@@ -769,18 +1746,34 @@ class RainBedGenerator:
             hi = min(hi, 0.45 * self.sr)
             lo = min(lo, 0.5 * hi)
             sos = signal.butter(2, [lo, hi], "bandpass", fs=self.sr, output="sos")
-            self.bands.append(StatefulSOS(sos))
+            self.band_sos.append(sos)
             self.band_e[k] = float(np.sum(signal.sosfilt(sos, imp) ** 2))
         orders = np.floor(np.sqrt(np.arange(N_AMBI))).astype(int)
         self.ord_w = 1.0 / np.sqrt(2.0 * orders + 1.0)          # diffuse field in SN3D
-        self.gains_prev = np.zeros(len(self.BANDS))
+        self.v_prev = 0.0
+        self._var_prev = np.zeros(len(self.BANDS))
         self.aniso_prev = np.zeros(3)
-        self.air = _XfadeSOS(self.r_air)
+        self.shaper = _Shaper(self.kb)
+        self.ola = RowOLA(N_AMBI)
         # slowly wandering rain curtains: the louder side of the bed drifts (1/f, 1 s .. 30 s)
         self.wander = (RateModulator(self.rngf, "rain/bed/wander_x", sigma=0.6, tau_min_s=1.0,
                                      tau_max_s=30.0, sr=self.sr),
                        RateModulator(self.rngf, "rain/bed/wander_y", sigma=0.6, tau_min_s=1.0,
                                      tau_max_s=30.0, sr=self.sr))
+
+    def _band_codes(self, temp_c: float, rh_pct: float) -> np.ndarray:
+        """Kernel codes of the four band filters, each followed by ISO 9613-1 absorption at r_air."""
+        tq, hq = int(round(float(temp_c))), int(round(float(rh_pct) / 2.0)) * 2
+        imp = np.zeros(8192)
+        imp[0] = 1.0
+
+        def make(k):
+            y = signal.sosfilt(self.band_sos[k], imp)
+            air = air_absorption_sos(self.r_air, float(tq), float(hq), self.sr)
+            return fade_tail(signal.sosfilt(air, y), 0.1)
+
+        return np.array([self.kb.register(("bed_band", k, round(self.r_air, 2), tq, hq), lambda k=k: make(k))
+                         for k in range(len(self.BANDS))], dtype=np.int64)
 
     def _aniso(self, w: WeatherState, block: int, n: int) -> np.ndarray:
         v = np.array([0.0, 0.0, -0.2])                          # ground impacts: from below/horizon
@@ -823,30 +1816,37 @@ class RainBedGenerator:
             self._setup(int(ctx.sr))
         w = ctx.weather
         n = ctx.n
-        gains = np.sqrt(np.maximum(self._band_power(w), 0.0) / self.band_e)
-        if not np.any(gains) and not np.any(self.gains_prev):
+        power = np.maximum(self._band_power(w), 0.0)
+        v = float(power.sum())
+        if v <= 0.0 and self.v_prev <= 0.0:
             return []
-        noise = self.rngf.get("rain/bed", ctx.index).standard_normal((N_AMBI, n))
+        var = power / self.band_e                               # white-noise variance feeding each band filter
+        if v <= 0.0:                                            # fade out over one block on the last shape
+            var = self._var_prev
+            m0, m1 = 1.0, 0.0
+        else:
+            m0, m1 = self.v_prev / v, 1.0
+            self._var_prev = var
+        self.v_prev = v
+        codes = self._band_codes(w.temperature_c, w.humidity_pct)
+        rows = np.repeat(np.arange(N_AMBI), len(self.BANDS))
+        base = int(self.rngf.get("rain/bed", ctx.index).integers(0, 1 << 30))
+        rows_u, sig = self.shaper.render(n, rows, np.tile(codes, N_AMBI), np.tile(var, N_AMBI),
+                                         np.full(N_AMBI, m0), np.full(N_AMBI, m1), base,
+                                         layout_key=tuple(codes.tolist()))
+        if rows_u.size:
+            self.ola.add(rows_u, sig)
+        out = self.ola.pop(n) * self.ord_w[:, None]
         ramp = np.arange(n, dtype=float) / n
-        sig = np.zeros((N_AMBI, n))
-        for k, band in enumerate(self.bands):
-            g0, g1 = self.gains_prev[k], gains[k]
-            if g0 == 0.0 and g1 == 0.0:
-                band.reset()
-                continue
-            sig += band.process(noise) * (g0 + (g1 - g0) * ramp)
-        self.gains_prev = gains
-        sig *= self.ord_w[:, None]
-        v = self._aniso(w, ctx.index, n)
-        vr = self.aniso_prev[:, None] + (v - self.aniso_prev)[:, None] * ramp[None, :]
-        self.aniso_prev = v
+        vdir = self._aniso(w, ctx.index, n)
+        vr = self.aniso_prev[:, None] + (vdir - self.aniso_prev)[:, None] * ramp[None, :]
+        self.aniso_prev = vdir
         if N_AMBI >= 4:
-            wsig = sig[0].copy()
-            sig[1] += wsig * vr[1]      # ACN 1 = Y (left)
-            sig[2] += wsig * vr[2]      # ACN 2 = Z (up)
-            sig[3] += wsig * vr[0]      # ACN 3 = X (front)
-        sig = self.air.process(sig, w.temperature_c, w.humidity_pct, ctx.sr)
-        return [Emission(signal=sig, azimuth=0.0, elevation=0.0, distance=self.r_air, spread=1.0,
+            wsig = out[0].copy()
+            out[1] += wsig * vr[1]      # ACN 1 = Y (left)
+            out[2] += wsig * vr[2]      # ACN 2 = Z (up)
+            out[3] += wsig * vr[0]      # ACN 3 = X (front)
+        return [Emission(signal=out, azimuth=0.0, elevation=0.0, distance=self.r_air, spread=1.0,
                          stem="rain_far", is_ambisonic=True, source_id=self.name)]
 
 
@@ -1108,7 +2108,7 @@ class DripGenerator:
                 y += g.voice.render(n)
             if g.direct.active:
                 y += g.direct.pop(n)
-            y = g.air.process(y * float(spreading_gain(g.distance)), g.distance, w.temperature_c, w.humidity_pct)
+            y = _air(g.air, y * float(spreading_gain(g.distance)), g.distance, w)
             sid = self.name if n_groups == 1 else f"{self.name}/{k}"
             out.append(Emission(signal=y, azimuth=g.azimuth, elevation=g.elevation, distance=g.distance,
                                 spread=g.spread, stem=g.stem, is_ambisonic=False, source_id=sid))
@@ -1207,7 +2207,7 @@ class GutterGenerator:
         if q > 0.0:
             # trickle: separate ~4 mm drops (3.4e-5 l each) onto the elbow / channel bottom
             drip_w = 1.0 - _smoothstep(q, 0.002, 0.006)
-            rng = self.rngf.get(f"gutter/{pid}/drops", b)
+            rng = self.rngf.get(f"gutter/{pid}", b)              # one generator per block for every stream
             off = cox_offsets(rng, drip_w * q / 3.4e-5, n, sr, curve)
             if off.size:
                 d = rng.uniform(3.5, 4.5, off.size)
@@ -1220,7 +2220,7 @@ class GutterGenerator:
                                water_quality=self.water_quality, sr=sr)
             # bubbly flow
             flow_w = _smoothstep(q, 0.001, 0.01)
-            rng_b = self.rngf.get(f"gutter/{pid}/bubbles", b)
+            rng_b = rng
             lam = flow_w * min(900.0 * (q / 0.05) ** 0.8, 8000.0)
             offb, scb = thinned_offsets(rng_b, lam, n, sr, 500, curve)
             if offb.size:
@@ -1258,7 +2258,7 @@ class GutterGenerator:
 
         exc = self.ola.pop(n)
         if rush > 0.0 or self.prev_rush > 0.0:
-            noise = self.rngf.get(f"gutter/{pid}/rush", b).standard_normal(n)
+            noise = noise_rows(np.array([int(self.rngf.get(f"gutter/{pid}/rush", b).integers(0, 1 << 30))]), n)[0]
             g = np.linspace(self.prev_rush, rush, n, endpoint=False)
             exc = exc + self.rush.process(noise) * self.rush_norm * g
         self.prev_rush = rush
@@ -1266,13 +2266,13 @@ class GutterGenerator:
         if self.shell.active:
             y += self.shell.render(n)
         if sheet > 0.0 or self.prev_sheet > 0.0:
-            noise = self.rngf.get(f"gutter/{pid}/sheet", b).standard_normal(n)
+            noise = noise_rows(np.array([int(self.rngf.get(f"gutter/{pid}/sheet", b).integers(0, 1 << 30))]), n)[0]
             g = np.linspace(self.prev_sheet, sheet, n, endpoint=False)
             y = y + self.sheet.process(noise) * self.sheet_norm * g
         self.prev_sheet = sheet
         if not np.any(y) and not self.ola.active:
             return []
-        y = self.air.process(y * float(spreading_gain(self.distance)), self.distance, w.temperature_c, w.humidity_pct)
+        y = _air(self.air, y * float(spreading_gain(self.distance)), self.distance, w)
         return [Emission(signal=y, azimuth=self.patch.azimuth, elevation=self.patch.elevation,
                          distance=self.patch.distance, spread=self.spread, stem="aftermath",
                          is_ambisonic=False, source_id=self.name)]
@@ -1362,11 +2362,12 @@ class _HailPatch:
         return (self.pend_t.size > 0 or self.direct.active
                 or (self.voice is not None and self.voice.active))
 
-    def render(self, ctx: BlockContext, sp, flux: float):
+    def render(self, ctx: BlockContext, sp, flux: float, rng=None):
         w = ctx.weather
         n, sr, b = ctx.n, ctx.sr, ctx.index
         t_abs0 = int(round(ctx.t0 * sr))
-        rng = self.rngf.get(f"hail/{self.patch.id}", b)
+        if rng is None:
+            rng = self.rngf.get(f"hail/{self.patch.id}", b)
         nx, ny, nz = self.normal
         offs, ds, vs, scs = [], [], [], []
         primary = 0
@@ -1416,7 +2417,7 @@ class _HailPatch:
             return None
         if self.xfer is not None:
             y = self.xfer.process(y) * self.xfer_gain
-        return self.air.process(y * float(spreading_gain(self.r_eq)), self.r_eq, w.temperature_c, w.humidity_pct)
+        return _air(self.air, y * float(spreading_gain(self.r_eq)), self.r_eq, w)
 
     def _synth(self, ctx, rng, sp, off, d, v, sc, primary: int, t_abs0: int):
         w = ctx.weather
@@ -1514,6 +2515,7 @@ class HailGenerator:
         if not active and not any(s.active for s in self.states.values()):
             return []
         flux = _ice_number_flux(float(w.rain_rate_mm_h), sp) if active else 0.0
+        rng = self.rngf.get("hail", ctx.index)          # one generator per block, drawn by the patches in order
         out = []
         for p in self.patches:
             st = self.states.get(p.id)
@@ -1524,7 +2526,7 @@ class HailGenerator:
                 self.states[p.id] = st
             elif not active and not st.active:
                 continue
-            y = st.render(ctx, sp if active else None, flux)
+            y = st.render(ctx, sp if active else None, flux, rng)
             if y is not None:
                 out.append(Emission(signal=y, azimuth=p.azimuth, elevation=p.elevation, distance=p.distance,
                                     spread=st.spread, stem=st.stem, is_ambisonic=False,
@@ -1554,11 +2556,12 @@ class _SnowPatch:
     def active(self) -> bool:
         return self.voice.active
 
-    def render(self, ctx: BlockContext, flake, flux: float):
+    def render(self, ctx: BlockContext, flake, flux: float, rng=None):
         w = ctx.weather
         n, sr = ctx.n, ctx.sr
         if flake is not None and flux > 0.0 and self.patch.exposure > 0.0:
-            rng = self.rngf.get(f"snow/{self.patch.id}", ctx.index)
+            if rng is None:
+                rng = self.rngf.get(f"snow/{self.patch.id}", ctx.index)
             nx, ny, nz = self.normal
             uh = _wind_vector(w)
             fac = max(0.0, nz - (nx * uh[0] + ny * uh[1]) / max(flake["v"], 0.3))
@@ -1577,7 +2580,7 @@ class _SnowPatch:
         y = self.voice.render(n)
         if self.xfer is not None:
             y = self.xfer.process(y) * self.xfer_gain
-        return self.air.process(y * float(spreading_gain(self.r_eq)), self.r_eq, w.temperature_c, w.humidity_pct)
+        return _air(self.air, y * float(spreading_gain(self.r_eq)), self.r_eq, w)
 
 
 class SnowGenerator:
@@ -1625,6 +2628,7 @@ class SnowGenerator:
             flake = self.flake_params(float(w.temperature_c)) if active else None
             # liquid-equivalent mass flux / flake mass
             flux = (float(w.rain_rate_mm_h) * 1e-3 / 3600.0 * RHO_WATER / flake["mass"]) if active else 0.0
+            rng = self.rngf.get("snow", ctx.index) if active else None   # one generator per block
             for p in self.patches:
                 st = self.states.get(p.id)
                 if st is None:
@@ -1632,7 +2636,7 @@ class SnowGenerator:
                         continue
                     st = _SnowPatch(p, self.rngf, self.kb, self.sr)
                     self.states[p.id] = st
-                y = st.render(ctx, flake, flux)
+                y = st.render(ctx, flake, flux, rng)
                 if y is not None:
                     out.append(Emission(signal=y, azimuth=p.azimuth, elevation=p.elevation, distance=p.distance,
                                         spread=st.spread, stem=st.stem, is_ambisonic=False,
@@ -1668,6 +2672,17 @@ def _loudness_score(p: SourcePatch) -> float:
     lvl = mat.level_db + (6.0 if mat.kind == "water" else 0.0)
     return (lvl + 10.0 * math.log10(max(p.area_m2 * max(p.exposure, 0.0), 1e-3))
             - 20.0 * math.log10(max(p.distance, 0.3)) + (6.0 if p.interior else 0.0))
+
+
+def _is_voice(p: SourcePatch) -> bool:
+    """Per-drop 'voice' candidates (MASTER_PLAN 7.5): resonant objects and panels of the listener's own
+    shelter, and surfaces near enough for single drops to stand out; a large surface in the mid-field
+    is many independent pieces and renders as a granular / statistical layer."""
+    if p.interior or p.kind in ("membrane", "vehicle_body", "gutter"):
+        return True
+    if p.distance > FULL_MAX_DIST_M:
+        return False
+    return p.area_m2 <= VOICE_MAX_AREA_M2 or p.distance <= VOICE_NEAR_M
 
 
 def _is_downspout(patch: SourcePatch) -> bool:
@@ -1707,10 +2722,11 @@ def make_rain_generators(scene, layout: list[SourcePatch], rngf: RngFactory, *, 
     'all' for live control where the type can change at any time). Drips and gutters are always
     built: they are driven by the wetness stores, so they also play the aftermath of a dry scene.
 
-    Level of detail (Zhang et al. 2019; MASTER_PLAN 3.5): the K loudest rain-receiving patches
-    (K by render quality) within 12 m - and any interior, membrane or vehicle panel among them -
-    get per-event modal synthesis; the rest are granular density layers; beyond the ground rings
-    the RainBedGenerator renders a statistically matched diffuse bed directly in the SH domain.
+    Level of detail (Zhang et al. 2019; MASTER_PLAN 7.5): the K loudest rain-receiving patches (K by
+    render quality) that are voice candidates (shelter panels, membranes, vehicle bodies, and surfaces
+    within 12 m that are small or within 4 m) get per-drop modal synthesis; the rest are granular /
+    statistical layers; all share one vectorised _RainField; beyond the ground rings the
+    RainBedGenerator renders a statistically matched diffuse bed directly in the SH domain.
     """
     sr = SAMPLE_RATE
     kb = KernelBank(sr)
@@ -1726,17 +2742,19 @@ def make_rain_generators(scene, layout: list[SourcePatch], rngf: RngFactory, *, 
     snow_place = str(scene.place.ground or "").lower().startswith("snow") or any("snow" in s for s in surf)
     want_snow = bool(types & set(SNOW_TYPES)) or snow_place
 
-    k_full = LOD_K.get(str(getattr(scene.render, "quality", "studio")).lower(), 24)
+    quality = str(getattr(scene.render, "quality", "studio") or "studio").lower()
+    k_full = lod_settings(quality)["k"]
     patches = [p for p in layout if p.kind in RAIN_KINDS and p.exposure > 0.0]
     ranked = sorted(patches, key=lambda p: (-_loudness_score(p), p.id))
-    full_ids = {p.id for p in ranked[:k_full]
-                if p.distance <= FULL_MAX_DIST_M or p.interior or p.kind in ("membrane", "vehicle_body")}
+    # the K loudest voice candidates (large far surfaces must not crowd the near ring out of the budget)
+    full_ids = {p.id for p in [p for p in ranked if _is_voice(p)][:k_full]}
 
     gens: list = []
     if want_rain:
+        field = _RainField(rngf, quality, kb, sr)
         for p in patches:
             gens.append(RainPatchGenerator(scene, p, rngf, lod="full" if p.id in full_ids else "granular",
-                                           kernels=kb, sr=sr))
+                                           kernels=kb, sr=sr, field=field))
     if want_rain or want_hail:
         gens.append(RainBedGenerator(scene, layout, rngf, sr=sr))
 

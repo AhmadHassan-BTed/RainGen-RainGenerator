@@ -53,7 +53,9 @@ def make_environment_generators(scene, layout, rngf, sr: int = SAMPLE_RATE) -> l
     if aeo.voices:
         gens.append(aeo)
     if bool(getattr(scene.weather.wind, "mic_rumble", False)):
-        gens.append(MicRumbleGenerator(scene, rngf, sr=sr))
+        mic = MicRumbleGenerator(scene, rngf, sr=sr)
+        if mic.exposure > 0.0:                  # no wind reaches a capsule inside a car or a closed room
+            gens.append(mic)
 
     gens.append(ThunderGenerator(scene, layout, rngf, sr=sr))
 

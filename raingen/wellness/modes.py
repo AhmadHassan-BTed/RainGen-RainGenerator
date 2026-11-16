@@ -21,8 +21,8 @@
 `CalmGovernor` is deterministic and feed-forward: it analyses the *incoming*
 audio on a fixed 100 ms hop aligned to absolute sample time (never to host
 blocks), so its decisions do not depend on the block size. Per hop it measures
-a loudness proxy (mean square with the BS.1770 -0.691 dB offset, not
-K-weighted), a sharpness proxy (DIN 45692 weighting g(z) over Bark bands with a
+a loudness proxy (the BS.1770 sum of channel mean squares with its -0.691 dB
+offset, not K-weighted), a sharpness proxy (DIN 45692 weighting g(z) over Bark bands with a
 Zwicker-like N' ~ E^0.23 specific loudness, no masking spread), the PSD tilt
 (dB/octave over 125 Hz-8 kHz; pink noise = -3) and a fluctuation proxy (1-20 Hz
 modulation of the 10 ms envelope over 2.56 s). It then slews a broadband gain
@@ -38,10 +38,12 @@ from typing import Any, Optional
 
 import numpy as np
 from scipy import signal
+from scipy.ndimage import minimum_filter1d
 
 from ..core.constants import SAMPLE_RATE
 from ..scene.schema import Scene, SceneObject
 from ..scene.units import beaufort_to_mps
+from ..scene.vibe import turbulence_from_gust
 
 MODES = ("none", "sleep", "focus", "calm", "asmr")
 MODE_ALIASES = {"relax": "calm", "relaxed": "calm", "cinematic": "none", "off": "none", "": "none",
@@ -160,9 +162,10 @@ def _asmr_objects(scene: Scene, triggers: tuple, tingle: float) -> list[SceneObj
 def _guard_summary(mode: str, s: dict) -> dict:
     """What the generators and the UI badge need to know about the active limits."""
     th = s["thunder"]
+    pair = lambda v: list(v) if isinstance(v, tuple) else v      # JSON-native, so scenes round-trip equal
     return {
         "mode": mode, "label": MODE_LABELS[mode], "soothing": bool(s["soothing"]),
-        "level_dba": s["level_dba"], "tilt_db_oct": s["tilt_db_oct"],
+        "level_dba": pair(s["level_dba"]), "tilt_db_oct": pair(s["tilt_db_oct"]),
         "event_to_bed_db": s["event_to_bed_db"], "event_attack_ms": s["event_attack_ms"],
         "gust_depth_db": s["gust_depth_db"], "salient_events_per_min": s["salient_events_per_min"],
         "thunder_lowpass_hz": th["lowpass_hz"], "thunder_attack_ms": th["attack_ms"],
@@ -225,7 +228,7 @@ def apply_mode(scene: Scene, mode: str) -> Scene:
     if s["max_gust_factor"] is not None:
         g = wind.gust_factor
         wind.gust_factor = float(min(g, s["max_gust_factor"])) if g is not None else float(s["max_gust_factor"])
-        wind.turbulence_intensity = (wind.gust_factor - 1.0) / 3.0
+        wind.turbulence_intensity = turbulence_from_gust(wind.gust_factor)
         rate = wind.gust_rate_per_min
         wind.gust_rate_per_min = float(min(rate, 1.0)) if rate is not None else 0.5
     if mode in ("sleep", "focus"):
@@ -359,6 +362,7 @@ class CalmGovernor:
         self.metrics: dict[str, float] = {}
         # analysis (fixed hop -> one band layout)
         self._hop_buf = np.zeros(self.hop)
+        self._hop_pow = 0.0              # sum over channels and samples of x^2 (BS.1770 channel sum)
         self._hop_fill = 0
         self._layout = self._band_layout(self.hop)
         self._bands: Optional[np.ndarray] = None
@@ -406,7 +410,9 @@ class CalmGovernor:
         win = np.hanning(n)
         return zb, valid, oct_idx, octs, win, float(np.mean(win ** 2))
 
-    def _analyse(self, mono: np.ndarray) -> None:
+    def _analyse(self, mono: np.ndarray, ms: float) -> None:
+        """Spectral metrics from the hop's channel average; loudness from `ms`, the per-sample
+        sum of channel mean squares (BS.1770-4 eq. 2 with unit channel weights)."""
         zb, valid, oct_idx, octs, win, wnorm = self._layout
         n = mono.size
         spec = np.abs(np.fft.rfft(mono * win)) ** 2 / (n * wnorm + 1e-30)
@@ -433,7 +439,6 @@ class CalmGovernor:
             tilt = float(np.polyfit(np.log2(octs), lvl, 1)[0])
         else:
             tilt = -3.0
-        ms = float(np.mean(mono ** 2))
         ldb = 10.0 * math.log10(ms + 1e-20) - 0.691
         a3 = 1.0 - math.exp(-self.HOP_S / 3.0)              # 3 s loudness smoothing
         self._loud_db = ldb if self._loud_db is None else self._loud_db + a3 * (ldb - self._loud_db)
@@ -485,7 +490,8 @@ class CalmGovernor:
         """Analyse the completed hop and set the controls for the next one."""
         s = self.settings
         mono = self._hop_buf
-        self._analyse(mono)
+        self._analyse(mono, self._hop_pow / self.hop)
+        self._hop_pow = 0.0
         self._bed_db = self._modulation(mono)
         t_end = (self.elapsed) / self.sr
         u = float(self._descent_u(np.array([t_end]))[0])
@@ -536,7 +542,7 @@ class CalmGovernor:
         if self._channels == C:
             return
         self._channels = C
-        self._shelf_zi = np.zeros((1, C, 2))
+        self._shelf_zi = np.zeros((C, 2))
         self._fast_zi = None
         D = self.latency
         self._min_carry = np.zeros(D + self._hold)
@@ -550,8 +556,9 @@ class CalmGovernor:
         ymono = y.mean(axis=0)
         a_fast = math.exp(-1.0 / (0.005 * self.sr))
         if self._fast_zi is None:
-            self._fast_zi = np.array([a_fast * float(np.mean(ymono ** 2))])   # start at steady state
+            self._fast_zi = np.zeros(1)              # settles within the first hop, before the bed is known
         env, self._fast_zi = signal.lfilter([1.0 - a_fast], [1.0, -a_fast], ymono ** 2, zi=self._fast_zi)
+        np.copyto(self._fast_zi, 0.0, where=np.abs(self._fast_zi) < 1e-30)
         env_db = 10.0 * np.log10(env + 1e-20)
         self._ev_peak = max(self._ev_peak, float(np.max(env_db)))
         if self._bed_db is None:
@@ -563,15 +570,20 @@ class CalmGovernor:
             g_db = np.where(excess <= -knee / 2, 0.0,
                             np.where(excess >= knee / 2, -excess, -((excess + knee / 2) ** 2) / (2.0 * knee)))
         # minimum over [look-ahead + hold], then a (D+1)-tap moving average: the full reduction is
-        # reached exactly when the event leaves the delay line, and released after the hold
-        ext = np.concatenate([self._min_carry, g_db])
+        # reached exactly when the event leaves the delay line, and released after the hold.
+        # O(n) running minimum (van Herk / Gil-Werman); the average is a cumulative-sum difference
+        # over at most one hop plus D samples, so its rounding stays near 1e-12 dB at any block size.
         W = D + self._hold + 1
-        gmin = np.lib.stride_tricks.sliding_window_view(ext, W).min(axis=-1)
-        self._min_carry = ext[-(W - 1):] if W > 1 else self._min_carry
+        if W > 1:
+            ext = np.concatenate([self._min_carry, g_db])
+            gmin = minimum_filter1d(ext, W, mode="nearest")[W // 2: W // 2 + m]
+            self._min_carry = ext[-(W - 1):]
+        else:
+            gmin = g_db
         if D > 0:
             ext2 = np.concatenate([self._ma_carry, gmin])
-            cs = np.concatenate([[0.0], np.cumsum(ext2)])
-            g_s = (cs[D + 1:] - cs[:-(D + 1)]) / (D + 1)
+            cs = np.cumsum(ext2)
+            g_s = (cs[D:] - np.concatenate(([0.0], cs[:-(D + 1)]))) / (D + 1)
             self._ma_carry = ext2[-D:]
         else:
             g_s = gmin
@@ -581,7 +593,12 @@ class CalmGovernor:
         """Process a segment that lies inside one hop."""
         s = self.settings
         m = seg.shape[1]
-        y, self._shelf_zi = signal.sosfilt(self._shelf_sos, seg, axis=-1, zi=self._shelf_zi)
+        if self._shelf_db == 0.0 and not self._shelf_zi.any():
+            y = seg                                  # flat shelf with a clear state: the filter is the identity
+        else:
+            sec = self._shelf_sos[0]
+            y, self._shelf_zi = signal.lfilter(sec[:3], sec[3:], seg, axis=-1, zi=self._shelf_zi)
+            np.copyto(self._shelf_zi, 0.0, where=np.abs(self._shelf_zi) < 1e-30)
         total = self._g0 + (self._g1 - self._g0) * ((self._hop_fill + np.arange(m)) / self.hop)
         if self.limiter_on:
             total = total + self._limiter_gain(y)
@@ -595,8 +612,11 @@ class CalmGovernor:
             total = total + s["descent_db"] * self._descent_u(t)
             over = t - self.timer_s
             total = total + np.where(over > 0.0, -120.0 * np.minimum(1.0, over / self.FINAL_FADE_S), 0.0)
+            gain = 10.0 ** (total / 20.0)
+            gain[over >= self.FINAL_FADE_S] = 0.0            # the -120 dB fade ends in true digital silence
             if over[-1] >= self.FINAL_FADE_S:
                 self.finished = True
+            return y * gain[None, :]
         return y * (10.0 ** (total / 20.0))[None, :]
 
     def process(self, x: np.ndarray) -> np.ndarray:
@@ -620,6 +640,7 @@ class CalmGovernor:
             seg = x[:, pos:pos + take]
             out[:, pos:pos + take] = self._render(seg)
             self._hop_buf[self._hop_fill:self._hop_fill + take] = seg.mean(axis=0)
+            self._hop_pow += float(np.einsum("ij,ij->", seg, seg))
             self._hop_fill += take
             self.elapsed += take
             pos += take

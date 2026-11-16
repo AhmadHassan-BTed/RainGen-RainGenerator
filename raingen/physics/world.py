@@ -14,6 +14,26 @@ Each block the World:
      (clear calm nights -> stable inversion, sunny light-wind days -> unstable,
      overcast / windy / rainy -> neutral) for the refraction model;
   6. applies a modest convective outflow cooling near active thunder cells.
+
+Rain rate continuity: the rate is a smooth function of time (arc, showers, Cox knots are
+cosine-interpolated) times a gust 'curtain' taken from the gust low-passed over 2 s, so
+consecutive blocks never jump.
+
+Gust contract (shared with raingen.synth.wind, so the wind sound's gusts line up with
+WeatherState.gust). The World's listener gust process is exactly::
+
+    GustProcess(rngf, World.GUST_LAYER == "wind.gust", integral_time_s=T0, ti=ti0,
+                control_rate=sr / block)      # history_s, lead_s, max_replay_s: defaults
+
+with (T0, ti0) from `_gust_params` at construction, and before every `gusts.step(b)` (one
+call per block index, in render order) `gusts.set_params(T_b, ti_b)`, where
+T_b = self.gust_integral_time_s (the user `integral_time_s`, else 60 / (2 pi gust rate),
+else Kaimal at ear height: kaimal_integral_time_s(wind_at_height(u10, max(h, 0.3), z0),
+max(h, 0.3, 1.0))) and ti_b = WeatherState.turbulence_intensity (ear-height TI, with the
+stability factor that relaxes towards sqrt 2 / 1 / sqrt 0.5 with a 20 s time constant).
+A second GustProcess built and driven that way, from the same RngFactory seed, returns
+WeatherState.gust bit for bit; GustProcess is a pure function of (seed, layer, params,
+block sequence).
 """
 
 from __future__ import annotations
@@ -26,7 +46,13 @@ from .dsd import CLASS_NAMES, class_flux, dsd_from_scene, dsd_with_dm
 from .layout import build_layout, exposure_by_material
 from .storm import StormSystem
 from .wetness import WetnessStores
-from .wind import GustProcess, kaimal_integral_time_s, terrain_z0, turbulence_intensity_for, wind_at_height
+from .wind import (
+    GustProcess,
+    kaimal_integral_time_s,
+    terrain_z0,
+    turbulence_intensity_for,
+    wind_at_height,
+)
 
 _LIQUID_FRACTION = {
     "none": 0.0, "drizzle": 1.0, "rain": 1.0, "showers": 1.0, "freezing_rain": 1.0,
@@ -37,6 +63,7 @@ _SEASON_DOY = {"spring": 80, "summer": 172, "autumn": 266, "fall": 266, "winter"
 _CHARACTER_MEAN = {"showery": 0.4, "intermittent": 0.7}
 _STABILITY_TI = {"unstable": math.sqrt(2.0), "neutral": 1.0, "stable": math.sqrt(0.5)}
 _STABILITY_TAU_S = 20.0
+_CURTAIN_TAU_S = 2.0          # rain curtains follow the gust smoothed over ~2 s (see step)
 
 
 def daylight_hours(latitude_deg: float, season: str) -> tuple[float, float]:
@@ -67,7 +94,9 @@ def stability_class(is_day: bool, cloud_okta: float, wind_mps: float, rain_mm_h:
 
 
 class World:
-    """Physically resolved weather, one `step` per block."""
+    """Physically resolved weather, one `step` per block (any block length)."""
+
+    GUST_LAYER = "wind.gust"
 
     def __init__(self, scene, rngf, sr: int = SAMPLE_RATE, block: int = BLOCK):
         self.scene = scene
@@ -98,10 +127,13 @@ class World:
         stab0 = stability_class(day0, float(w0.cloud_okta), max(float(w0.wind.speed_mps), 0.0), rate0)
         self._stab_factor = _STABILITY_TI.get(stab0, 1.0)
         T, ti = self._gust_params(scene.weather.wind, scene.listener.height_m)
-        self.gusts = GustProcess(rngf, "wind.gust", integral_time_s=T, ti=ti, control_rate=self.sr / self.block)
+        self.gusts = GustProcess(rngf, self.GUST_LAYER, integral_time_s=T, ti=ti, control_rate=self.sr / self.block)
+        self.gust_integral_time_s = float(T)        # (T, ti) last passed to gusts.set_params
+        self.gust_ti = float(ti)
         self.wetness = WetnessStores(materials, aftermath_tau_min=place.aftermath_tau_min,
                                      canopy_capacity_mm=self._canopy_capacity(), roof_area_m2=self._roof_area())
         self._primed = False
+        self._curtain_gust = None
         self.state: WeatherState | None = None
         self.dsd = None
 
@@ -212,13 +244,21 @@ class World:
         # wind at the ears with gusts
         T, ti = self._gust_params(wind, L.height_m)
         self.gusts.set_params(T, ti)
+        self.gust_integral_time_s, self.gust_ti = float(T), float(ti)
         gust = self.gusts.step(block_index)
         u_h = wind_at_height(u10, float(L.height_m), self.z0)
         wind_listener = u_h * gust
         wind_az = bearing_to_azimuth(float(wind.from_deg), float(L.heading_deg))
 
-        # precipitation: arc x showers x Cox x gust curtains
-        curtain = min(max(1.0 + 0.3 * (gust - 1.0), 0.5), 1.8)
+        # precipitation: arc x showers x Cox x gust curtains. Rain shafts are carried by the
+        # gust structure on scales of seconds; the point gust also has the inertial-range
+        # flicker of the Kaimal spectrum (~16 % per 21 ms block at TI 0.45), which drops that
+        # fell several metres average out, so the curtain follows the gust low-passed over 2 s
+        if self._curtain_gust is None:
+            self._curtain_gust = gust
+        else:
+            self._curtain_gust += (gust - self._curtain_gust) * (1.0 - math.exp(-dt / _CURTAIN_TAU_S))
+        curtain = min(max(1.0 + 0.3 * (self._curtain_gust - 1.0), 0.5), 1.8)
         rate = base_rate * rain_mult * curtain
         dsd = dsd_from_scene(p, rate)
         dm_factor = self.storms.dm_factor

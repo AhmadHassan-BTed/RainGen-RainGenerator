@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from . import units
@@ -44,9 +44,12 @@ SURFACE_MATERIALS = ("leaves", "grass", "soil", "puddle", "asphalt", "concrete",
                      "tile", "glass", "fabric", "wood", "car_body", "snow", "needles", "water",
                      "plastic", "canvas")
 REGIONS = ("temperate_europe", "north_america", "east_asia", "tropical", "mediterranean", "arid", "boreal", "oceania")
-RENDER_LAYOUTS = ("stereo", "binaural", "5.1", "7.1.4", "foa", "hoa3")
+RENDER_LAYOUTS = ("stereo", "binaural", "5.1", "7.1.4", "foa", "hoa3", "7.1", "mono")   # new layouts appended: indices stay stable
+# The delivery profiles of raingen.master.destinations, new ones appended so choice indices stay stable.
+# Listed here rather than imported: importing raingen.master pulls in scipy and the limiter, and the
+# scene layer must stay cheap to import (the test suite checks the two lists stay equal).
 DESTINATIONS = ("raw", "youtube", "spotify", "apple_music", "podcast", "sleep", "broadcast_eu", "broadcast_us",
-                "streaming_broadcaster", "post_stems", "game", "vr")
+                "streaming_broadcaster", "post_stems", "game", "vr", "online_streaming")
 MODES = ("none", "sleep", "focus", "calm", "asmr")
 
 # Human words accepted for choice parameters (UI labels and spoken names -> stored value).
@@ -84,6 +87,7 @@ class ParamSpec:
     type: str = "float"                       # float | int | bool | str | vec3
     nullable: bool = False                    # None means "auto"
     wrap: bool = False                        # circular quantity (degrees, hour of day)
+    zero_ok: bool = False                     # 0 is valid below a log range ("no rain"); it is never clamped up
     description: str = ""
     ucs: str = ""                             # UCS hint for file naming / metadata
     group: str = ""
@@ -139,7 +143,8 @@ def _smoothing_for(path: str, scale: str, type_: str) -> float:
 
 def _p(id: str, label: str, unit: str = "", lo: Optional[float] = None, hi: Optional[float] = None, *,
        scale: str = "lin", tier: int = 1, audibility: str = "direct", hint: str = "", choices: tuple = (),
-       type: str = "float", nullable: bool = False, wrap: bool = False, wwise: Optional[str] = "auto",
+       type: str = "float", nullable: bool = False, wrap: bool = False, zero_ok: bool = False,
+       wwise: Optional[str] = "auto",
        fmod: Optional[str] = "auto", midi: Optional[str] = None, smoothing: Optional[float] = None,
        default: Any = "schema", description: str = "", ucs: str = "") -> ParamSpec:
     if choices and scale == "lin":
@@ -186,7 +191,7 @@ def _p(id: str, label: str, unit: str = "", lo: Optional[float] = None, hi: Opti
     return ParamSpec(id=id, label=label, unit=unit, min=lo, max=hi, default=default, scale=scale, tier=tier,
                      smoothing_s=float(smoothing), audibility=audibility, audibility_hint=hint, osc=osc,
                      osc_type=osc_type, midi=midi, wwise=wwise, fmod=fmod, choices=tuple(choices), type=type,
-                     nullable=nullable, wrap=wrap, description=description, ucs=ucs, group=group)
+                     nullable=nullable, wrap=wrap, zero_ok=zero_ok, description=description, ucs=ucs, group=group)
 
 
 _H_DIRECT = "heard directly"
@@ -210,7 +215,7 @@ def _build_params() -> list[ParamSpec]:
 
     # ---------------- Tier 0: Vibe -------------------------------------------------
     add(_p("vibe.intensity", "Intensity", "", 0, 100, tier=0, hint="walks the storm path: drips, drizzle, rain, downpour, thunderstorm",
-           description="0 dry/drips only, 20 drizzle, 40 moderate rain, 60 heavy, 80 thunderstorm, 100 extreme"))
+           description="0 dry/drips only, 20 drizzle 0.3 mm/h, 40 moderate 5, 60 heavy 20, 80 thunderstorm 50, 100 cloudburst 100 mm/h"))
     add(_p("vibe.closeness", "Closeness / Shelter", "", 0, 100, tier=0, hint="from out in it to indoors with the window shut",
            description="0 open, 25 umbrella or tree, 50 porch or tent, 75 room with window open, 100 window shut"))
     add(_p("vibe.wildness", "Calm ↔ Wild", "", 0, 100, tier=0, hint="gustiness, shower contrast and thunder rate",
@@ -223,8 +228,9 @@ def _build_params() -> list[ParamSpec]:
     # ---------------- Tier 1: Weather ----------------------------------------------
     pr = "weather.precipitation."
     add(_p(pr + "type", "Precipitation", "", choices=PRECIP_TYPES, type="str", tier=1, hint=_H_DIRECT, ucs="RAIN"))
-    add(_p(pr + "rate_mm_h", "Amount", "mm/h", 0.02, 150.0, scale="log", tier=1, hint=_H_RATE,
-           description="WMO detents: slight < 2.5, moderate 2.5-10, heavy 10-50, intense >= 50, cloudburst >= 100"))
+    add(_p(pr + "rate_mm_h", "Amount", "mm/h", 0.02, 150.0, scale="log", tier=1, hint=_H_RATE, zero_ok=True,
+           description="WMO detents: slight < 2.5, moderate 2.5-10, heavy 10-50, intense >= 50, cloudburst >= 100; "
+                       "0 = no rain (0.02 mm/h is the WMO detection threshold and the log slider's floor)"))
     add(_p(pr + "drops", "Drop character", "", choices=("fine", "normal", "fat"), type="str", tier=1, hint=_H_DROPS,
            description="moves Dm along the stratiform / maritime / continental clusters (Bringi 2003)"))
     add(_p(pr + "character", "Character", "", choices=("continuous", "intermittent", "showery"), type="str", tier=1,
@@ -257,7 +263,9 @@ def _build_params() -> list[ParamSpec]:
            audibility="indirect", hint=_H_TIME))
     add(_p("weather.storm_arc", "Storm arc", "", choices=("arriving", "steady", "passing", "clearing"), type="str",
            tier=1, hint="sparse big drops, downpour, stratiform tail, drips"))
-    add(_p("weather.arc_minutes", "Arc length", "min", 5, 120, scale="log", tier=1, hint="how long the arc phase lasts"))
+    add(_p("weather.arc_minutes", "Arc length", "min", 0.5, 120, scale="log", tier=1, hint="how long the arc phase lasts",
+           description="minutes the current arc phase lasts; a whole arc is usually 5-120 min (2.5), so a short "
+                       "storm's phases can be a few minutes each (the storm model's floor is 0.5 min)"))
     add(_p("weather.cloud_okta", "Cloud cover", "okta", 0, 8, tier=1, audibility="context_only", hint=_H_VISUAL))
     add(_p("weather.visibility_km", "Visibility", "km", 0.05, 50, scale="log", tier=1, audibility="context_only", hint=_H_VISUAL))
     add(_p("weather.pressure_hpa", "Pressure", "hPa", 870, 1085, tier=1, audibility="context_only", hint=_H_PRESS))
@@ -416,6 +424,8 @@ def clamp(spec: ParamSpec, value: Any) -> Any:
     if value is None or not spec.is_numeric:
         return value
     v = float(value)
+    if spec.zero_ok and v <= 0.0:
+        return 0.0                                # "no rain" stays exactly zero
     if spec.wrap and spec.min is not None and spec.max is not None:
         span = spec.max - spec.min
         v = spec.min + ((v - spec.min) % span)
@@ -516,7 +526,9 @@ def _json_type(spec: ParamSpec) -> dict:
     else:
         t = {"type": "integer" if spec.type == "int" else "number"}
         if spec.min is not None:
-            t["minimum"] = spec.min
+            t["minimum"] = 0 if spec.zero_ok else spec.min
+            if spec.zero_ok:
+                t["x-log-floor"] = spec.min
         if spec.max is not None:
             t["maximum"] = spec.max
     if spec.nullable:
@@ -607,7 +619,9 @@ def to_json_schema() -> dict:
         "description": "Auto/Offset/Pinned state per parameter path",
         "additionalProperties": {"type": "object", "properties": {
             "state": {"enum": ["auto", "offset", "pinned"]},
-            "offset": {"type": "number"},
+            "offset": {"type": "number", "description": "perceptual delta: log2 ratio, Beaufort steps or plain units"},
+            "ratio": {"type": "number", "minimum": 0.25, "maximum": 4.0,
+                      "description": "log-scaled parameters: the adjustment as a ratio (x0.25 .. x4)"},
             "value": {},
         }},
     }
@@ -630,7 +644,8 @@ def osc_namespace() -> dict[str, dict]:
     ns["/rg/preset"] = {"type": "s", "kind": "command", "description": "load a preset by name"}
     ns["/rg/text"] = {"type": "s", "kind": "command", "description": "describe your weather in words"}
     ns["/rg/metar"] = {"type": "s", "kind": "command", "description": "apply a METAR report"}
-    ns["/rg/pin"] = {"type": "s?", "kind": "command", "description": "pin a parameter (path [, value])"}
+    ns["/rg/pin"] = {"type": "s", "optional": "value (any type, in the parameter's units)", "kind": "command",
+                     "description": "lock a parameter (path [, value]); without a value it locks the current value"}
     ns["/rg/offset"] = {"type": "sf", "kind": "command", "description": "offset a parameter (path, perceptual delta)"}
     ns["/rg/relink"] = {"type": "s", "kind": "command", "description": "return a parameter to Auto"}
     return dict(sorted(ns.items()))

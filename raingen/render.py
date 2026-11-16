@@ -14,33 +14,45 @@ Signal flow per block of BLOCK frames at SAMPLE_RATE (MASTER_PLAN 9.1):
       -> [rational polyphase resampler when the output rate is not 48 kHz]
       -> BS.1770-5 meter -> TPDF dither -> streaming BWF/RF64 or FLAC writer
 
-Loudness normalisation is two-pass without temporary files (9.4): every layer is
-counter-based and seeded, so pass 1 renders the programme once and only measures its
-integrated loudness (BS.1770-5 gating, ITU-R BS.1770-5 / EBU R128), and pass 2 renders it
-again bit-identically and applies the exact gain target - measured before the limiter. The
-governor sits before the gain so its level-dependent decisions are the same in both passes.
-Nothing is ever held in memory beyond one block.
+Loudness normalisation is two-pass (9.4). Pass 1 renders the programme once, measures its
+integrated loudness (BS.1770-5 gating, ITU-R BS.1770-5 / EBU R128) and keeps the pre-gain
+signal (the mix after the governor, and the decoded stems) on a "tape": float32 in memory
+for short renders, an np.memmap in a private temporary directory next to the output for
+long ones. The gain sits after the governor and before the limiter, so pass 2 is exact
+without re-synthesis: it replays the tape through gain -> limiter -> dither -> writer only.
+Because the limiter can pull a loud, peaky programme below the target, the gain is refined
+on the tape (a few cheap limiter-only passes) until the limited programme meets the target.
+When the tape would not fit on disk, pass 2 re-renders instead: every layer is counter-based
+and seeded, so the second synthesis is bit-identical to the first.
 
 Latency of the decoder, governor and limiter is removed per output chain by discarding
 their first `latency` samples and rendering on past the end, so sample 0 of every file is
 scene time 0 and captions/markers line up with the audio exactly. The scene (JSON), seed
 and engine version are embedded in every file (bext CodingHistory + iXML <USER>, or the
 FLAC Vorbis comment), so any render can be reproduced.
+
+This module is also the public function `raingen.render(...)`: calling it renders anything
+that names a scene to a file (raingen.api.render_file; see _CallableModule at the end).
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
+import shutil
+import sys
+import tempfile
 import time
+import types
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
 
 from . import __version__
-from .core.constants import AMBI_ORDER, BLOCK, SAMPLE_RATE, STEMS
+from .core.constants import AMBI_ORDER, BLOCK, N_AMBI, SAMPLE_RATE, STEMS
 from .core.rng import RngFactory
 from .core.types import BlockContext, EventMarker, WeatherState
 from .scene.schema import Scene
@@ -55,6 +67,13 @@ __all__ = [
 
 SAFETY_CEILING_DBTP = -0.3          # integer exports of un-normalised renders are limited here instead of clipped
 CAPTION_FORMATS = ("srt", "vtt", "csv", "edl")
+TAPE_MEMORY_BYTES = 128 * 2 ** 20   # pass-1 tape kept in RAM up to this size, else np.memmap on disk
+CALIBRATION_MAX_MAKEUP_DB = 6.0     # limiter make-up gain allowed on top of the measured gain
+CALIBRATION_TOLERANCE_LU = 0.05     # stop refining the gain once the limited programme is this close
+# Largest normalisation gain. Physically calibrated scenes span ~10 dB SPL (snow in a still forest,
+# rain through a closed window: -85..-75 LUFS) to ~95 dB SPL (hail on a car roof: ~0 LUFS); bringing
+# the quietest to a -14 LUFS streaming target needs ~70 dB, harmless in the float pipeline.
+MAX_NORMALISATION_GAIN_DB = 90.0
 
 # Mix keys accepted in `mix=` (scene-file style: rain, drips, nature ...) -> engine stems.
 STEM_ALIASES: dict[str, tuple[str, ...]] = {
@@ -123,6 +142,49 @@ def resolve_layout(scene: Scene, layout: Optional[str], destination: Optional[di
         return lr
     hint = (destination or {}).get("layout_hint")
     return normalize_layout(hint) if hint else "stereo"
+
+
+def limit_threads(n: int = 1):
+    """Context manager capping the BLAS / OpenMP thread pools at `n` threads while rendering.
+
+    Rendering is many small array operations per 1024-frame block; pooled BLAS threads only
+    spin on them (measured: 8x the CPU time of the wall time). Uses threadpoolctl when it is
+    installed; otherwise a no-op (the command line sets OMP_NUM_THREADS & co. before numpy
+    loads, see raingen.cli). Any limit the caller set is restored on exit.
+    """
+    try:
+        from threadpoolctl import threadpool_limits  # type: ignore
+    except ImportError:
+        return contextlib.nullcontext()
+    try:
+        return threadpool_limits(limits=int(n))
+    except Exception:                                           # never let tuning break a render
+        return contextlib.nullcontext()
+
+
+SILENCE_LUFS = -150.0                 # below this an ungated reading is numerical noise, not programme
+
+
+def normalisation_loudness(meter) -> tuple[float, Optional[str]]:
+    """(LUFS to normalise on, note) from a LoudnessMeter that has seen the whole programme.
+
+    Normally the BS.1770-5 gated integrated loudness (note None). Under one 400 ms gating block
+    the meter's provisional (ungated) reading ('provisional'). A real but very quiet programme,
+    such as rain heard through a closed window at ~20 dB SPL (about -75 LUFS at this engine's
+    calibration, 1.0 = 1 Pa), has no gating block above the -70 LUFS absolute gate and so no
+    integrated value; it is normalised on its ungated K-weighted mean square ('below_gate')
+    instead of being left inaudible. Only digital silence gives -inf.
+    """
+    v = float(meter.integrated())
+    if math.isfinite(v):
+        return v, ("provisional" if getattr(meter, "integrated_is_provisional", False) else None)
+    n = int(getattr(meter, "samples", 0) or 0)
+    energy = float(getattr(meter, "_energy", 0.0) or 0.0)       # sum of channel-weighted K-filtered z
+    if n > 0 and energy > 0.0:
+        u = -0.691 + 10.0 * math.log10(energy / n)                # BS.1770-5 eq. 2, no gates
+        if u > SILENCE_LUFS:
+            return u, "below_gate"
+    return float("-inf"), None
 
 
 def _fmt_duration(s: float) -> str:
@@ -254,6 +316,9 @@ class BlockRenderer:
         self.world = World(self.scene, self.rngf, sr=self.sr, block=self.block)
         self.generators = list(make_generators(self.scene, self.patches, self.rngf, precip_types=precip_types))
         self.encoder = Encoder(AMBI_ORDER, self.sr)
+        # build the all-pass decorrelator bank now (designed once per process, ~2 s), so the first
+        # block of a live pipeline does not stall on it
+        _ = self.encoder.decorrelators
         self.shelter = ShelterTransfer(self.scene, self.sr)
         self._window_open = float(getattr(self.scene.place, "window_open", 0.0) or 0.0)
         self.layout = normalize_layout(layout)
@@ -320,8 +385,10 @@ class BlockRenderer:
                 self.generators.remove(gen)
                 continue
             for em in emissions or ():
-                stem = self._stem_for(em.stem)
-                buses[stem] += self.encoder.encode(em, n)
+                # queued per stem: finish_block sums each stem with one matrix product and one
+                # decorrelator pass (and keeps the decorrelator tails across blocks)
+                self.encoder.encode_into(buses, self._stem_for(em.stem), em, n)
+        self.encoder.finish_block(buses, n)
 
         for s, g in self.stem_gain.items():
             if g != 1.0:
@@ -424,6 +491,89 @@ class _OutputChain:
 
 
 # ---------------------------------------------------------------------------
+# pass-1 tape: the pre-gain programme kept for pass 2
+# ---------------------------------------------------------------------------
+class _Tape:
+    """Pre-gain programme of pass 1 (mix after the governor, decoded stems), replayed by pass 2.
+
+    One float32 (frames, C) buffer per source, appended block by block and read back by block
+    index: in memory up to TAPE_MEMORY_BYTES in total, otherwise an np.memmap in a private
+    temporary directory (inside `tmp_dir`), removed by close(). float32 keeps the replay
+    error near -150 dB of the signal, far below 24-bit dither.
+    """
+
+    def __init__(self, sources: Iterable[str], channels: int, capacity: int, block: int,
+                 tmp_dir: Optional[str] = None, memory_bytes: Optional[int] = None):
+        self.sources = tuple(sources)
+        self.channels = int(channels)
+        self.block = int(block)
+        self.capacity = int(math.ceil(max(int(capacity), 1) / self.block)) * self.block
+        self.frames = 0
+        self.nbytes = self.capacity * self.channels * 4 * len(self.sources)
+        limit = TAPE_MEMORY_BYTES if memory_bytes is None else int(memory_bytes)
+        self.on_disk = self.nbytes > limit
+        self._dir: Optional[str] = None
+        self._buf: dict[str, np.ndarray] = {}
+        if self.on_disk:
+            parent = tmp_dir or tempfile.gettempdir()
+            os.makedirs(parent, exist_ok=True)
+            if shutil.disk_usage(parent).free < self.nbytes * 1.05 + 256 * 2 ** 20:
+                raise OSError(f"not enough free space in {parent} for a {self.nbytes / 2 ** 30:.1f} GiB loudness tape")
+            self._dir = tempfile.mkdtemp(prefix=".raingen-tape-", dir=parent)
+            for i, src in enumerate(self.sources):
+                self._buf[src] = np.memmap(os.path.join(self._dir, f"{i:02d}.f32"), dtype=np.float32, mode="w+",
+                                           shape=(self.capacity, self.channels))
+        else:
+            for src in self.sources:
+                self._buf[src] = np.empty((self.capacity, self.channels), dtype=np.float32)
+
+    @property
+    def blocks(self) -> int:
+        return self.frames // self.block
+
+    @property
+    def full(self) -> bool:
+        return self.frames + self.block > self.capacity
+
+    def append(self, mix: np.ndarray, stems: Optional[dict]) -> None:
+        n = mix.shape[1]
+        if n != self.block:
+            raise ValueError("the tape stores whole blocks")
+        a, b = self.frames, self.frames + n
+        for src, buf in self._buf.items():
+            buf[a:b] = (mix if src == "mix" else stems[src]).T
+        self.frames = b
+
+    def read(self, source: str, block_index: int) -> np.ndarray:
+        a = int(block_index) * self.block
+        return np.asarray(self._buf[source][a:a + self.block], dtype=np.float64).T
+
+    def close(self) -> None:
+        bufs, self._buf = self._buf, {}
+        for buf in bufs.values():
+            mm = getattr(buf, "_mmap", None)
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+        del bufs
+        if self._dir is not None:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
+
+
+@dataclass
+class _Pass1:
+    """What pass 1 leaves for pass 2: the live pipeline (to continue past the tape), the tape, markers."""
+    br: BlockRenderer
+    governor: Any
+    tape: Optional[_Tape]
+    markers: list
+    skip: int                                       # decoder + governor latency of the mix
+
+
+# ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
 class RenderReport(dict):
@@ -482,7 +632,10 @@ class Renderer:
     target_lufs / ceiling_dbtp (override the destination), gain_db (fixed gain, no measurement),
     quality (mobile|game|studio|cinematic), mode (apply a wellness mode), honor_timer (let a
     sleep timer fade the render to silence; off by default for offline renders), strict
-    (re-raise generator errors), start_tc / fps (bext TimeReference and caption timecode).
+    (re-raise generator errors), start_tc / fps (bext TimeReference and caption timecode),
+    tape (keep the pass-1 programme so pass 2 only re-masters it; False re-renders it),
+    tmp_dir (where a long tape is kept; default: next to the output file) and block (synthesis
+    block length in frames; BLOCK by default, other sizes are for testing).
     """
 
     def __init__(self, scene, seconds: float, layout: Optional[str] = None, destination: Optional[str] = None,
@@ -491,7 +644,8 @@ class Renderer:
                  mix: Optional[dict] = None, target_lufs: Optional[float] = None,
                  ceiling_dbtp: Optional[float] = None, gain_db: Optional[float] = None,
                  quality: Optional[str] = None, mode: Optional[str] = None, honor_timer: bool = False,
-                 strict: bool = False, start_tc: Optional[str] = None, fps: float = 24.0):
+                 strict: bool = False, start_tc: Optional[str] = None, fps: float = 24.0,
+                 tape: bool = True, tmp_dir: Optional[str] = None, block: int = BLOCK):
         from .master.destinations import get_destination
         from .wellness.modes import apply_mode, canonical_mode
 
@@ -513,7 +667,13 @@ class Renderer:
         elif canonical_mode(sc.mode) != "none" and "guard" not in (sc.vibe or {}):
             sc = apply_mode(sc, sc.mode)
 
-        self.dest = get_destination(destination or getattr(sc.render, "destination", None) or "raw")
+        from .master.destinations import DESTINATIONS, _key as _dest_key
+
+        dest_name = destination or getattr(sc.render, "destination", None) or "raw"
+        if _dest_key(dest_name) not in DESTINATIONS:
+            # get_destination() falls back to 'raw'; a typo must not silently skip normalisation
+            raise ValueError(f"unknown destination {dest_name!r}; choose from {', '.join(DESTINATIONS)}")
+        self.dest = get_destination(dest_name)
         self.layout = resolve_layout(sc, layout, self.dest)
         self.stems = bool(sc.render.stems if stems is None else stems)
         self.sr_out = int(sample_rate or getattr(sc.render, "sample_rate", None) or self.dest["sample_rate"]
@@ -556,6 +716,13 @@ class Renderer:
             self.ceiling_dbtp = None
         self._gain_db: Optional[float] = float(gain_db) if gain_db is not None else None
         self._measured: Optional[float] = None
+        self._measure_note: Optional[str] = None            # normalisation_loudness note of pass 1
+        self.use_tape = bool(tape)
+        self.block = int(block)
+        if self.block < 16:
+            raise ValueError("block must be at least 16 frames")
+        self.tmp_dir = os.fspath(tmp_dir) if tmp_dir is not None else None
+        self.pass2: Optional[str] = None                    # 'replay' (tape) | 'render' (re-synthesis) | None
         self.warnings: list[str] = []
         self.summary: Optional[RenderReport] = None
 
@@ -565,7 +732,7 @@ class Renderer:
         return self._gain_db is None and self.target_lufs is not None
 
     def _block_renderer(self, stems: bool) -> BlockRenderer:
-        return BlockRenderer(self.scene, self.layout, stems=stems, mix=self.mix, strict=self.strict)
+        return BlockRenderer(self.scene, self.layout, stems=stems, mix=self.mix, strict=self.strict, block=self.block)
 
     def _governor(self):
         from .wellness.modes import CalmGovernor, canonical_mode
@@ -589,26 +756,52 @@ class Renderer:
         if self.progress(float(min(max(fraction, 0.0), 1.0)), phase) is False:
             raise RenderCancelled("render cancelled")
 
-    def _loop(self, br: BlockRenderer, chains: list[_OutputChain], phase: str, f0: float, f1: float,
-              collect: bool = False) -> list:
+    @staticmethod
+    def _live(br: BlockRenderer, governor, start: int = 0):
+        """(mix after the governor, stems or None, markers) per block, rendered from block `start` on."""
+        idx = int(start)
+        while True:
+            out = br.render_block(idx)
+            mix = governor.process(out.mix) if governor is not None else out.mix
+            yield mix, out.stems, out.markers
+            idx += 1
+
+    @staticmethod
+    def _replay(p1: _Pass1):
+        """The pass-1 tape block by block, then live rendering from where pass 1 stopped."""
+        tape = p1.tape
+        stems = [s for s in tape.sources if s != "mix"]
+        for b in range(tape.blocks):
+            yield tape.read("mix", b), ({s: tape.read(s, b) for s in stems} if stems else None), []
+        yield from Renderer._live(p1.br, p1.governor, tape.blocks)
+
+    def _loop(self, source, chains: list[_OutputChain], phase: str, f0: float, f1: float,
+              collect: bool = False, tape: Optional[_Tape] = None, br: Optional[BlockRenderer] = None) -> list:
+        """Feed blocks from `source` to every chain until all are done (and `tape`, if any, is full)."""
         markers: list = []
         lead = chains[0]
-        slack = max(c.skip for c in chains) + 8 * BLOCK
-        limit = (max(self.frames_in, int(math.ceil(self.frames_out * SAMPLE_RATE / self.sr_out))) + slack) // BLOCK + 64
+        B = self.block
+        slack = max(c.skip for c in chains) + 8 * B
+        limit = (max(self.frames_in, int(math.ceil(self.frames_out * SAMPLE_RATE / self.sr_out))) + slack) // B + 64
+        if tape is not None:
+            limit = max(limit, tape.capacity // B + 64)
         idx = 0
-        while not all(c.done for c in chains):
+        it = iter(source)
+        while not (all(c.done for c in chains) and (tape is None or tape.full)):
             if idx > limit:
                 raise RuntimeError("render loop did not converge (latency bookkeeping error)")
-            out = br.render_block(idx)
+            mix, stems, mk = next(it)
+            if tape is not None and not tape.full:
+                tape.append(mix, stems)
             for c in chains:
                 if not c.done:
-                    c.push(out.mix if c.source == "mix" else out.stems[c.source])
-            if collect and out.markers:
-                markers.extend(out.markers)
+                    c.push(mix if c.source == "mix" else stems[c.source])
+            if collect and mk:
+                markers.extend(mk)
             idx += 1
             if idx % 8 == 0 or lead.done:
                 self._report_progress(f0 + (f1 - f0) * lead.fraction, phase)
-        for w in br.warnings:
+        for w in (br.warnings if br is not None else ()):
             if w not in self.warnings:
                 self.warnings.append(w)
         return markers
@@ -618,17 +811,70 @@ class Renderer:
         return sorted(keep, key=lambda m: (float(m.t), str(m.kind)))
 
     # -- pass 1 ---------------------------------------------------------------
+    def _limiter_latency(self, channels: int) -> int:
+        if self.ceiling_dbtp is None:
+            return 0
+        from .master.limiter import TruePeakLimiter
+        return int(TruePeakLimiter(SAMPLE_RATE, channels, self.ceiling_dbtp).latency)
+
+    def _pass1(self, stems: bool, keep: bool, tmp_dir: Optional[str] = None) -> _Pass1:
+        """Render once, measure the loudness of the programme after the governor and, with `keep`,
+        record the pre-gain programme (mix + stems) on a tape for pass 2."""
+        br = self._block_renderer(stems)
+        gov = self._governor()
+        skip = br.latency + int(getattr(gov, "latency", 0) or 0)
+        chain = _OutputChain("measure", "mix", br.channels, self.frames_in, sr_in=SAMPLE_RATE, sr_out=SAMPLE_RATE,
+                             skip=skip, layout=self.layout, true_peak=False)
+        tape = None
+        if keep and self.use_tape:
+            # everything pass 2 consumes: latencies (decoder, governor, limiter), the programme and
+            # the resampler's look-ahead; any shortfall is rendered live after the replay
+            need_in = int(math.ceil(self.frames_out * SAMPLE_RATE / self.sr_out)) + 64
+            capacity = skip + self._limiter_latency(br.channels) + max(need_in, self.frames_in) + self.block
+            sources = ("mix",) + (tuple(br.stem_names) if stems else ())
+            try:
+                tape = _Tape(sources, br.channels, capacity, self.block, tmp_dir=tmp_dir)
+            except OSError as exc:
+                log.warning("loudness tape unavailable (%s); pass 2 will re-render the programme", exc)
+                tape = None
+        f1 = (0.9 if tape is not None else 0.4) if self.target_lufs is not None and self._gain_db is None else 1.0
+        try:
+            markers = self._loop(self._live(br, gov), [chain], "measure", 0.0, f1, collect=keep, tape=tape, br=br)
+        except BaseException:
+            if tape is not None:
+                tape.close()
+            raise
+        self._measured, note = normalisation_loudness(chain.meter)
+        self._measure_note = note
+        msg = None
+        if note == "provisional":
+            # BS.1770 needs one 400 ms gating block; shorter clips are normalised on the meter's
+            # provisional reading (ungated mean square of the whole clip, absolute gate only)
+            msg = (f"programme shorter than one 400 ms gating block: normalised on a provisional "
+                   f"(ungated) loudness of {self._measured:.1f} LUFS")
+        elif note == "below_gate":
+            msg = (f"programme below the -70 LUFS absolute gate (BS.1770-5): normalised on its ungated "
+                   f"loudness of {self._measured:.1f} LUFS")
+        if msg is not None and self.target_lufs is not None and msg not in self.warnings:
+            self.warnings.append(msg)
+        log.info("pass 1: %.2f LUFS integrated%s", self._measured,
+                 f", {tape.nbytes / 2 ** 20:.0f} MiB tape {'on disk' if tape.on_disk else 'in memory'}" if tape else "")
+        self.pass2 = "replay" if tape is not None else "render"
+        return _Pass1(br=br, governor=gov, tape=tape, markers=markers, skip=skip)
+
     def measure(self) -> float:
         """Pass 1: integrated loudness (LUFS) of the un-limited programme after the governor."""
-        if self._measured is not None:
-            return self._measured
-        br = self._block_renderer(False)
-        chain = _OutputChain("measure", "mix", br.channels, self.frames_in, sr_in=SAMPLE_RATE, sr_out=SAMPLE_RATE,
-                             skip=br.latency, governor=self._governor(), layout=self.layout, true_peak=False)
-        self._loop(br, [chain], "measure", 0.0, 0.4 if self.two_pass else 1.0)
-        self._measured = float(chain.meter.integrated())
-        log.info("pass 1: %.2f LUFS integrated", self._measured)
+        if self._measured is None:
+            self._pass1(stems=False, keep=False)
+            self.pass2 = "render"
         return self._measured
+
+    def _gain_from_measurement(self) -> float:
+        m = self._measured
+        if m is not None and math.isfinite(m):
+            return float(np.clip(self.target_lufs - m, -MAX_NORMALISATION_GAIN_DB, MAX_NORMALISATION_GAIN_DB))
+        self.warnings.append("programme is silent; loudness normalisation skipped")
+        return 0.0
 
     @property
     def gain_db(self) -> float:
@@ -637,11 +883,52 @@ class Renderer:
             if self.target_lufs is None:
                 self._gain_db = 0.0
             else:
-                m = self.measure()
-                self._gain_db = float(np.clip(self.target_lufs - m, -60.0, 60.0)) if math.isfinite(m) else 0.0
-                if not math.isfinite(m):
-                    self.warnings.append("programme is silent; loudness normalisation skipped")
+                self.measure()
+                self._gain_db = self._gain_from_measurement()
         return self._gain_db
+
+    def _calibrate(self, p1: _Pass1, gain_db: float) -> float:
+        """Refine the pre-limiter gain on the tape until the *delivered* programme meets the target.
+
+        A static gain toward the target is exact while the limiter is idle and the output runs at
+        48 kHz. When the limiter has to pull peaks down (dense rain or hail at -14 LUFS), the
+        programme ends up quieter than the target; resampling to 44.1 kHz removes the band above
+        ~20 kHz, which the K-weighting counts. So the tape is replayed through the real output
+        chain (gain, limiter, resampler, meter; no synthesis, a few percent of pass 1), the gain is
+        moved by the shortfall and re-checked, at most CALIBRATION_MAX_MAKEUP_DB above the
+        measured gain.
+        """
+        tape = p1.tape
+        if tape is None or self.target_lufs is None or not math.isfinite(gain_db):
+            return gain_db
+        gated_exact = self._measure_note != "below_gate"   # measured ungated; delivered is gated
+        if self.ceiling_dbtp is None and self.sr_out == SAMPLE_RATE and gated_exact:
+            return gain_db                              # gain only: the measurement is exact
+        base = gain_db
+        for _ in range(5):
+            ch = _OutputChain("calibrate", "mix", tape.channels, self.frames_out, sr_in=SAMPLE_RATE,
+                              sr_out=self.sr_out, skip=p1.skip, gain_db=gain_db, ceiling_dbtp=self.ceiling_dbtp,
+                              layout=self.layout, true_peak=False)
+            for b in range(tape.blocks):
+                ch.push(tape.read("mix", b))
+                if ch.done:
+                    break
+            if (ch.limiter is None or ch.limiter.max_gain_reduction_db <= 0.0) and self.sr_out == SAMPLE_RATE \
+                    and gated_exact:
+                break                                   # limiter idle at 48 kHz: the static gain is exact
+            got = float(ch.meter.integrated())
+            if not math.isfinite(got):
+                break
+            err = self.target_lufs - got
+            if abs(err) <= CALIBRATION_TOLERANCE_LU:
+                break
+            new = min(gain_db + err, base + CALIBRATION_MAX_MAKEUP_DB)
+            if abs(new - gain_db) < 1e-3:
+                self.warnings.append(f"target {self.target_lufs:g} LUFS not reached: the limiter would need more "
+                                     f"than {CALIBRATION_MAX_MAKEUP_DB:g} dB of make-up gain")
+                break
+            gain_db = new
+        return float(gain_db)
 
     # -- outputs --------------------------------------------------------------
     def _output_path(self, out) -> str:
@@ -715,7 +1002,8 @@ class Renderer:
         extra = {"RAINGEN_LAYOUT": self.layout, "RAINGEN_DESTINATION": self.dest["name"],
                  "RAINGEN_GAIN_DB": f"{gain_db:.3f}", "RAINGEN_STEM": stem or "mix",
                  "RAINGEN_SECONDS": f"{self.seconds:.6f}"}
-        ixml = build_ixml(ucs, self.scene, names, extra=extra, fps=self.fps if self.start_tc else None, sr=self.sr_out)
+        ixml = build_ixml(ucs, self.scene, names, extra=extra, fps=self.fps if self.start_tc else None, sr=self.sr_out,
+                          drop_frame=";" in (self.start_tc or ""))
         return StreamingWavWriter(tmp, self.sr_out, channels, self._file_bits(path), bext=bext, ixml=ixml,
                                   channel_mask=mask), tmp
 
@@ -770,6 +1058,8 @@ class Renderer:
             measured_lufs=self._measured,
             gain_db=float(self.gain_db),
             integrated_lufs=float(meter.integrated()) if meter is not None else None,
+            loudness_provisional=bool(getattr(meter, "integrated_is_provisional", False)) if meter is not None
+            else None,
             true_peak_dbtp=float(meter.true_peak_db()) if meter is not None else None,
             lra_lu=float(meter.lra()) if meter is not None else None,
             markers=len(markers),
@@ -782,14 +1072,63 @@ class Renderer:
         self.summary = rep
         return rep
 
+    @staticmethod
+    def _publish(tmps: list, paths: list) -> None:
+        """Move each finished `.part` file onto its name.
+
+        A destination that cannot be replaced (on Windows: open in a player or editor) keeps the
+        finished render in its `.part` file, and the error names where it is, instead of losing it.
+        """
+        kept = []
+        first: Optional[OSError] = None
+        for tmp, path in zip(tmps, paths, strict=True):
+            try:
+                os.replace(tmp, path)
+            except OSError as exc:
+                kept.append((tmp, path))
+                first = first or exc
+        if kept:
+            where = "; ".join(f"{os.path.abspath(t)} (could not replace {os.path.abspath(p)})" for t, p in kept)
+            raise OSError(f"the render finished but {len(kept)} file(s) could not be put in place "
+                          f"({first.strerror or first}); the finished audio was kept in: {where}") from first
+
     # -- pass 2 ---------------------------------------------------------------
+    def _prepare_pass2(self, stems: bool, tmp_dir: Optional[str]):
+        """(pass-1 leftovers or None, gain dB): runs pass 1 with a tape when the destination normalises."""
+        p1 = None
+        if self._gain_db is None and self.target_lufs is not None and self._measured is None:
+            p1 = self._pass1(stems, keep=True, tmp_dir=tmp_dir)
+            if p1.tape is None:
+                p1 = None
+        gain_db = self.gain_db
+        if p1 is not None:
+            gain_db = self._gain_db = self._calibrate(p1, gain_db)
+        return p1, gain_db
+
     def run(self, out=None, captions=False) -> RenderReport:
         """Render to `out` (file path or directory; None = a UCS-named file in the working dir)."""
+        with limit_threads(1):
+            return self._run(out, captions)
+
+    def _run(self, out, captions) -> RenderReport:
         t_wall = time.perf_counter()
-        gain_db = self.gain_db
-        f0 = 0.4 if self.two_pass else 0.0
         mix_path = self._output_path(out)
-        br = self._block_renderer(self.stems)
+        p1, gain_db = None, 0.0
+        try:
+            p1, gain_db = self._prepare_pass2(self.stems, self.tmp_dir or os.path.dirname(mix_path))
+            return self._write(p1, gain_db, mix_path, captions, t_wall)
+        finally:
+            if p1 is not None and p1.tape is not None:
+                p1.tape.close()
+
+    def _write(self, p1: Optional[_Pass1], gain_db: float, mix_path: str, captions, t_wall: float) -> RenderReport:
+        f0 = 0.9 if p1 is not None else (0.4 if self._measured is not None and self.target_lufs is not None else 0.0)
+        if p1 is not None:
+            br, source, mix_skip, markers = p1.br, self._replay(p1), p1.skip, list(p1.markers)
+        else:
+            br = self._block_renderer(self.stems)
+            gov = self._governor()
+            source, mix_skip, markers = self._live(br, gov), br.latency + int(getattr(gov, "latency", 0) or 0), []
         C = br.channels
         names = list(getattr(br.decoder, "channel_names", []) or [])
         mask = int(getattr(br.decoder, "channel_mask", 0) or 0)
@@ -805,20 +1144,22 @@ class Renderer:
         tmps: list[str] = []
         chains: list[_OutputChain] = []
         try:
-            for name, source, path in targets:
+            for name, source_name, path in targets:
                 w, tmp = self._open_writer(path, C, names, mask, None if name == "mix" else name, gain_db)
                 writers.append(w)
                 tmps.append(tmp)
+                ceiling = self.ceiling_dbtp
+                if ceiling is None and self._file_bits(path) < 32:
+                    ceiling = SAFETY_CEILING_DBTP           # e.g. a 32-bit request written as 24-bit FLAC
                 chains.append(_OutputChain(
-                    name, source, C, self.frames_out, sr_in=SAMPLE_RATE, sr_out=self.sr_out, skip=br.latency,
-                    governor=self._governor() if name == "mix" else None, gain_db=gain_db,
-                    ceiling_dbtp=self.ceiling_dbtp, layout=self.layout, dither_bits=self._file_bits(path),
+                    name, source_name, C, self.frames_out, sr_in=SAMPLE_RATE, sr_out=self.sr_out,
+                    skip=mix_skip if name == "mix" else br.latency, gain_db=gain_db,
+                    ceiling_dbtp=ceiling, layout=self.layout, dither_bits=self._file_bits(path),
                     rngf=rngf, sink=w.write))
-            markers = self._loop(br, chains, "render", f0, 1.0, collect=True)
-            for chain, w, tmp, (_, _, path) in zip(chains, writers, tmps, targets):
+            markers += self._loop(source, chains, "render", f0, 1.0, collect=True, br=br)
+            for chain, w in zip(chains, writers, strict=True):
                 w.set_loudness_from_meter(chain.meter)
                 w.close()
-                os.replace(tmp, path)
         except BaseException:
             for w in writers:
                 try:
@@ -831,6 +1172,7 @@ class Renderer:
                 except OSError:
                     pass
             raise
+        self._publish(tmps, [t[2] for t in targets])
 
         markers = self._final_markers(markers)
         cap_paths = self._write_captions(markers, os.path.splitext(mix_path)[0], captions) if captions else {}
@@ -842,18 +1184,31 @@ class Renderer:
 
     def stream(self, sink: Callable[[np.ndarray], None], dither: bool = False) -> tuple[RenderReport, list]:
         """Render the mix into `sink(block (C, n) float)` instead of a file. Returns (report, markers)."""
-        t_wall = time.perf_counter()
-        gain_db = self.gain_db
-        br = self._block_renderer(False)
-        chain = _OutputChain("mix", "mix", br.channels, self.frames_out, sr_in=SAMPLE_RATE, sr_out=self.sr_out,
-                             skip=br.latency, governor=self._governor(), gain_db=gain_db,
-                             ceiling_dbtp=self.ceiling_dbtp, layout=self.layout,
-                             dither_bits=self.bit_depth if dither else None,
-                             rngf=RngFactory(int(self.scene.seed)), sink=sink)
-        markers = self._final_markers(self._loop(br, [chain], "render", 0.4 if self.two_pass else 0.0, 1.0,
-                                                 collect=True))
-        rep = self._summary(None, chain, markers, time.perf_counter() - t_wall, channels=br.channels)
-        return rep, markers
+        with limit_threads(1):
+            t_wall = time.perf_counter()
+            p1 = None
+            try:
+                p1, gain_db = self._prepare_pass2(False, self.tmp_dir)
+                if p1 is not None:
+                    br, source, skip, markers = p1.br, self._replay(p1), p1.skip, list(p1.markers)
+                else:
+                    br = self._block_renderer(False)
+                    gov = self._governor()
+                    source, skip, markers = self._live(br, gov), br.latency + int(getattr(gov, "latency", 0) or 0), []
+                f0 = 0.9 if p1 is not None else (0.4 if self._measured is not None and self.target_lufs is not None
+                                                 else 0.0)
+                chain = _OutputChain("mix", "mix", br.channels, self.frames_out, sr_in=SAMPLE_RATE,
+                                     sr_out=self.sr_out, skip=skip, gain_db=gain_db,
+                                     ceiling_dbtp=self.ceiling_dbtp, layout=self.layout,
+                                     dither_bits=self.bit_depth if dither else None,
+                                     rngf=RngFactory(int(self.scene.seed)), sink=sink)
+                markers += self._loop(source, [chain], "render", f0, 1.0, collect=True, br=br)
+            finally:
+                if p1 is not None and p1.tape is not None:
+                    p1.tape.close()
+            markers = self._final_markers(markers)
+            rep = self._summary(None, chain, markers, time.perf_counter() - t_wall, channels=br.channels)
+            return rep, markers
 
     def to_array(self) -> tuple[np.ndarray, list]:
         """The mastered mix as one float array (C, n) plus its markers. Short renders only."""
@@ -887,57 +1242,124 @@ def render_array(scene, seconds: float, layout: Optional[str] = None, destinatio
 
 def thunder_one_shots(count: int = 3, distance_km: float = 3.0, sample_rate: int = SAMPLE_RATE,
                       seed: Optional[int] = None, max_s: float = 10.0, layout: str = "stereo") -> list[np.ndarray]:
-    """Synthesized thunder one-shots (C, n) peak-normalised to 0.9, cut at each 'thunder' marker.
+    """`count` synthesized thunder one-shots (C, n), each peak-normalised to 0.9.
 
-    A dry, calm, open-meadow scene with a steady thunder cell at `distance_km` is rendered just
-    long enough for `count` flashes at 12 per minute, and each roll is cut from its first
-    arrival (the marker time) for up to `max_s` seconds with a short fade-out.
+    Only the thunder generator runs (no rain, wind, plants or biophony): each clip is one
+    cloud-to-ground strike (ThunderGenerator.strike, 3-D fractal channel, N-waves, rumble,
+    terrain echoes) `distance_km` away over an open meadow on a calm, dry 15 C evening. The
+    render starts a few blocks before the first arrival (the flash-to-bang time of the slant
+    range, ~hypot(distance, 3 km) / 343 m/s, is silent and skipped) and runs until the roll
+    and its echoes have died away, or `max_s`. The clip starts 50 ms before the first arrival
+    and ends with a 0.3 s fade. Strikes that would be inaudible or shorter than 0.5 s are
+    replaced by the next one; at most 150 s of thunder are rendered in total.
     """
+    from .physics.layout import build_layout
+    from .physics.world import World
+    from .spatial.decoders import make_decoder
+    from .synth.thunder import ThunderGenerator
+
     count = max(1, int(count))
+    sr = int(sample_rate)
+    max_s = max(float(max_s), 0.6)
     sc = Scene(name="Thunder one-shots", seed=int(seed) if seed is not None else 0x7D0D3E)
     sc.weather.precipitation.type = "none"
     sc.weather.precipitation.rate_mm_h = 0.0
     sc.weather.wind.speed_mps = 1.0
+    sc.weather.temperature_c = 15.0
     sc.weather.storm_arc = "steady"
-    th = sc.weather.thunder
-    th.enabled = True
-    th.distance_km = float(max(distance_km, 0.3))
-    th.bearing_deg = 270.0
-    th.approach_kmh = 0.0
-    th.flashes_per_min = 12.0
-    th.stroke_intensity = 0.7
-    th.cg_fraction = 0.6
+    sc.weather.thunder.enabled = False             # no storm cells: the strikes below are the only flashes
     sc.place.preset = "meadow"
+    sc.place.shelter = "open"
     sc.place.surfaces = {"grass": 100.0}
     sc.place.vegetation = {"deciduous": 0, "conifer": 0, "distance_m": 30.0}
     sc.place.emitters = []
-    sc.place.biophony = {"birds": "off", "insects": "off", "frogs": "off", "traffic": 0.0,
-                         "region": "temperate_europe"}
     sc.render.quality = "mobile"
-    flash_to_bang = th.distance_km / 0.343
-    seconds = min(150.0, flash_to_bang + max_s + 7.5 * count + 5.0)
-    y, markers = Renderer(sc, seconds, layout=layout, destination="raw", sample_rate=sample_rate,
-                          bit_depth=32, ceiling_dbtp=None).to_array()
-    starts = sorted(float(m.t) for m in markers if m.kind == "thunder")
+    rngf = RngFactory(int(sc.seed))
+    patches = build_layout(sc)
+    B = BLOCK
+    weather = World(sc, rngf, sr=SAMPLE_RATE, block=B).step(0, 0.0, B, sc)   # calm and dry: constant
+    d_km = float(max(distance_km, 0.3))
+    budget = 150.0                                  # seconds of thunder rendered at most
     clips: list[np.ndarray] = []
-    sr = int(sample_rate)
-    fade = int(0.3 * sr)
-    for i, t in enumerate(starts):
-        s = max(0, int((t - 0.05) * sr))
-        e = s + int(max_s * sr)
-        if i + 1 < len(starts):
-            e = min(e, max(s + int(1.5 * sr), int((starts[i + 1] - 0.05) * sr)))
-        e = min(e, y.shape[1])
-        if e - s < int(0.5 * sr):
+    lead, fade = int(0.05 * sr), int(0.3 * sr)
+    attempt = 0
+    while len(clips) < count and budget > 0.0 and attempt < 4 * count + 4:
+        gen = ThunderGenerator(sc, patches, rngf, sr=SAMPLE_RATE, block=B)
+        ctx = BlockContext(sr=SAMPLE_RATE, n=B, index=0, t0=0.0, weather=weather, rng=rngf, markers=[])
+        ev = gen.strike(ctx, 0.0, d_km, bearing_deg=270.0, intensity=0.7, cg=True, flash_id=f"oneshot.{attempt}",
+                        seed=attempt)
+        attempt += 1
+        if ev is None:
             continue
-        clip = y[:, s:e].copy()
+        t_on = min(float(ev.t_first), float(getattr(ev, "t_origin", ev.t_first)))
+        b0 = max(0, int(t_on * SAMPLE_RATE) // B - 3)    # nothing has arrived before this block
+        dec = make_decoder(layout, AMBI_ORDER, SAMPLE_RATE)
+        skip = int(getattr(dec, "latency", 0) or 0)
+        rs = StreamingResampler(SAMPLE_RATE, sr, dec.channels) if sr != SAMPLE_RATE else None
+        first = int(round((ev.t_first - b0 * B / SAMPLE_RATE) * sr)) - lead      # clip start, output samples
+        want = first + int(max_s * sr)
+        parts, have, quiet, idx = [], 0, 0, b0
+        while have < want + fade:
+            bctx = BlockContext(sr=SAMPLE_RATE, n=B, index=idx, t0=idx * B / SAMPLE_RATE, weather=weather, rng=rngf,
+                                markers=[])
+            ems = gen.render(bctx)
+            bus = np.zeros((N_AMBI, B))
+            for em in ems:
+                bus += em.signal
+            y = dec.process(bus)
+            if skip:
+                d = min(skip, y.shape[1])
+                y, skip = y[:, d:], skip - d
+            if rs is not None:
+                y = rs.process(y)
+            parts.append(y)
+            have += y.shape[1]
+            idx += 1
+            quiet = quiet + 1 if not ems else 0
+            if quiet > 8:                            # event and echoes finished (and the decoder flushed)
+                break
+        budget -= idx * B / SAMPLE_RATE - b0 * B / SAMPLE_RATE
+        y = np.concatenate(parts, axis=1)[:, max(first, 0): want]
+        env = np.max(np.abs(y), axis=0) if y.size else np.zeros(0)
+        peak = float(np.max(env)) if env.size else 0.0
+        if peak <= 1e-9:
+            continue
+        loud = np.nonzero(env > peak * 1e-3)[0]      # trim the tail below -60 dB of the peak
+        y = y[:, : int(loud[-1]) + 1 + fade] if loud.size else y
+        if y.shape[1] < int(0.5 * sr):
+            continue
+        clip = y.copy()
         f = min(fade, clip.shape[1] // 4)
         if f > 0:
             clip[:, -f:] *= np.cos(np.linspace(0.0, 0.5 * math.pi, f)) ** 2
-        peak = float(np.max(np.abs(clip)))
-        if peak <= 1e-9:
-            continue
-        clips.append(clip * (0.9 / peak))
-        if len(clips) >= count:
-            break
+        clips.append(clip * (0.9 / float(np.max(np.abs(clip)))))
     return clips
+
+
+# ---------------------------------------------------------------------------
+# `raingen.render` stays callable
+# ---------------------------------------------------------------------------
+class _CallableModule(types.ModuleType):
+    """This module, callable: it *is* the public `raingen.render` (and `raingen.api.render`).
+
+    A package attribute and a submodule cannot share the name `render` as two objects: importing
+    raingen.render binds the package attribute to the module, and `import raingen.render as rr`
+    reads that attribute back. So there is one object: this module, whose call is
+    raingen.api.render_file (Scene, preset, file, METAR or plain words -> a rendered file and its
+    report), with that function's signature for inspect/help. `rg.render(...)`,
+    `from raingen.render import Renderer` and `import raingen.render as rr` all work in any order.
+    """
+
+    def __call__(self, *args, **kw):
+        from .api import render_file
+        return render_file(*args, **kw)
+
+    @property
+    def __signature__(self):
+        import inspect
+
+        from .api import render_file
+        return inspect.signature(render_file)
+
+
+sys.modules[__name__].__class__ = _CallableModule

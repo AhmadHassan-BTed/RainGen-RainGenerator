@@ -60,7 +60,7 @@ WMO_CODES: dict[int, dict[str, Any]] = {
     3: {"label": "overcast", "type": "none", "rate": 0.0, "character": "continuous", "thunder": False, "okta": 8},
     45: {"label": "fog", "type": "none", "rate": 0.0, "character": "continuous", "thunder": False, "okta": 8, "fog": True},
     48: {"label": "depositing rime fog", "type": "none", "rate": 0.0, "character": "continuous", "thunder": False, "okta": 8, "fog": True},
-    51: {"label": "light drizzle", "type": "drizzle", "rate": 0.1, "character": "continuous", "thunder": False, "okta": 8},
+    51: {"label": "light drizzle", "type": "drizzle", "rate": 0.08, "character": "continuous", "thunder": False, "okta": 8},
     53: {"label": "moderate drizzle", "type": "drizzle", "rate": 0.3, "character": "continuous", "thunder": False, "okta": 8},
     55: {"label": "dense drizzle", "type": "drizzle", "rate": 0.8, "character": "continuous", "thunder": False, "okta": 8},
     56: {"label": "light freezing drizzle", "type": "freezing_rain", "rate": 0.2, "character": "continuous", "thunder": False, "okta": 8, "drops": "fine"},

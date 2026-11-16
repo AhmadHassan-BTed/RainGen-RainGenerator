@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Optional
@@ -29,8 +30,6 @@ from typing import Optional
 from . import __version__
 
 LAYOUTS = ("stereo", "binaural", "5.1", "7.1", "7.1.4", "foa", "hoa3", "mono")
-DESTINATIONS = ("raw", "youtube", "spotify", "apple_music", "podcast", "sleep", "broadcast_eu", "broadcast_us",
-                "streaming_broadcaster", "post_stems", "game", "vr")
 MODES = ("none", "sleep", "focus", "calm", "relax", "asmr")
 CAPTIONS = ("srt", "vtt", "csv", "edl")
 MANIFEST_FORMATS = ("json-schema", "osc", "wwise", "fmod", "markdown", "json")
@@ -38,6 +37,24 @@ MANIFEST_FORMATS = ("json-schema", "osc", "wwise", "fmod", "markdown", "json")
 
 class CLIError(Exception):
     """A user-facing error (printed without a traceback)."""
+
+
+# BLAS / OpenMP pools read these once, when numpy (or scipy) first loads them.
+THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS",
+                   "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def limit_blas_threads(n: int = 1) -> bool:
+    """Ask the BLAS / OpenMP runtimes for `n` threads; only effective before numpy is imported.
+
+    raingen renders many small per-block array operations, where a pooled BLAS spins its
+    worker threads (a multi-threaded render used ~8x more CPU time than wall time) for no
+    speed-up. Variables the user has set are left alone. Returns True when numpy was not yet
+    loaded, i.e. when the setting takes effect.
+    """
+    for var in THREAD_ENV_VARS:
+        os.environ.setdefault(var, str(int(n)))
+    return "numpy" not in sys.modules
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +67,37 @@ def _seed(text: str) -> int:
         raise argparse.ArgumentTypeError(f"seed must be an integer (decimal or 0x hex), got {text!r}") from None
 
 
+def destination_names() -> tuple[str, ...]:
+    """The --destination choices: every profile in raingen.master.destinations.DESTINATIONS."""
+    from .master.destinations import DESTINATIONS
+
+    return tuple(DESTINATIONS)
+
+
+def _destination(text: str) -> str:
+    """A destination name or alias (ebu, r128, atsc, ott ...) -> its canonical key."""
+    from .master import destinations as dst
+
+    key = dst._key(text)
+    if key not in dst.DESTINATIONS:
+        raise argparse.ArgumentTypeError(f"unknown destination {text!r}; choose from {', '.join(dst.DESTINATIONS)}")
+    return key
+
+
+# METAR present-weather groups with an intensity sign ('-RA', '-SHRA', '-TSRAGR') look like
+# options to argparse; they are protected before parsing and restored in _join().
+_METAR_WX = re.compile(r"^-(VC)?(MI|BC|PR|DR|BL|SH|TS|FZ)?((DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|"
+                       r"SQ|FC|SS|DS)+)$")
+_PROTECT = "\u2212"                        # U+2212 MINUS SIGN stands in for '-' while parsing
+
+
+def _protect_metar_groups(argv: list[str]) -> list[str]:
+    return [_PROTECT + t[1:] if _METAR_WX.match(t) else t for t in argv]
+
+
 def _join(words) -> str:
     if isinstance(words, (list, tuple)):
-        return " ".join(str(w) for w in words)
+        return " ".join(("-" + str(w)[1:]) if str(w).startswith(_PROTECT) else str(w) for w in words)
     return str(words)
 
 
@@ -94,8 +139,9 @@ def _add_duration(p: argparse.ArgumentParser, default_note: str = "default 60 s"
 def _add_render_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out", "-o", help="output file (.wav/.flac) or directory (UCS-named file)")
     p.add_argument("--layout", "-l", choices=LAYOUTS, help="output layout (default: the scene's, else stereo)")
-    p.add_argument("--destination", "-d", choices=DESTINATIONS,
-                   help="delivery profile: loudness, true peak, format (default: raw)")
+    p.add_argument("--destination", "-d", type=_destination, metavar="DEST",
+                   help="delivery profile: loudness, true peak, format (default: raw); one of "
+                        + ", ".join(destination_names()) + " (aliases such as ebu, atsc, ott work too)")
     p.add_argument("--seed", type=_seed, help="random seed (overrides the scene's)")
     p.add_argument("--stems", action="store_true", help="also write one file per stem")
     p.add_argument("--captions", nargs="*", choices=CAPTIONS, metavar="FMT",
@@ -147,16 +193,16 @@ def _has_length(a: argparse.Namespace) -> bool:
 # commands
 # ---------------------------------------------------------------------------
 def cmd_render(a: argparse.Namespace) -> int:
-    from .api import render
+    from .api import render_file
 
     what = _join(a.what)
-    rep = render(what, seconds=_length(a), progress=_progress(a.quiet or a.json), **_render_kwargs(a))
+    rep = render_file(what, seconds=_length(a), progress=_progress(a.quiet or a.json), **_render_kwargs(a))
     _print_report(rep, a.json)
     return 0
 
 
 def cmd_variations(a: argparse.Namespace) -> int:
-    from .api import load_scene, render, variations
+    from .api import load_scene, render_file as render, variations
     from .io.ucs import ucs_filename
 
     base = load_scene(_join(a.what))
@@ -210,7 +256,7 @@ def cmd_presets(a: argparse.Namespace) -> int:
 
 
 def cmd_metar(a: argparse.Namespace) -> int:
-    from .api import play, render, scene_from_metar
+    from .api import play, render_file as render, scene_from_metar
 
     scene = scene_from_metar(_join(a.raw), utc_offset_h=a.utc_offset)
     if a.play:
@@ -225,7 +271,7 @@ def cmd_metar(a: argparse.Namespace) -> int:
 
 
 def cmd_live(a: argparse.Namespace) -> int:
-    from .api import play, render, scene_from_live
+    from .api import play, render_file as render, scene_from_live
 
     if a.station:
         location, provider = a.station, "metar"
@@ -433,9 +479,20 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _tolerant_std_streams() -> None:
+    """Never crash on a label: a Windows pipe (cp1252) cannot encode every character of a scene name."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    limit_blas_threads(1)
+    _tolerant_std_streams()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_protect_metar_groups(list(sys.argv[1:] if argv is None else argv)))
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
     try:

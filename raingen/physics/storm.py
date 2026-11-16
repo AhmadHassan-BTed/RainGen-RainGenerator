@@ -377,7 +377,7 @@ class StormSystem:
                     continue
                 times = k * bd + rng.uniform(0.0, bd, count)
                 gains = rng.lognormal(0.0, 0.3, count)
-                for tf, gk in zip(times, gains):
+                for tf, gk in zip(times, gains, strict=True):
                     tf = float(tf)
                     if t0 <= tf < t1:
                         si = float(min(max(cell.stroke_intensity * gk, 0.02), 1.0))

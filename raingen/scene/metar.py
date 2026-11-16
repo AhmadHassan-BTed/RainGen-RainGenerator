@@ -50,9 +50,10 @@ _TREND = ("NOSIG", "BECMG", "TEMPO", "FM", "TL", "AT", "PROB30", "PROB40")
 _DIRS8 = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0, "SW": 225.0, "W": 270.0, "NW": 315.0}
 _OKTA = {"SKC": 0.0, "CLR": 0.0, "NSC": 0.0, "NCD": 0.0, "FEW": 1.5, "SCT": 3.5, "BKN": 6.0, "OVC": 8.0, "VV": 8.0}
 
-# Representative rates (mm/h, water equivalent) by phenomenon and intensity (light, moderate, heavy).
+# Representative rates (mm/h, water equivalent) by phenomenon and intensity (light, moderate, heavy),
+# inside the WMO bands: rain slight < 2.5 / moderate 2.5-10 / heavy 10-50; drizzle < 0.1 / 0.1-0.5 / >= 0.5.
 _RATES = {
-    "DZ": (0.1, 0.3, 0.8), "RA": (1.0, 5.0, 16.0), "SN": (0.5, 1.5, 4.0), "SG": (0.1, 0.3, 0.6),
+    "DZ": (0.05, 0.3, 0.8), "RA": (1.0, 5.0, 16.0), "SN": (0.5, 1.5, 4.0), "SG": (0.1, 0.3, 0.6),
     "PL": (0.5, 1.5, 4.0), "GR": (8.0, 20.0, 40.0), "GS": (1.0, 3.0, 8.0), "IC": (0.02, 0.05, 0.1),
     "UP": (1.0, 4.0, 10.0),
 }
@@ -97,7 +98,9 @@ def _parse_remarks(rmk: list[str]) -> dict:
         dirs = re.findall(r"\b(ALQDS|[NSEW]{1,2})\b", m.group(4) or "")
         out["lightning"] = {"frequency": {"OCNL": "occasional", "FRQ": "frequent", "CONS": "continuous"}.get(freq, ""),
                             "types": types, "where": m.group(3) or "", "directions": dirs}
-    m = re.search(r"\b(VC)?TS\b\s*(OHD|DSNT|VC)?\s*((?:ALQDS|[NSEW]{1,2})(?=[\s-]|$)(?:-[NSEW]{1,2}(?=[\s-]|$))*)?"
+    # each optional group carries its own leading whitespace, so a skipped group never swallows
+    # the space that 'MOV' needs ("TS OHD MOV E")
+    m = re.search(r"\b(VC)?TS\b(?:\s+(OHD|DSNT|VC))?(?:\s+((?:ALQDS|[NSEW]{1,2})(?=[\s-]|$)(?:-[NSEW]{1,2}(?=[\s-]|$))*))?"
                   r"(?:\s+MOV\s+([NSEW]{1,2}|STNRY))?", text)
     if m and "TSNO" not in text:
         dirs = re.findall(r"ALQDS|[NSEW]{1,2}", m.group(3) or "")
@@ -311,7 +314,9 @@ def metar_assignments(parsed: dict, utc_offset_h: Optional[float] = None) -> dic
     w = parsed.get("wind")
     if w:
         a["weather.wind.speed_mps"] = float(w["speed_mps"])
-        if w["dir_deg"] is not None:
+        if w.get("calm"):
+            pass                                          # 00000KT: calm has no direction
+        elif w["dir_deg"] is not None:
             a["weather.wind.from_deg"] = float(w["dir_deg"]) % 360.0
         elif w.get("var_from") is not None:
             lo, hi = w["var_from"], w["var_to"]

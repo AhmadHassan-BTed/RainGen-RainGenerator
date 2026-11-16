@@ -17,6 +17,7 @@ Physics behind the tables
   short "grit" resonances colour the splash click.
 - Water kinds carry no modes: they are synthesized as impact click + Minnaert
   bubble (raingen.synth.kernels).
+- Small radiators (leaves) are dipoles below ka ~ 1: their radiation band starts there.
 - ``level_db`` is the calibration anchor: peak SPL (dB re 20 uPa) at 1 m of a single
   2 mm drop at terminal speed (6.5 m/s, Atlas et al. 1973) striking the dry surface.
   For water kinds it is the peak level of that drop's impact click. Everything else
@@ -222,7 +223,9 @@ def _make_materials() -> dict[str, Material]:
                  hardness=0.15, splash=0.2, radiation_hp_hz=80.0, radiation_lp_hz=4000.0,
                  level_db=38.0, ucs_cat="RAINGen"))
 
-    # Vegetation: many small leaf plates (variants detune heavily at synthesis time)
+    # Vegetation: many small leaf plates (variants detune heavily at synthesis time). A leaf is an
+    # unbaffled dipole radiator: efficiency rises ~(ka)^2 (12 dB/octave) up to ka ~ 1, i.e. ~1.2 kHz for
+    # a broadleaf of radius ~4.5 cm, which is why rain on leaves sounds crisp (2nd-order radiation HP).
     add(Material("grass", "vegetation",
                  _grit("grass", 400.0, 6000.0, 10, 0.008, 0.003, tilt_db_oct=-2.0,
                        peak_hz=1500.0, peak_db=4.0),
@@ -231,7 +234,7 @@ def _make_materials() -> dict[str, Material]:
     add(Material("leaves", "vegetation",
                  _grit("leaves", 250.0, 6000.0, 16, 0.03, 0.006, tilt_db_oct=-1.0,
                        peak_hz=1200.0, peak_db=5.0),
-                 hardness=0.35, splash=0.3, radiation_hp_hz=150.0, radiation_lp_hz=12000.0,
+                 hardness=0.35, splash=0.3, radiation_hp_hz=1200.0, radiation_lp_hz=12000.0,
                  level_db=50.0, ucs_cat="RAINVege"))
     add(Material("needles", "vegetation",
                  _grit("needles", 1000.0, 9000.0, 10, 0.006, 0.002, peak_hz=4000.0, peak_db=3.0),

@@ -16,7 +16,8 @@ from typing import Any, Optional
 
 UCS_VERSION = "8.2.1"
 
-# CatID -> (Category, SubCategory)
+# CatID -> (Category, SubCategory), exactly as in the UCS v8.2.1 Full List (the weather-relevant
+# subset). Note the WEATHER CatIDs are not prefixed: HAIL, STORM, THUN, and WTHR is WEATHER-MISC.
 UCS_CATIDS: dict[str, tuple[str, str]] = {
     "RAIN": ("RAIN", "GENERAL"),
     "RAINClth": ("RAIN", "CLOTH"),
@@ -35,34 +36,53 @@ UCS_CATIDS: dict[str, tuple[str, str]] = {
     "WINDTonl": ("WIND", "TONAL"),
     "WINDTurb": ("WIND", "TURBULENT"),
     "WINDVege": ("WIND", "VEGETATION"),
-    "WTHR": ("WEATHER", "GENERAL"),
-    "WTHRHail": ("WEATHER", "HAIL"),
-    "WTHRMisc": ("WEATHER", "MISC"),
-    "WTHRStrm": ("WEATHER", "STORM"),
-    "WTHRThun": ("WEATHER", "THUNDER"),
-    "WATR": ("WATER", "GENERAL"),
+    "HAIL": ("WEATHER", "HAIL"),
+    "STORM": ("WEATHER", "STORM"),
+    "THUN": ("WEATHER", "THUNDER"),
+    "WTHR": ("WEATHER", "MISC"),
     "WATRDrip": ("WATER", "DRIP"),
+    "WATRDran": ("WATER", "DRAIN"),
     "WATRFlow": ("WATER", "FLOW"),
-    "WATRTrkl": ("WATER", "TRICKLE"),
+    "WATRLap": ("WATER", "LAP"),
+    "WATRMisc": ("WATER", "MISC"),
+    "WATRPour": ("WATER", "POUR"),
     "WATRSplsh": ("WATER", "SPLASH"),
-    "AMB": ("AMBIENCE", "GENERAL"),
+    "AMBAlpn": ("AMBIENCE", "ALPINE"),
     "AMBBird": ("AMBIENCE", "BIRDSONG"),
+    "AMBDsrt": ("AMBIENCE", "DESERT"),
+    "AMBFarm": ("AMBIENCE", "FARM"),
     "AMBForst": ("AMBIENCE", "FOREST"),
-    "AMBInsct": ("AMBIENCE", "INSECT"),
+    "AMBGras": ("AMBIENCE", "GRASSLAND"),
+    "AMBHome": ("AMBIENCE", "RESIDENTIAL"),
+    "AMBInsc": ("AMBIENCE", "INSECT"),
+    "AMBLake": ("AMBIENCE", "LAKESIDE"),
+    "AMBMisc": ("AMBIENCE", "MISC"),
+    "AMBPark": ("AMBIENCE", "PARK"),
     "AMBRurl": ("AMBIENCE", "RURAL"),
     "AMBSea": ("AMBIENCE", "SEASIDE"),
     "AMBSubn": ("AMBIENCE", "SUBURBAN"),
     "AMBSwmp": ("AMBIENCE", "SWAMP"),
+    "AMBTndra": ("AMBIENCE", "TUNDRA"),
+    "AMBTown": ("AMBIENCE", "TOWN"),
     "AMBTraf": ("AMBIENCE", "TRAFFIC"),
+    "AMBTrop": ("AMBIENCE", "TROPICAL"),
+    "AMBUndr": ("AMBIENCE", "UNDERGROUND"),
     "AMBUrbn": ("AMBIENCE", "URBAN"),
-    # raingen extension (not in the official list): rain-dominated ambience beds
-    "AMBRain": ("AMBIENCE", "RAIN"),
 }
 
 CATID_ALIASES = {
-    "THUN": "WTHRThun", "THUNDER": "WTHRThun", "WEATHER/THUN": "WTHRThun", "STORM": "WTHRStrm",
-    "HAIL": "WTHRHail", "WEATHER": "WTHR", "DRIP": "WATRDrip", "GUST": "WINDGust",
+    "THUNDER": "THUN", "WEATHER/THUN": "THUN", "WTHRTHUN": "THUN", "WTHRSTRM": "STORM",
+    "WTHRHAIL": "HAIL", "WEATHER": "WTHR", "WTHRMISC": "WTHR", "DRIP": "WATRDrip", "GUST": "WINDGust",
 }
+
+
+def canonical_catid(catid: str) -> str:
+    """A UCS CatID from a CatID or a legacy/alias spelling ('WTHRThun' -> 'THUN')."""
+    c = str(catid).strip()
+    if c in UCS_CATIDS:
+        return c
+    return CATID_ALIASES.get(c.upper(), c)
+
 
 MATERIAL_CATID = {
     "metal_sheet": "RAINMetl", "tin_roof": "RAINMetl", "car_body": "RAINMetl", "metal_gutter": "RAINMetl",
@@ -81,14 +101,16 @@ MATERIAL_WORDS = {
     "tent": "tent", "canvas": "canvas", "plastic": "plastic", "wood": "wood", "soil": "soil", "snow": "snow",
 }
 
-# shelter -> (CatID or None for dominant surface, phrase, closeness)
+# shelter -> (CatID or None for dominant surface, phrase, closeness). UCS RAIN-INTERIOR is
+# "rain from inside house or barn, or vehicle", so attic, car and rooms are RAINInt; tent and
+# umbrella fabric is RAIN-CLOTH ("patio umbrella, awning").
 SHELTER_INFO = {
     "umbrella": ("RAINClth", "on umbrella", "close"),
     "tent": ("RAINClth", "on tent", "close"),
-    "car": ("RAINMetl", "on car roof", "close"),
+    "car": ("RAINInt", "on car roof", "from inside"),
     "porch": (None, "from porch", ""),
-    "attic": ("RAINMetl", "on tin roof", "interior"),
-    "room_closed": ("RAINInt", "on window", "interior"),
+    "attic": ("RAINInt", "on tin roof", "from inside"),
+    "room_closed": ("RAINInt", "on window", "from inside"),
     "room_open": ("RAINInt", "through open window", ""),
     "tree": ("RAINVege", "under tree", ""),
     "cave": ("RAINConc", "at cave mouth", ""),
@@ -102,11 +124,16 @@ _OBJECT_MATERIAL = {"car": "car_body", "umbrella": "umbrella", "tent": "tent", "
 COMPASS8 = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 COMPASS8_WORDS = ("north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west")
 
-_PRESET_AMB = {"forest": "AMBForst", "woods": "AMBForst", "jungle": "AMBForst", "rainforest": "AMBForst",
-               "city": "AMBUrbn", "street": "AMBUrbn", "urban": "AMBUrbn", "suburb": "AMBSubn",
-               "garden": "AMBSubn", "beach": "AMBSea", "coast": "AMBSea", "sea": "AMBSea", "lake": "AMBRurl",
-               "swamp": "AMBSwmp", "marsh": "AMBSwmp", "field": "AMBRurl", "meadow": "AMBRurl",
-               "farm": "AMBRurl", "mountain": "AMBRurl", "countryside": "AMBRurl"}
+_PRESET_AMB = {"forest": "AMBForst", "woods": "AMBForst", "conifer_forest": "AMBForst",
+               "deciduous_forest": "AMBForst", "jungle": "AMBTrop", "rainforest": "AMBTrop",
+               "tropical": "AMBTrop", "city": "AMBUrbn", "city_street": "AMBUrbn", "street": "AMBUrbn",
+               "urban": "AMBUrbn", "town": "AMBTown", "village": "AMBTown", "suburb": "AMBSubn",
+               "garden": "AMBSubn", "park": "AMBPark", "beach": "AMBSea", "coast": "AMBSea", "sea": "AMBSea",
+               "lake": "AMBLake", "lakeside": "AMBLake", "swamp": "AMBSwmp", "marsh": "AMBSwmp",
+               "field": "AMBGras", "meadow": "AMBGras", "moor": "AMBGras", "moorland": "AMBGras",
+               "prairie": "AMBGras", "farm": "AMBFarm", "mountain": "AMBAlpn", "alpine": "AMBAlpn",
+               "desert": "AMBDsrt", "tundra": "AMBTndra", "cabin": "AMBRurl", "countryside": "AMBRurl",
+               "cave": "AMBUndr", "underpass": "AMBUrbn", "alley": "AMBUrbn", "mountain_ridge": "AMBAlpn", "bedroom": "AMBHome", "house": "AMBHome"}
 
 
 def compass8(bearing_deg: float, words: bool = False) -> str:
@@ -204,8 +231,8 @@ def _rain_catid(scene) -> tuple[str, str, str]:
     if shelter == "porch":
         phrase = f"from porch, {phrase}"
     preset = str(_get(scene.place, "preset", "")).lower()
-    if preset in ("forest", "woods", "rainforest", "jungle") and cat in ("RAIN", "RAINVege"):
-        cat, phrase = "RAINVege", "in forest"
+    if ("forest" in preset or preset in ("woods", "jungle")) and cat in ("RAIN", "RAINVege"):
+        cat, phrase = "RAINVege", ("in jungle" if preset == "jungle" else "in forest")
     closeness = ""
     vibe = _get(scene, "vibe", {}) or {}
     c = vibe.get("closeness") if isinstance(vibe, dict) else None
@@ -266,11 +293,13 @@ def ucs_catid(scene, stem: Optional[str] = None) -> str:
     rate = float(_get(scene.weather.precipitation, "rate_mm_h", 0.0) or 0.0)
     wind_v = float(_get(scene.weather.wind, "speed_mps", 0.0) or 0.0)
     if stem == "thunder":
-        return "WTHRThun"
+        return "THUN"
     if stem == "wind":
         veg = _get(scene.place, "vegetation", {}) or {}
         trees = float(veg.get("deciduous", 0) or 0) + float(veg.get("conifer", 0) or 0) if isinstance(veg, dict) else 0.0
         gf = _get(scene.weather.wind, "gust_factor", None)
+        if wind_v >= 20.8:                       # Beaufort 9+: UCS WIND-TURBULENT "huge storm winds"
+            return "WINDTurb"
         if wind_v >= 10.8 or (gf is not None and float(gf) >= 1.6):
             return "WINDGust"
         if trees >= 3:
@@ -285,20 +314,23 @@ def ucs_catid(scene, stem: Optional[str] = None) -> str:
         return "RAIN"
     if stem == "interior":
         shelter = str(_get(scene.place, "shelter", "open")).lower()
-        return {"car": "RAINMetl", "tent": "RAINClth", "umbrella": "RAINClth", "attic": "RAINMetl"}.get(shelter, "RAINInt")
+        return {"tent": "RAINClth", "umbrella": "RAINClth"}.get(shelter, "RAINInt")
     # full mix or rain_near
     if ptype == "none" or rate <= 0.0:
         if stem == "rain_near":
             return "RAIN"
         if _get(scene.weather.thunder, "enabled", False):
-            return "WTHRThun"
-        return "WIND" if wind_v >= 5.0 else "AMB"
+            return "THUN"
+        if wind_v >= 5.0:
+            return "WIND"
+        preset = str(_get(scene.place, "preset", "")).lower()
+        return _PRESET_AMB.get(preset, "AMBMisc")
     if ptype == "hail":
-        return "WTHRHail"
-    if ptype in ("snow", "sleet", "graupel"):
-        return "WTHRMisc"
+        return "HAIL"
+    if ptype in ("snow", "sleet", "graupel", "ice_pellets", "freezing_rain"):
+        return "WTHR"
     if stem is None and _is_storm(scene):
-        return "WTHRStrm"
+        return "STORM"
     return _rain_catid(scene)[0]
 
 
