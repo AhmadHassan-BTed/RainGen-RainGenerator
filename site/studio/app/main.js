@@ -21,7 +21,7 @@
  *   current scene stays and a toast says why.
  */
 import { SceneStore, clone, paramSpec } from './scene-store.js';
-import { unlockAudio } from '../../engine/unlock.js';
+import { unlockAudio } from '../../engine/unlock.js?v=20261117a';
 import { presetScene, vibeDrivers, DEMO_WALK, stormPosition, rangeBearing } from './presets.js';
 import { Library, instantiate, objectLabel } from './library.js';
 import { Inspector } from './inspector.js';
@@ -32,7 +32,7 @@ import {
   closeDialog, compassWord, flashBang, kmFromFlashBang, fmtNum, clamp, speeds,
 } from './a11y.js';
 
-const ENGINE_URL = '../../engine/weather-engine.js';
+const ENGINE_URL = '../../engine/weather-engine.js?v=20261117a';
 const LS = 'raingen.studio';
 const DEG = Math.PI / 180;
 

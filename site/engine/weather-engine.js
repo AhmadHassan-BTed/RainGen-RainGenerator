@@ -57,8 +57,8 @@ import {
   localToWorld,
   lapseRateKPerKm,
   DEG,
-} from './physics.js';
-import { shelterName, shelterInfo, reverbSpecFor, transmissionFor, ReverbUnit } from './reverb.js';
+} from './physics.js?v=20261117a';
+import { shelterName, shelterInfo, reverbSpecFor, transmissionFor, ReverbUnit } from './reverb.js?v=20261117a';
 import {
   FLASH_CELL_SEC,
   FLASH_CEILING_PER_MIN,
@@ -67,8 +67,8 @@ import {
   nearestDistance,
   synthesizeThunder,
   createThunderBuffers,
-} from './thunder.js';
-import { compassName } from './units.js';
+} from './thunder.js?v=20261117a';
+import { compassName } from './units.js?v=20261117a';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2489,7 +2489,8 @@ function applyPlan(graph, prev, plan, ctl, model, env, when) {
 const LOADED = new WeakMap();
 
 function moduleUrls(base) {
-  return MODULES.map((m) => new URL(m, base || import.meta.url).href);
+  // Versioned so a cached worklet from an older deploy is never mixed with a newer engine.
+  return MODULES.map((m) => new URL(m + '?v=20261117a', base || import.meta.url).href);
 }
 
 async function loadModules(ctx, base) {
