@@ -1,4 +1,4 @@
-import { unlockAudio, releaseAudio } from '../engine/unlock.js';
+import { unlockAudio, releaseAudio } from '../engine/unlock.js?v=20261117a';
 /* raingen landing page. Progressive enhancement: the page reads fine without it. */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -379,7 +379,7 @@ function fadeInMaster() {
   }, 50);
 }
 function loadEngine() {
-  if (!enginePromise) enginePromise = import('../engine/weather-engine.js').catch((err) => { enginePromise = null; throw err; });
+  if (!enginePromise) enginePromise = import('../engine/weather-engine.js?v=20261117a').catch((err) => { enginePromise = null; throw err; });
   return enginePromise;
 }
 const prefetch = () => { loadEngine().catch(() => {}); };
