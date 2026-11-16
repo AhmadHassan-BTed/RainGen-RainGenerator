@@ -363,7 +363,7 @@ function buildScene() {
 const listenBtn = $('#listen'), listenLabel = $('#listen-label'), listenStatus = $('#listen-status');
 
 // The first play fades in over 3 s to a modest level, because the system volume is unknown.
-const FADE_FROM_DB = -48, FADE_TO_DB = -10, FADE_SEC = 3;
+const FADE_FROM_DB = -48, FADE_TO_DB = -4, FADE_SEC = 3;
 let fadeTimer = 0;
 function fadeInMaster() {
   clearInterval(fadeTimer);
