@@ -1664,6 +1664,10 @@ function stemCal(cal, s) {
   return cal.rain;
 }
 
+// Playback trim: the physical calibration puts moderate rain near -27 dBFS RMS, inaudible on
+// laptop speakers; +10 dB lands it near -17 dB RMS while the -1 dBFS limiter guards storms.
+const OUTPUT_TRIM_DB = 10;
+
 /** Transmission loss, stem gains (calibration x mode x mix) and master gain. */
 function masterParams(plan, ctl, cal, mix, masterDb, sr, emit) {
   const shelter = plan ? plan.shelter : ctl.shelter;
@@ -1678,7 +1682,7 @@ function masterParams(plan, ctl, cal, mix, masterDb, sr, emit) {
   emit('tl|gO', dbToGain(tl.open.gainDb) * tl.openness);
   const mode = MODE_GAINS[ctl.mode] || MODE_GAINS.none;
   for (const s of STEMS) emit(`stem|${s}`, stemCal(cal, s) * dbToGain((mode[s] || 0) + (mix[s] || 0)));
-  emit('master|gain', dbToGain(masterDb + (mode.master || 0)));
+  emit('master|gain', dbToGain(masterDb + (mode.master || 0) + OUTPUT_TRIM_DB));
 }
 
 /** AudioListener position (ear) and orientation from heading/pitch, in Web Audio coordinates. */

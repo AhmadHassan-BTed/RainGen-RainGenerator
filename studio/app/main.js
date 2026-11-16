@@ -59,7 +59,7 @@ const storedLayers = prefs.get('layers', {});
 const ui = {
   workspace: prefs.get('workspace', 'listener') === 'studio' ? 'studio' : 'listener',
   visuals: ['full', 'calm', 'off'].includes(prefs.get('visuals', 'full')) ? prefs.get('visuals', 'full') : 'full',
-  volume: clamp(Number(prefs.get('volume', 50)) || 0, 0, 100),
+  volume: clamp(Number(prefs.get('volume', 70)) || 0, 0, 100),
   singleKeys: prefs.get('singleKeys', true) !== false,
   layers: storedLayers && typeof storedLayers === 'object' && !Array.isArray(storedLayers) ? storedLayers : {},
   sleepFade: 1,
