@@ -190,11 +190,13 @@ def test_hertz_contact_matches_johnson_and_crushing_limit():
     # Hertz scaling: contact time ~ v^(-1/5)
     _, tau2 = K.hertz_contact(d, 2 * v, crush_mpa=0.0)
     assert tau2 / tau == pytest.approx(2 ** -0.2, rel=1e-6)
-    # crushing ice (25 mm stone at 15 m/s): impulse = m v (1 + e) over 0.6 D/v
+    # crushing ice (25 mm stone at 15 m/s): impulse = m v (1 + e) over the stone's transit time D/v
     f_c, tau_c = K.hertz_contact(25.0, 15.0, restitution=0.5)
     m25 = 917.0 * math.pi * 0.025 ** 3 / 6.0
-    assert tau_c == pytest.approx(0.6 * 0.025 / 15.0, rel=1e-9)
+    assert tau_c == pytest.approx(0.025 / 15.0, rel=1e-9)
     assert f_c * 0.574 * tau_c == pytest.approx(m25 * 15.0 * 1.5, rel=1e-9)
+    # instrumented ice-sphere impacts peak at ~2-2.6 m v^2 / D (Kim & Kedward 2000; Tippmann et al. 2013)
+    assert 2.0 <= f_c / (m25 * 15.0 ** 2 / 0.025) <= 2.7
 
 
 def test_modal_bank_frequency_and_t60():
@@ -647,9 +649,11 @@ def test_through_ceiling_transfer_follows_mass_law():
     f = np.array([125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0])
     _, h = signal.sosfreqz(sos, worN=f, fs=SR)
     tl = -20 * np.log10(np.abs(h))
-    # field-incidence mass law 20 log10(m f) - 47 for a 10 kg/m^2 gypsum ceiling, capped at ~32 dB by
-    # coincidence (Cremer & Heckl; Bies & Hansen gypsum data); first-order knee: within 3.5 dB
-    ref = np.minimum(20 * np.log10(10.0 * f) - 47.0, 32.0)
+    # field-incidence mass law 20 log10(m f) - 47 for a 10 kg/m^2 gypsum ceiling, capped by the board's
+    # coincidence dip (R ~26-30 dB at 2-4 kHz, NRC IR-761) less ~2 dB in-situ flanking (ISO 12354-1);
+    # first-order knee: within 3.5 dB
+    assert R.CEILING_TL_MAX_DB == pytest.approx(26.0)
+    ref = np.minimum(20 * np.log10(10.0 * f) - 47.0, 26.0)
     assert np.max(np.abs(tl - ref)) < 3.5
     # attic build-up re the patch's free field: positive, of order +10..+20 dB (diffuse field 4/A)
     assert 10.0 < 20 * np.log10(gain) < 20.0
@@ -775,3 +779,79 @@ def test_interior_panels_radiate_directly_into_the_room():
     assert 20 * np.log10(abs(h[1])) < -6.0
     outdoor = patch("concrete", pos=(2.0, 0.0, -1.7))
     assert R._stem_for(outdoor) == "rain_near"
+
+
+def test_window_sill_drives_the_glazing_with_its_near_field():
+    # a sill under the pane sends ~1/4 of its power onto the glass; the facade level difference of
+    # ShelterTransfer is stated for a distant source meeting the pane at ~1/2 obliquity, so the sill's
+    # free field at the listener is raised by 0.25 * 2 pi r_eq^2 / (0.5 S_window) (~+10 dB at 2.25 m)
+    sill = patch("metal_sheet", pos=(2.15, 0.0, -0.15), area=0.25,
+                 params={"sill": True, "shelter": "room_closed"})
+    gain, sos = R._interior_transfer(sill, SR)
+    r_eq, _ = R._patch_geometry(sill)
+    assert sos is None
+    assert gain ** 2 == pytest.approx(0.25 * 2 * math.pi * r_eq ** 2 / (0.5 * 1.5), rel=1e-9)
+    assert 8.0 < 20 * math.log10(gain) < 12.0
+    assert R._stem_for(sill) == "rain_near"                   # still exterior: the envelope loss applies
+    # the same sheet in the open (or a sill outside any room) is a plain outdoor surface
+    assert R._interior_transfer(patch("metal_sheet", pos=(2.15, 0.0, -0.15), area=0.25), SR) == (1.0, None)
+    assert R._interior_transfer(patch("metal_sheet", pos=(2.15, 0.0, -0.15), area=0.25,
+                                      params={"sill": True, "shelter": "open"}), SR) == (1.0, None)
+
+
+def test_hail_spectrum_ends_at_the_reported_size():
+    # hail_size_mm is the reported size: the largest stones (NOAA/NWS storm reports), so "marble"
+    # hail holds no quarter-size stones; ice pellets and graupel keep their typical-size tail
+    w = weather(30.0, precip="hail", hail_mm=15.0)
+    sp = R._ice_species(w)
+    assert sp["hi"] == 1.0
+    d = R._ice_sizes(np.random.default_rng(3), sp["size"], 20000, sp["hi"])
+    assert d.min() >= 0.3 * 15.0 - 1e-9 and d.max() <= 15.0 + 1e-9
+    assert 7.5 < float(np.mean(d)) < 10.0                    # skewed small (slope 2 / size)
+    # mass conservation: the number flux is the ice volume flux over the mean stone volume
+    vol = float(np.mean(math.pi * (d * 1e-3) ** 3 / 6.0))
+    q = 30.0 * 1e-3 / 3600.0 * sp["frac"] * RHO_WATER / sp["rho"]
+    assert R._ice_number_flux(30.0, sp) == pytest.approx(q / vol, rel=0.03)
+    sleet = R._ice_species(weather(5.0, precip="sleet"))
+    assert sleet.get("hi", 1.6) == 1.6
+
+
+# ---------------------------------------------------------------------------
+# preset levels (raw, unlimited: digital 1.0 = 1 Pa = 94 dB SPL)
+
+def _preset_level(name: str, seconds: float = 2.0, seed: int = 1) -> tuple[float, float]:
+    """(rms dB SPL, peak dB SPL) of a preset's stereo mix straight from the block renderer (no limiter)."""
+    from raingen.render import BlockRenderer
+    from raingen.scene.presets import preset
+
+    sc = preset(name)
+    sc.seed = seed
+    br = BlockRenderer(sc, "stereo")
+    n_blocks = int(round(seconds * br.sr / br.block))
+    x = np.concatenate([br.render_block(i).mix for i in range(n_blocks)], axis=1)
+    return spl(x), float(20.0 * np.log10(np.max(np.abs(x)) / 20e-6))
+
+
+@pytest.mark.parametrize("name, lo, hi", [
+    # closed bedroom, tiled roof over an attic and a gypsum ceiling, 4 mm/h with the wind on the back of the
+    # window: the roof through the ceiling (~26 dB), the sill's near field through the glazing (~24 dB) and
+    # the muffled garden (~17 dB) give ~25-30 dB SPL. The 35-45 dB of a "rain on the window" bedroom needs
+    # wind-driven rain on the glass or a tilted window (Locher et al. 2018: 15.5 dB instead of 27.8 dB)
+    ("window-rain-bedroom", 24.0, 45.0),
+    ("focus-steady-roof", 27.0, 45.0),                       # 8 mm/h fine drops on the same roof
+    ("steady-rain-leaves-night", 44.3, 50.3),                # unchanged by the interior fixes (47.3, +-3 dB)
+    ("tin-roof-cabin-storm", 65.5, 71.5),                    # unchanged (68.5, +-3 dB)
+])
+def test_preset_levels_stay_in_their_physical_window(name, lo, hi):
+    rms, peak = _preset_level(name)
+    assert lo <= rms <= hi, f"{name}: {rms:.1f} dB SPL rms outside [{lo}, {hi}]"
+    assert peak < 110.0
+
+
+@pytest.mark.slow
+def test_hailstorm_car_level():
+    # inside a car under 15 mm (marble) hail, 15 mm/h of ice: ~80-95 dB SPL rms; single hits on the roof
+    # peak well below 124 dB (crushing pulse over D/v, spectrum truncated at the reported size)
+    rms, peak = _preset_level("hailstorm-car")
+    assert 80.0 <= rms <= 95.0
+    assert peak <= 120.0

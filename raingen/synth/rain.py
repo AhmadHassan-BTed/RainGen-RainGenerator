@@ -197,7 +197,16 @@ def _patch_geometry(patch: SourcePatch) -> tuple[float, float]:
 
 
 CEILING_MASS_KG_M2 = 10.0        # 12.5 mm gypsum board ceiling (8.5-10.5 kg/m^2, Bies & Hansen table)
-CEILING_TL_MAX_DB = 32.0         # its coincidence region (fc ~2.5-3 kHz) caps the mass law (provisional)
+# The board's coincidence dip (fc ~2.5-3.2 kHz) caps the mass law: a single 12.5 mm board measures
+# R ~26-30 dB from 2 to 4 kHz (Rw 28; NRC IR-761, Halliwell et al. 1998), and in situ flanking through
+# the walls, downlights and the loft hatch takes the apparent R' ~2 dB lower (ISO 12354-1). Rain on
+# tiles peaks at ~3.5 kHz, right in that dip.
+CEILING_TL_MAX_DB = 26.0
+# A sill under the glazing drives the pane with its near field: ~1/4 of its power falls on the glass,
+# while the facade level difference of raingen.synth.places is stated for a distant source whose
+# intensity at the listener, W / (2 pi r^2), meets the pane at an average obliquity of ~1/2.
+SILL_GLAZING_SHARE = 0.25
+WINDOW_AREA_M2 = 1.5             # bedroom window (raingen.physics.layout room window)
 ATTIC_DEPTH_M = 1.2              # mean height of the attic space between roof and ceiling
 ATTIC_ABSORPTION = 0.4           # Sabine absorption of the attic per m^2 of roof (insulated floor, alpha ~0.8)
 
@@ -226,9 +235,17 @@ def _interior_transfer(patch: SourcePatch, sr: int):
     (the value at 100 Hz plus the 6 dB/octave slope). Double / triple glazing: the struck outer pane
     reaches the room through the cavity and the inner pane - a broadband loss and a high-frequency
     roll-off (~10 dB below single glazing for rain on skylights; provisional).
+    An exterior window sill (params 'sill', in a room) is not interior, but its gain converts its free
+    field at the listener into the near field its pane receives (SILL_GLAZING_SHARE).
     """
     p = patch.params or {}
     if not patch.interior:
+        if p.get("sill") and str(p.get("shelter", "")) in ("room_closed", "room_open"):
+            # facade near field: the envelope loss of ShelterTransfer applies to the sound the pane
+            # receives, SILL_GLAZING_SHARE W, not to the free field W / (2 pi r_eq^2) at the listener
+            r_eq, _ = _patch_geometry(patch)
+            s_win = float(p.get("window_area_m2", WINDOW_AREA_M2))
+            return math.sqrt(SILL_GLAZING_SHARE * 2.0 * math.pi * r_eq * r_eq / (0.5 * max(s_win, 0.1))), None
         return 1.0, None
     if p.get("through_ceiling"):
         r_eq, _ = _patch_geometry(patch)
@@ -1803,7 +1820,10 @@ class RainBedGenerator:
         sp = _ice_species(w)
         if sp is not None and w.rain_rate_mm_h > 0.0:
             nflux = _ice_number_flux(w.rain_rate_mm_h, sp)
-            dm = 0.6 * sp["size"]
+            # representative stone: 0.6 x size for the 1.6 x tail; the hail spectrum, truncated at its reported
+            # size, shifts it down with its mean diameter (the distribution scales with size)
+            hi = sp.get("hi", 1.6)
+            dm = 0.6 * sp["size"] * _ice_mean_diameter_rel(hi) / _ice_mean_diameter_rel(1.6)
             j = sp["rho"] * math.pi * (dm * 1e-3) ** 3 / 6.0 * float(_ice_fall_speed(dm, sp["kind"])) * (1.0 + sp["rest"])
             e_hail = (self.p_mix * j / J_REF) ** 2 * self.T_EFF * 0.3
             p += nflux * e_hail * self.HAIL_BANDS
@@ -2284,8 +2304,10 @@ class GutterGenerator:
 def _ice_species(w: WeatherState):
     t = w.precip_type
     if t == "hail":
+        # hail_size_mm is the reported size, i.e. the largest stones (NOAA/NWS reports compare the biggest
+        # stone with a pea, marble, quarter ...): the spectrum is truncated there (hi = 1.0 x size)
         return {"kind": "hail", "size": max(float(w.hail_size_mm), 5.0), "rho": 900.0, "e": 5.0e9,
-                "crush": 10.0, "frac": 0.5, "rest": 0.5}
+                "crush": 10.0, "frac": 0.5, "rest": 0.5, "hi": 1.0}
     if t == "sleet":
         return {"kind": "sleet", "size": 3.5, "rho": 900.0, "e": 9.0e9, "crush": 15.0, "frac": 0.5, "rest": 0.45}
     if t == "graupel":
@@ -2293,9 +2315,12 @@ def _ice_species(w: WeatherState):
     return None
 
 
-def _ice_sizes(rng, size_mm: float, n: int) -> np.ndarray:
-    """Truncated exponential on [0.3, 1.6] x size with slope 2/size (stones skew small)."""
-    lo, hi = 0.3 * size_mm, 1.6 * size_mm
+def _ice_sizes(rng, size_mm: float, n: int, hi_frac: float = 1.6) -> np.ndarray:
+    """Truncated exponential on [0.3, hi_frac] x size with slope 2/size (stones skew small).
+
+    Hail passes hi_frac = 1.0 (its size is the reported maximum); ice pellets and graupel, whose
+    size is a typical one, keep the 1.6 x tail."""
+    lo, hi = 0.3 * size_mm, hi_frac * size_mm
     lam = 2.0 / size_mm
     u = rng.random(n)
     return lo - np.log(1.0 - u * (1.0 - math.exp(-lam * (hi - lo)))) / lam
@@ -2312,11 +2337,11 @@ def _ice_fall_speed(d_mm, kind: str):
     return 1.3 * d ** 0.6
 
 
-def _ice_mean_volume(size_mm: float) -> float:
-    key = round(size_mm, 2)
+def _ice_mean_volume(size_mm: float, hi_frac: float = 1.6) -> float:
+    key = (round(size_mm, 2), round(hi_frac, 3))
     v = _ICE_VOL_CACHE.get(key)
     if v is None:
-        lo, hi = 0.3 * size_mm, 1.6 * size_mm
+        lo, hi = 0.3 * size_mm, hi_frac * size_mm
         dgrid = np.linspace(lo, hi, 256)
         pdf = np.exp(-2.0 / size_mm * (dgrid - lo))
         pdf /= pdf.sum()
@@ -2325,10 +2350,17 @@ def _ice_mean_volume(size_mm: float) -> float:
     return v
 
 
+def _ice_mean_diameter_rel(hi_frac: float) -> float:
+    """Mean stone diameter / size of the truncated exponential of _ice_sizes (scale-free)."""
+    dgrid = np.linspace(0.3, hi_frac, 256)
+    pdf = np.exp(-2.0 * (dgrid - 0.3))
+    return float(np.sum(pdf * dgrid) / np.sum(pdf))
+
+
 def _ice_number_flux(rate_mm_h: float, sp: dict) -> float:
     """Stones per m^2 per s from the liquid-equivalent rate (share sp['frac'] falls as ice)."""
     q = max(rate_mm_h, 0.0) * 1e-3 / 3600.0 * sp["frac"] * RHO_WATER / sp["rho"]
-    return q / max(_ice_mean_volume(sp["size"]), 1e-12)
+    return q / max(_ice_mean_volume(sp["size"], sp.get("hi", 1.6)), 1e-12)
 
 
 class _HailPatch:
@@ -2378,7 +2410,7 @@ class _HailPatch:
             rate = flux * self.patch.area_m2 * self.patch.exposure * fac
             off, scale = thinned_offsets(rng, rate, n, sr, self.MAX_EVENTS)
             if off.size:
-                d = _ice_sizes(rng, sp["size"], off.size)
+                d = _ice_sizes(rng, sp["size"], off.size, sp.get("hi", 1.6))
                 vt = _ice_fall_speed(d, sp["kind"])
                 un = np.maximum(vt * nz - (nx * uh[0] + ny * uh[1]), 0.25 * vt)
                 offs.append(off)
@@ -2397,7 +2429,8 @@ class _HailPatch:
                 self.pend_t, self.pend_v = self.pend_t[keep], self.pend_v[keep]
                 self.pend_d, self.pend_s = self.pend_d[keep], self.pend_s[keep]
         if offs and sp is None:
-            sp = {"kind": "hail", "size": 10.0, "rho": 900.0, "e": 5.0e9, "crush": 10.0, "frac": 0.5, "rest": 0.5}
+            sp = {"kind": "hail", "size": 10.0, "rho": 900.0, "e": 5.0e9, "crush": 10.0, "frac": 0.5, "rest": 0.5,
+                  "hi": 1.0}
         if offs:
             off = np.concatenate(offs).astype(np.int64)
             d = np.concatenate(ds)

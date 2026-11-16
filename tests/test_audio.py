@@ -779,9 +779,7 @@ def test_generate_storm_audio_master_volume_and_determinism(caplog):
     "steady",
     "thunderstorm",
     "gale",
-    pytest.param("cozy", marks=pytest.mark.xfail(
-        reason="raingen window-rain-bedroom renders at about -67 dBTP (interior scenes nearly silent); "
-               "the legacy wrapper falls back to the old synthesizer", strict=False)),
+    "cozy",
 ])
 def test_every_legacy_preset_renders_through_raingen(preset, caplog):
     from raingen.master.loudness import integrated_loudness, true_peak_db

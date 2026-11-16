@@ -10,7 +10,9 @@ Physics implemented
   K = 4/3 E* sqrt(R), delta_max = (5 m v^2 / 4K)^(2/5), F_max = K delta_max^(3/2),
   contact time 2.94 delta_max / v, force ~ sin(pi t / tau)^(3/2). When the mean contact
   pressure exceeds the ice crushing strength the stone behaves as a crushing projectile:
-  duration ~0.6 D/v and impulse m v (1 + e).
+  the force lasts about the time the stone takes to travel its own diameter, D/v, with
+  impulse m v (1 + e), i.e. a peak of ~2.6 m v^2 / D at e = 0.5 (instrumented ice-sphere
+  impacts: Kim & Kedward 2000; Tippmann, Kim & Rhymer 2013, peak ~2-2.6 m v^2 / D).
 - Air bubbles (Minnaert 1933): f a ~ 3.28 m/s at 1 atm (a = radius). Single-bubble voice
   after van den Doel (2005), as used by Moss et al. (2010):
   p(t) = eps a sin(2 pi f0 (t + xi beta t^2 / 2)) exp(-beta t),
@@ -125,7 +127,7 @@ def hertz_contact(d_mm, v_mps, *, rho: float = 917.0, e_proj: float = 9.0e9,
     if crush_mpa and crush_mpa > 0.0:
         p_mean = f_max / (np.pi * r * delta)            # contact radius^2 = R delta
         crushed = p_mean > crush_mpa * 1e6
-        tau_c = np.maximum(tau, 0.6 * d / v)
+        tau_c = np.maximum(tau, d / v)                  # crushing lasts the stone's own transit time
         f_c = m * v * (1.0 + np.asarray(restitution, dtype=float)) / (0.574 * tau_c)  # int sin^1.5 = 0.574
         f_max = np.where(crushed, f_c, f_max)
         tau = np.where(crushed, tau_c, tau)

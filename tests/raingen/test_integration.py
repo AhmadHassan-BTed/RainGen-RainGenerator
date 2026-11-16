@@ -702,6 +702,69 @@ class TestLoudness:
         with pytest.raises(RenderCancelled):
             Renderer(calm_scene(), 0.5, destination="youtube", progress=lambda f, ph: False).to_array()
 
+    @pytest.mark.parametrize("sr_out", [44100, 48000, 96000])
+    def test_output_chain_true_peak_at_output_rate(self, sr_out):
+        """The limiter runs after the resampler: hail-like transients (sharp, broadband) driven into
+        a -1 dBTP ceiling stay under it at the delivered rate. With the limiter at 48 kHz ahead of
+        the 44.1 kHz resampler, the band-limiting rang them up to -0.82 dBTP."""
+        from raingen.master.loudness import true_peak_db
+        from raingen.render import _OutputChain
+
+        rng = np.random.default_rng(1)
+        n = 2 * SAMPLE_RATE
+        x = 0.05 * rng.standard_normal((2, n))
+        for t in rng.integers(1000, n - 1000, 300):
+            x[:, t:t + 3] += rng.choice([-1.0, 1.0]) * np.array([4.0, -3.0, 1.5])
+        frames = int(n * sr_out / SAMPLE_RATE) - 2000
+        out: list = []
+        ch = _OutputChain("mix", "mix", 2, frames, sr_in=SAMPLE_RATE, sr_out=sr_out, gain_db=6.0,
+                          ceiling_dbtp=-1.0, true_peak=False, sink=out.append)
+        for b in range(0, n, BLOCK):
+            ch.push(x[:, b:b + BLOCK])
+        y = np.concatenate(out, axis=1)
+        assert ch.done and y.shape[1] == frames
+        assert ch.limiter.max_gain_reduction_db > 6.0                  # the limiter is working hard
+        assert true_peak_db(y, sr_out) <= -1.0 + 1e-3
+
+    def test_output_chain_alignment_with_limiter(self):
+        """Limiter look-ahead is trimmed at the output rate: an impulse at input sample T lands at
+        T * 44100 / 48000 in the delivered signal, with or without a limiter."""
+        from raingen.render import _OutputChain
+
+        T = 3 * BLOCK + 517
+        x = np.zeros((1, SAMPLE_RATE // 2))
+        x[0, T] = 0.1
+        peaks = []
+        for ceiling in (None, -1.0):
+            out: list = []
+            ch = _OutputChain("mix", "mix", 1, 20000, sr_in=SAMPLE_RATE, sr_out=44100, skip=0,
+                              ceiling_dbtp=ceiling, layout="mono", meter=False, sink=out.append)
+            for b in range(0, x.shape[1], BLOCK):
+                ch.push(x[:, b:b + BLOCK])
+            y = np.concatenate(out, axis=1)
+            assert y.shape[1] == 20000
+            peaks.append(int(np.argmax(np.abs(y[0]))))
+        assert peaks[0] == peaks[1]
+        assert abs(peaks[0] - T * 44100 / SAMPLE_RATE) <= 1.0
+
+    @pytest.mark.slow                  # 2 s of real synthesis, two passes + calibration replays
+    def test_real_hail_44k1_true_peak(self, tmp_out):
+        """hailstorm-car (dense, peaky hail transients) to youtube at 44.1 kHz: the written file's
+        true peak (BS.1770 8x detector) is at or below the -1 dBTP ceiling."""
+        import soundfile as sf
+
+        from raingen.master.loudness import true_peak_db
+        from raingen.render import render
+        from raingen.scene.presets import preset
+
+        sc = preset("hailstorm-car")
+        sc.render.quality = "mobile"
+        rep = render(sc, 2.0, out=str(tmp_out / "hail.wav"), destination="youtube", sample_rate=44100)
+        y, sr = sf.read(rep["path"], always_2d=True)
+        assert sr == 44100 and y.shape[0] == 2 * 44100
+        assert true_peak_db(y.T, sr) <= -1.0 + 0.1
+        assert_clean(y.T)
+
 
 class TestRenderOptions:
     @pytest.mark.parametrize("block", [256, 480, 1000])

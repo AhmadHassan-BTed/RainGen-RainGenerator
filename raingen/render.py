@@ -10,8 +10,10 @@ Signal flow per block of BLOCK frames at SAMPLE_RATE (MASTER_PLAN 9.1):
       -> Room send                     SH-domain FDN reverb of the enclosure (added to 'interior')
       -> sum stems -> Decoder          stereo | binaural | 5.1 | 7.1.4 | foa | hoa3 | mono
       -> CalmGovernor                  wellness modes only ("Keep it soothing", 8.2)
-      -> static gain -> TruePeakLimiter (>= 8x true-peak detection, destination ceiling)
+      -> static gain
       -> [rational polyphase resampler when the output rate is not 48 kHz]
+      -> TruePeakLimiter at the output rate (>= 8x true-peak detection, destination ceiling),
+         so the band-limiting of the resampler cannot push the delivered peaks over the ceiling
       -> BS.1770-5 meter -> TPDF dither -> streaming BWF/RF64 or FLAC writer
 
 Loudness normalisation is two-pass (9.4). Pass 1 renders the programme once, measures its
@@ -19,14 +21,15 @@ integrated loudness (BS.1770-5 gating, ITU-R BS.1770-5 / EBU R128) and keeps the
 signal (the mix after the governor, and the decoded stems) on a "tape": float32 in memory
 for short renders, an np.memmap in a private temporary directory next to the output for
 long ones. The gain sits after the governor and before the limiter, so pass 2 is exact
-without re-synthesis: it replays the tape through gain -> limiter -> dither -> writer only.
+without re-synthesis: it replays the tape through gain -> [resampler] -> limiter -> dither ->
+writer only.
 Because the limiter can pull a loud, peaky programme below the target, the gain is refined
 on the tape (a few cheap limiter-only passes) until the limited programme meets the target.
 When the tape would not fit on disk, pass 2 re-renders instead: every layer is counter-based
 and seeded, so the second synthesis is bit-identical to the first.
 
-Latency of the decoder, governor and limiter is removed per output chain by discarding
-their first `latency` samples and rendering on past the end, so sample 0 of every file is
+Latency of the decoder, governor (input rate) and limiter (output rate) is removed per output
+chain by discarding their first `latency` samples and rendering on past the end, so sample 0 of every file is
 scene time 0 and captions/markers line up with the audio exactly. The scene (JSON), seed
 and engine version are embedded in every file (bext CodingHistory + iXML <USER>, or the
 FLAC Vorbis comment), so any render can be reproduced.
@@ -420,9 +423,17 @@ class BlockRenderer:
 
 
 # ---------------------------------------------------------------------------
-# output chain: governor -> gain -> limiter -> latency trim -> resample -> meter -> dither -> sink
+# output chain: governor -> gain -> latency trim -> resample -> limiter -> limiter trim -> meter
+#               -> dither -> sink
 # ---------------------------------------------------------------------------
 class _OutputChain:
+    """One delivered signal. The true-peak limiter runs at the *output* rate, after the resampler:
+    band-limiting to a lower rate (48 -> 44.1 kHz) reshapes the inter-sample peaks of a limited
+    programme (Gibbs ringing on hail or impact transients), so a limiter ahead of it could deliver
+    up to ~0.2 dB over the ceiling. `skip` (decoder + governor latency) is trimmed at the input
+    rate before the resampler, the limiter's look-ahead at the output rate right after it, so
+    sample 0 of the output is scene time 0 either way."""
+
     def __init__(self, name: str, source: str, channels: int, frames_out: int, *, sr_in: int, sr_out: int,
                  skip: int = 0, governor=None, gain_db: float = 0.0, ceiling_dbtp: Optional[float] = None,
                  layout: str = "stereo", meter: bool = True, true_peak: bool = True,
@@ -438,9 +449,11 @@ class _OutputChain:
         self.frames_out = int(frames_out)
         self.governor = governor
         self.gain = 10.0 ** (float(gain_db) / 20.0)
-        self.limiter = TruePeakLimiter(sr_in, self.channels, ceiling_dbtp) if ceiling_dbtp is not None else None
-        self.skip = int(skip) + int(getattr(governor, "latency", 0) or 0) + \
-            (int(self.limiter.latency) if self.limiter is not None else 0)
+        self.limiter = TruePeakLimiter(sr_out, self.channels, ceiling_dbtp) if ceiling_dbtp is not None else None
+        self.skip = int(skip) + int(getattr(governor, "latency", 0) or 0)          # input-rate samples
+        self.skip_out = int(self.limiter.latency) if self.limiter is not None else 0   # output-rate samples
+        # the limiter look-ahead in input samples, for the render loop's run-on budget
+        self.lookahead_in = int(math.ceil(self.skip_out * int(sr_in) / int(sr_out)))
         self.resampler = StreamingResampler(sr_in, sr_out, self.channels) if int(sr_out) != int(sr_in) else None
         self.meter = LoudnessMeter(sr_out, self.channels, layout=layout, true_peak=true_peak) if meter else None
         self.ditherer = None
@@ -467,8 +480,6 @@ class _OutputChain:
             y = self.governor.process(y)
         if self.gain != 1.0:
             y = y * self.gain
-        if self.limiter is not None:
-            y = self.limiter.process(y)
         if self.skip > 0:
             drop = min(self.skip, y.shape[1])
             y = y[:, drop:]
@@ -477,6 +488,14 @@ class _OutputChain:
                 return
         if self.resampler is not None:
             y = self.resampler.process(y)
+            if y.shape[1] == 0:
+                return
+        if self.limiter is not None:
+            y = self.limiter.process(y)
+            if self.skip_out > 0:
+                drop = min(self.skip_out, y.shape[1])
+                y = y[:, drop:]
+                self.skip_out -= drop
         y = y[:, : self.frames_out - self.written]
         if y.shape[1] == 0:
             return
@@ -781,7 +800,7 @@ class Renderer:
         markers: list = []
         lead = chains[0]
         B = self.block
-        slack = max(c.skip for c in chains) + 8 * B
+        slack = max(c.skip + c.lookahead_in for c in chains) + 8 * B
         limit = (max(self.frames_in, int(math.ceil(self.frames_out * SAMPLE_RATE / self.sr_out))) + slack) // B + 64
         if tape is not None:
             limit = max(limit, tape.capacity // B + 64)
@@ -815,7 +834,9 @@ class Renderer:
         if self.ceiling_dbtp is None:
             return 0
         from .master.limiter import TruePeakLimiter
-        return int(TruePeakLimiter(SAMPLE_RATE, channels, self.ceiling_dbtp).latency)
+        # the limiter runs at the output rate; its look-ahead in input (48 kHz) samples
+        lat = int(TruePeakLimiter(self.sr_out, channels, self.ceiling_dbtp).latency)
+        return int(math.ceil(lat * SAMPLE_RATE / self.sr_out))
 
     def _pass1(self, stems: bool, keep: bool, tmp_dir: Optional[str] = None) -> _Pass1:
         """Render once, measure the loudness of the programme after the governor and, with `keep`,
