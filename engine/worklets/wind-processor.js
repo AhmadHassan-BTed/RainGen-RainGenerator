@@ -1,5 +1,5 @@
 /**
- * rg-wind: wind heard through objects (MASTER_PLAN §3.6, §5.2).
+ * rg-wind: wind heard through objects.
  *
  * Modes (processorOptions.mode):
  * - air:        broadband wind roar, band centres rising with U, intensity ~ U^(2 chi), chi = 2,
@@ -167,8 +167,19 @@ class Res {
     this.y1[k] = y;
     return y;
   }
+
+  /** Zero states that have decayed into the subnormal range (ringing down on silence). */
+  flush() {
+    const y1 = this.y1;
+    const y2 = this.y2;
+    for (let k = 0; k < this.n; k++) {
+      if (y1[k] < 1e-18 && y1[k] > -1e-18) y1[k] = 0;
+      if (y2[k] < 1e-18 && y2[k] > -1e-18) y2[k] = 0;
+    }
+  }
 }
 
+const HIT_MAX = 32; // chime strikes per quantum (Poisson mean is ~0.03)
 const MODES = { air: 0, vegetation: 1, grass: 2, wire: 3, flag: 4, chime: 5, wiper: 6 };
 
 class WindProcessor extends AudioWorkletProcessor {
@@ -215,6 +226,10 @@ class WindProcessor extends AudioWorkletProcessor {
     this.dt = 128 / sr;
     // modulation (OU) states
     this.ou = new Float64Array(6);
+    this.am4 = new Float64Array(4);
+    this.hitOff = new Int32Array(HIT_MAX);
+    this.hitTube = new Int32Array(HIT_MAX);
+    this.hitV = new Float64Array(HIT_MAX);
     this.ouCoef = (tau) => Math.exp(-this.dt / tau);
     this.coefU = 1 - Math.exp(-this.dt / 0.12);
     this.lastU = -1;
@@ -325,6 +340,14 @@ class WindProcessor extends AudioWorkletProcessor {
       R.set(L);
     }
     for (let c = 2; c < out.length; c++) out[c].set(L);
+    // Filters fed only by sparse ticks decay toward zero between them; keep them out of subnormals.
+    const F = this.f;
+    for (let k = 0; k < F.length; k++) {
+      const q = F[k];
+      if (q[5] < 1e-18 && q[5] > -1e-18) q[5] = 0;
+      if (q[6] < 1e-18 && q[6] > -1e-18) q[6] = 0;
+    }
+    if (this.res) this.res.flush();
     this.pos = (this.pos + N) & RMASK;
     return true;
   }
@@ -372,14 +395,14 @@ class WindProcessor extends AudioWorkletProcessor {
     this.brown[1] = b1;
   }
 
-  ticks(N, rate, ampScale, probs) {
+  ticks(N, rate, ampScale, p0, p1) {
     const rng = this.rng;
     const n = rng.poisson(Math.min(8000, rate) * (N / this.sr));
     for (let k = 0; k < n; k++) {
       const off = Math.floor(rng.next() * N);
       const a = ampScale * (0.3 + rng.next()) * (rng.next() < 0.5 ? -1 : 1);
       const u = rng.next();
-      const band = u < probs[0] ? 0 : u < probs[0] + probs[1] ? 1 : 2;
+      const band = u < p0 ? 0 : u < p0 + p1 ? 1 : 2;
       const r = this.ring[band];
       const j = (this.pos + off) & RMASK;
       r[j] += a;
@@ -398,7 +421,7 @@ class WindProcessor extends AudioWorkletProcessor {
     }
     const sz = this.size;
     const rate = sz * 900 * Math.pow(Math.max(0, U - 1.5), 1.6);
-    this.ticks(N, rate, 0.08 * Math.pow(U / 8, 1.2), [0.4, 0.4]);
+    this.ticks(N, rate, 0.08 * Math.pow(U / 8, 1.2), 0.4, 0.4);
     const swish = 0.12 * sz * Math.pow(U / 10, 2.2) * Math.exp(0.35 * this.ouStep(0, 1.5));
     const low = 0.05 * sz * Math.pow(U / 10, 2.5) * Math.exp(0.3 * this.ouStep(1, 3));
     let n0 = this.ns0;
@@ -454,8 +477,8 @@ class WindProcessor extends AudioWorkletProcessor {
     }
     const sz = this.size;
     const wh = 0.06 * sz * Math.pow(U / 12, 3) * smooth(4, 8, U);
-    const am = [];
-    for (let k = 0; k < 4; k++) am.push(wh * Math.exp(0.5 * this.ouStep(k, 0.8 + 0.5 * k)));
+    const am = this.am4;
+    for (let k = 0; k < 4; k++) am[k] = wh * Math.exp(0.5 * this.ouStep(k, 0.8 + 0.5 * k));
     const swish = 0.05 * sz * Math.pow(U / 10, 2.2) * Math.exp(0.35 * this.ouStep(4, 1.5));
     if (!this.creak && rng.next() < 0.25 * smooth(14, 20, U) * this.dt) {
       const fc = 180 + 220 * rng.next();
@@ -491,7 +514,7 @@ class WindProcessor extends AudioWorkletProcessor {
   grass(N, U, L) {
     const sq = Math.sqrt(this.area / 10);
     const hiss = 0.1 * sq * Math.pow(U / 8, 2) * smooth(1.5, 3, U) * Math.exp(0.3 * this.ouStep(0, 1.2));
-    this.ticks(N, 300 * sq * Math.pow(Math.max(0, U - 2), 1.2), 0.03 * Math.pow(U / 8, 1.1), [0, 0]);
+    this.ticks(N, 300 * sq * Math.pow(Math.max(0, U - 2), 1.2), 0.03 * Math.pow(U / 8, 1.1), 0, 0);
     let n0 = this.ns0;
     const r2 = this.ring[2];
     for (let i = 0; i < N; i++) {
@@ -523,19 +546,24 @@ class WindProcessor extends AudioWorkletProcessor {
     const reGate = smooth(40, 150, Re) * (1 - smooth(1e5, 3e5, Re));
     const amp = 0.05 * Math.pow(U / 10, 3) * Math.sqrt(this.length / 10) * smooth(1.5, 3.5, U) * reGate * this.lockG * Math.exp(0.4 * this.ouStep(0, 0.5));
     bqBand(this.f[0], this.ft, 25, sr);
-    let ph = this.ph;
+    const ph = this.ph;
     const k = (TWO_PI * this.ft) / sr;
+    const ck = Math.cos(k);
+    const sk = Math.sin(k);
+    let s = Math.sin(ph);
+    let c = Math.cos(ph);
     let n0 = this.ns0;
     for (let i = 0; i < N; i++) {
-      ph += k;
-      if (ph > TWO_PI) ph -= TWO_PI;
+      const s1 = s * ck + c * sk;
+      c = c * ck - s * sk;
+      s = s1;
       n0 ^= n0 << 13;
       n0 ^= n0 >>> 17;
       n0 ^= n0 << 5;
       const w = n0 / 2147483648;
-      L[i] = amp * (Math.sin(ph) + 0.15 * Math.sin(2 * ph) + 2.5 * bq(this.f[0], w));
+      L[i] = amp * (s + 0.3 * s * c + 2.5 * bq(this.f[0], w));
     }
-    this.ph = ph;
+    this.ph = (ph + k * N) % TWO_PI;
     this.ns0 = n0;
   }
 
@@ -568,7 +596,12 @@ class WindProcessor extends AudioWorkletProcessor {
       pingOff = Math.floor(rng.next() * N);
     }
     let n0 = this.ns0;
-    const ph0 = this.flapPh;
+    const th0 = 2 * TWO_PI * this.flapPh;
+    const dth = (2 * TWO_PI * fFlap) / sr;
+    const cd = Math.cos(dth);
+    const sd = Math.sin(dth);
+    let ms = Math.sin(th0);
+    let mc = Math.cos(th0);
     for (let i = 0; i < N; i++) {
       const j = (this.pos + i) & RMASK;
       const env = r0[j];
@@ -577,8 +610,10 @@ class WindProcessor extends AudioWorkletProcessor {
       n0 ^= n0 >>> 17;
       n0 ^= n0 << 5;
       const w = n0 / 2147483648;
-      const p = ph0 + (fFlap * i) / sr;
-      const mod = 0.6 + 0.4 * (0.5 + 0.5 * Math.sin(TWO_PI * 2 * p));
+      const mod = 0.8 + 0.2 * ms;
+      const mt = ms * cd + mc * sd;
+      mc = mc * cd - ms * sd;
+      ms = mt;
       const x = i === pingOff ? ping : 0;
       L[i] = flutter * mod * bq(this.f[1], w) + bq(this.f[2], env * w) + this.res.tick(0, x) + this.res.tick(1, x);
     }
@@ -589,10 +624,14 @@ class WindProcessor extends AudioWorkletProcessor {
   chime(N, U, L) {
     const rng = this.rng;
     const rate = Math.min(10, 0.7 * Math.pow(Math.max(0, U - 1.5), 1.3));
-    const n = rng.poisson(rate * this.dt);
-    const hits = [];
+    const n = Math.min(HIT_MAX, rng.poisson(rate * this.dt));
+    const hOff = this.hitOff;
+    const hTube = this.hitTube;
+    const hV = this.hitV;
     for (let k = 0; k < n; k++) {
-      hits.push({ off: Math.floor(rng.next() * N), tube: Math.floor(rng.next() * this.tubes.length), v: 0.08 * (0.3 + 0.7 * rng.next() * Math.min(1, U / 10)) });
+      hOff[k] = Math.floor(rng.next() * N);
+      hTube[k] = Math.floor(rng.next() * this.tubes.length);
+      hV[k] = 0.08 * (0.3 + 0.7 * rng.next() * Math.min(1, U / 10));
     }
     const res = this.res;
     const nt = this.tubes.length;
@@ -600,15 +639,11 @@ class WindProcessor extends AudioWorkletProcessor {
       let y = 0;
       for (let t = 0; t < nt; t++) {
         let x = 0;
-        for (let h = 0; h < hits.length; h++) if (hits[h].off === i && hits[h].tube === t) x += hits[h].v;
+        for (let h = 0; h < n; h++) if (hOff[h] === i && hTube[h] === t) x += hV[h];
         y += res.tick(t * 3, x) + res.tick(t * 3 + 1, x) + res.tick(t * 3 + 2, x);
         if (x !== 0) y += 0.3 * x;
       }
       L[i] = y;
-    }
-    for (let k = 0; k < res.n; k++) {
-      if (Math.abs(res.y1[k]) < 1e-18) res.y1[k] = 0;
-      if (Math.abs(res.y2[k]) < 1e-18) res.y2[k] = 0;
     }
   }
 

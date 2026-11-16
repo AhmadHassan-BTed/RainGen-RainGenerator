@@ -1,15 +1,15 @@
 /**
- * Scene presets, Tier-0 vibe macros and storm-arc automation for the composer.
+ * Scene presets, the Listener vibe macros and storm-arc automation for the composer.
  *
- * Vibe anchors follow MASTER_PLAN section 6.2:
+ * Vibe anchors (interpolated in log(rate), Beaufort and log(distance)):
  *   Intensity 0 dry/drips · 20 drizzle 0.3 mm/h Bft 2 · 40 moderate 5 mm/h Bft 3 ·
  *   60 heavy 20 mm/h Bft 5 · 80 thunderstorm 40 mm/h Bft 7, thunder 5 km ·
- *   100 extreme 80 mm/h Bft 9, thunder 1.5 km (interpolated in log(rate),
- *   Beaufort and log(distance)).
+ *   100 extreme 80 mm/h Bft 9, thunder 1.5 km.
  *   Closeness 0 out in it · 25 umbrella/tree · 50 porch/tent · 75 indoors window
  *   open · 100 indoors window shut.
  *   Calm-Wild: gust factor 1.15-1.9, gust rate, shower-cell contrast, thunder rate.
- * Storm arcs follow section 3.4 (sparse fat drops -> downpour -> stratiform tail).
+ * Storm arcs follow the life of a convective cell: sparse fat drops on arrival,
+ * the downpour, then a lighter stratiform tail as it passes or clears.
  */
 import { defaultScene, deepMerge, normalizeScene, clone } from './scene-store.js';
 
@@ -399,7 +399,7 @@ export function vibeDrivers(vibe, scene) {
   return { intensity, closeness, wildness };
 }
 
-/** Best Tier-0 position for a scene (inverse of the anchors), so sliders open where the scene is. */
+/** Best vibe-slider position for a scene (inverse of the anchors), so the sliders open where the scene is. */
 export function inferVibe(scene) {
   const p = scene.weather.precipitation;
   let I = p.type === 'none' ? 0 : invInterp(p.type === 'snow' ? p.rate_mm_h / 0.3 : p.rate_mm_h, RATE_ANCHORS, true);
@@ -467,7 +467,7 @@ export const STORM_ARCS = {
 
 /* ------------------------------------------------------------------ scene physics helpers */
 
-/** Impacts per m^2 per s for drops >= 0.5 mm (Marshall-Palmer, MASTER_PLAN 3.1 table), log-log interpolated. */
+/** Impacts per m^2 per s for drops >= 0.5 mm from a Marshall-Palmer drop-size distribution, log-log interpolated. */
 const FLUX_TABLE = [[0.5, 450], [1, 750], [2.5, 1380], [5, 2100], [10, 3100], [25, 5000], [50, 7100], [100, 9700]];
 
 export function impactFlux(rate) {

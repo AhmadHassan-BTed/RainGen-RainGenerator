@@ -1,5 +1,5 @@
 /**
- * Shelter and place acoustics (MASTER_PLAN §3.9, §5.2 "Places").
+ * Shelter and place acoustics.
  *
  * - Impulse responses: exponentially decaying noise (Moorer 1979) with frequency-dependent
  *   decay (a low-pass whose cutoff falls over the tail, i.e. high frequencies die first, as

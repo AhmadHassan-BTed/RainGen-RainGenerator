@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Page not found · raingen</title>
+<meta name="description" content="This page could not be found. Head back to raingen, the physics-driven weather and environment sound engine, or open the 4D Composer.">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#000000">
+<!-- GitHub Pages serves this page for a missing URL at any depth, so every URL here is absolute
+     under the site's path. When the site is served from a server root instead (local preview),
+     the script below rewrites them to start at "/". -->
+<script>
+  (function () {
+    var site = '/RainGen-RainGenerator/';
+    var root = location.pathname.indexOf(site) === 0 ? site : '/';
+    var d = document.documentElement;
+    d.classList.add('js');
+    d.setAttribute('data-root', root);
+    [['icon', 'assets/favicon.svg', 'image/svg+xml'], ['stylesheet', 'assets/site.css']].forEach(function (l) {
+      var el = document.createElement('link');
+      el.rel = l[0];
+      el.href = root + l[1];
+      if (l[2]) el.type = l[2];
+      if (l[0] === 'stylesheet') el.setAttribute('blocking', 'render');
+      document.head.appendChild(el);
+    });
+  })();
+</script>
+<noscript>
+  <link rel="icon" href="/RainGen-RainGenerator/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/RainGen-RainGenerator/assets/site.css">
+</noscript>
+<style>body { background: #000; color: #f5f7fa; }</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="/RainGen-RainGenerator/" aria-label="raingen, home">
+      <svg viewBox="0 0 64 64" width="22" height="22" aria-hidden="true"><path d="M32 5C32 5 14 27 14 40a18 18 0 0 0 36 0C50 27 32 5 32 5Z" fill="#f5f7fa"/><path d="M21 41h5l3-7 4 13 4-17 3.5 13 2-2.5H48" fill="none" stroke="#000" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>raingen</span>
+    </a>
+  </div>
+</header>
+<main id="main" class="notfound">
+  <div class="wrap">
+    <p class="code">Error 404</p>
+    <h1>This page blew away.</h1>
+    <p class="lede">The link may be old, or the address mistyped. The weather is still where you left it.</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="/RainGen-RainGenerator/">Back to raingen</a>
+      <a class="btn btn-secondary" href="/RainGen-RainGenerator/studio/">Open the Composer</a>
+    </div>
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <span>© 2026 Ahmad Hassan. Released under the MIT licence.</span>
+    <nav class="footer-links" aria-label="Project"><a href="https://github.com/AhmadHassan-BTed/RainGen-RainGenerator">GitHub</a></nav>
+  </div>
+</footer>
+<script>
+  (function () {
+    var site = '/RainGen-RainGenerator/';
+    var root = document.documentElement.getAttribute('data-root');
+    if (!root || root === site) return;
+    document.querySelectorAll('a[href^="' + site + '"]').forEach(function (a) {
+      a.setAttribute('href', root + a.getAttribute('href').slice(site.length));
+    });
+  })();
+</script>
+</body>
+</html>

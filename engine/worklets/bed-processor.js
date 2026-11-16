@@ -1,5 +1,5 @@
 /**
- * rg-bed: far-field rain bed and drizzle hiss (MASTER_PLAN §3.5, §3.8, §4.2).
+ * rg-bed: far-field rain bed and drizzle hiss.
  *
  * The far field (beyond ~12 listener heights) holds >10^5 impacts per second, so it is
  * rendered as a statistically exact diffuse texture: every output channel is an independent
@@ -168,6 +168,9 @@ class BedProcessor extends AudioWorkletProcessor {
     let s = 0;
     for (const w of this.wts) s += w * w;
     this.wnorm = 1 / Math.sqrt(s);
+    this.ouN = 0;
+    this.ouA = new Float64Array(5);
+    this.ouS = new Float64Array(5);
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d && d.type === 'config' && d.config && d.config.seed !== undefined) {
@@ -210,19 +213,28 @@ class BedProcessor extends AudioWorkletProcessor {
     }
     const crRate = 1500 * density;
     const drRate = 3000;
+    // OU decay / drive coefficients depend only on the quantum length: computed once per length.
+    if (N !== this.ouN) {
+      this.ouN = N;
+      for (let k = 0; k < 5; k++) {
+        const a = Math.exp(-dt / (k < 4 ? this.taus[k] : 3));
+        this.ouA[k] = a;
+        this.ouS[k] = Math.sqrt(1 - a * a);
+      }
+    }
+    const ouA = this.ouA;
+    const ouS = this.ouS;
     for (let c = 0; c < nch; c++) {
       const ch = this.chans[c];
       const rng = ch.rng;
       let z = 0;
       for (let k = 0; k < 4; k++) {
-        const a = Math.exp(-dt / this.taus[k]);
-        ch.ou[k] = ch.ou[k] * a + Math.sqrt(1 - a * a) * rng.normal();
+        ch.ou[k] = ch.ou[k] * ouA[k] + ouS[k] * rng.normal();
         z += this.wts[k] * ch.ou[k];
       }
       z *= this.wnorm;
       const mod = Math.pow(10, (depth * z) / 20);
-      const da = Math.exp(-dt / 3);
-      ch.dou[0] = ch.dou[0] * da + Math.sqrt(1 - da * da) * rng.normal();
+      ch.dou[0] = ch.dou[0] * ouA[4] + ouS[4] * rng.normal();
       const dmod = Math.pow(10, (0.8 * depth * ch.dou[0]) / 20);
       if (bedAmp > 1e-9) {
         const n = rng.poisson(crRate * dt);

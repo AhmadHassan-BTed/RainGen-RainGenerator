@@ -1,11 +1,12 @@
 /**
- * Weather physics for the browser engine (JavaScript port of MASTER_PLAN §3).
+ * Weather physics for the browser engine, matching the raingen Python reference engine.
  *
- * - Fall speed: Atlas, Srivastava & Sekhon (1973), v = 9.65 - 10.3 exp(-0.6 D) m/s.
- *   Hail: Matson & Huggins (1980), v = 11.45 sqrt(D_cm) m/s.
+ * - Fall speed: Atlas, Srivastava & Sekhon (1973), v = 9.65 - 10.3 exp(-0.6 D) m/s from 0.5 mm,
+ *   Stokes drag below 0.1 mm and a linear bridge between. Hail: Matson & Huggins (1980),
+ *   v = 11.45 sqrt(D_cm) m/s.
  * - Drop-size distribution: normalized gamma (Testud et al. 2001; Bringi et al. 2003),
  *   N(D) = Nw f(mu) (D/Dm)^mu exp(-(4+mu) D/Dm); Marshall & Palmer (1948) as an option.
- *   Rain rate R = 6 pi 1e-4 ∫ D^3 v(D) N(D) dD (mm/h, D in mm).
+ *   Rain rate R = 6 pi 1e-4 ∫ D^3 v(D) N(D) dD (mm/h, D in mm); Nw closes the rate.
  * - Acoustic drop classes: Medwin, Nystuen et al. (1992) boundaries 0.8/1.1/2.2/3.5 mm
  *   (or Nystuen 0.8/1.2/2.0/3.5 mm). Class impact flux = ∫ N(D) v(D) dD (m^-2 s^-1).
  * - Drop impact force: Gordillo, Sun & Cheng (2018), F_max ~ 0.83 rho D^2 V^2, width ~ D/V.
@@ -258,10 +259,34 @@ export function absorptionCutoffHz(distanceM, tC = 20, rh = 70, db = 3, fMax = 2
 // Drops: fall speed, force, DSD, classes
 // ---------------------------------------------------------------------------
 
-/** Atlas et al. (1973) terminal fall speed (m/s) for diameter in mm. */
+const RHO_AIR = 1.204; // kg/m^3 at 20 C, 1013 hPa
+const MU_AIR = 1.81e-5; // dynamic viscosity of air, Pa s (~15 C)
+const D_STOKES_MM = 0.1; // below: Stokes regime
+const D_ATLAS_MM = 0.5; // above: Atlas et al. (1973)
+const STOKES_K = (G * 1e-6 * (RHO_WATER - RHO_AIR)) / (18 * MU_AIR); // v = K d_mm^2
+const V_STOKES_EDGE = STOKES_K * D_STOKES_MM * D_STOKES_MM;
+const V_ATLAS_EDGE = 9.65 - 10.3 * Math.exp(-0.6 * D_ATLAS_MM);
+const BRIDGE_SLOPE = (V_ATLAS_EDGE - V_STOKES_EDGE) / (D_ATLAS_MM - D_STOKES_MM);
+
+/**
+ * Terminal fall speed (m/s) of a raindrop of diameter dMm: Atlas, Srivastava & Sekhon (1973)
+ * v = 9.65 - 10.3 exp(-0.6 D) from 0.5 mm, Stokes drag below 0.1 mm and a linear bridge in
+ * between (within 3 % of Gunn & Kinzer 1949). Sea-level air by default; `rhoAir` (kg/m^3)
+ * applies the Foote & du Toit (1969) correction v = v0 (rho0 / rho)^0.4.
+ */
+export function fallSpeed(dMm, rhoAir) {
+  const d = num(dMm, 1);
+  let v;
+  if (d >= D_ATLAS_MM) v = Math.max(0, 9.65 - 10.3 * Math.exp(-0.6 * d));
+  else if (d >= D_STOKES_MM) v = V_STOKES_EDGE + BRIDGE_SLOPE * (d - D_STOKES_MM);
+  else v = d > 0 ? STOKES_K * d * d : 0;
+  if (rhoAir !== undefined && rhoAir !== null) v *= Math.pow(RHO_AIR / Math.max(num(rhoAir, RHO_AIR), 1e-3), 0.4);
+  return v;
+}
+
+/** Terminal fall speed (m/s) for diameter in mm: the Atlas et al. (1973) law of fallSpeed(). */
 export function atlasFallSpeed(dMm) {
-  const d = Math.max(0, num(dMm, 1));
-  return Math.max(0.05, 9.65 - 10.3 * Math.exp(-0.6 * d));
+  return Math.max(0.05, fallSpeed(Math.max(0, num(dMm, 1))));
 }
 
 /** Hail terminal speed (m/s), Matson & Huggins (1980): 11.45 sqrt(D_cm). */
@@ -312,20 +337,39 @@ export function gammaFn(x) {
   return Math.sqrt(2 * Math.PI) * Math.pow(t, x + 0.5) * Math.exp(-t) * a;
 }
 
-/** f(mu) of the normalized gamma DSD. */
+/** f(mu) of the normalized gamma DSD: 6/4^4 (4+mu)^(mu+4) / Gamma(mu+4). */
 export function fMu(mu) {
-  return (6 / 256) * (Math.pow(4 + mu, mu + 4) / gammaFn(mu + 4));
+  return (6 / 256) * Math.exp((mu + 4) * Math.log(4 + mu) - logGamma(mu + 4));
+}
+
+/** ln Gamma(x) for x > 0 (Lanczos, g = 7). */
+function logGamma(x) {
+  if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - logGamma(1 - x);
+  const c = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
+    12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+  ];
+  const y = x - 1;
+  let a = c[0];
+  const t = y + 7.5;
+  for (let i = 1; i < 9; i++) a += c[i] / (y + i);
+  return 0.5 * Math.log(2 * Math.PI) + (y + 0.5) * Math.log(t) - t + Math.log(a);
 }
 
 /**
- * Drop-character clusters (Bringi et al. 2003): Dm grows weakly with rate and saturates.
- * fine ~ stratiform, normal ~ maritime convective, fat ~ continental convective.
+ * Drop-size regimes: Dm = a R^b mm with a soft saturation at `cap` (sharpness p), mu = 3.
+ * 'fine' and 'fat' sit on the Bringi et al. (2003) maritime and continental convective cluster
+ * centres at ~30 mm/h (Dm 1.62 / 2.40 mm, log10 Nw 4.25 / 3.48); 'normal' is stratiform /
+ * mid-latitude rain (D0 ~1.7-2.0 mm in heavy rain). In heavy rain extra rate comes mostly from
+ * more drops, so Dm saturates; fine < normal < fat holds at every rate.
  */
-export const DROP_CHARACTER = {
-  fine: { a: 0.92, b: 0.12, mu: 6, dmMax: 1.6, label: 'stratiform' },
-  normal: { a: 1.18, b: 0.13, mu: 3, dmMax: 2.0, label: 'maritime' },
-  fat: { a: 1.55, b: 0.14, mu: 1, dmMax: 2.75, label: 'continental' },
+export const DROP_REGIMES = {
+  fine: { a: 0.85, b: 0.206, cap: 1.85, p: 8, mu: 3, label: 'maritime convective' },
+  normal: { a: 1.0, b: 0.2, cap: 2.25, p: 4, mu: 3, label: 'stratiform' },
+  fat: { a: 1.39, b: 0.17, cap: 2.9, p: 8, mu: 3, label: 'continental convective' },
 };
+export const DROP_CHARACTER = DROP_REGIMES;
+const DM_FLOOR_MM = 0.35;
 
 export const CLASS_BOUNDARIES = {
   medwin: [0.8, 1.1, 2.2, 3.5],
@@ -333,84 +377,188 @@ export const CLASS_BOUNDARIES = {
 };
 export const CLASS_NAMES = ['minuscule', 'small', 'mid', 'large', 'very_large'];
 
-/** Number density N(D) in m^-3 mm^-1. */
-export function dsdDensity(dsd, D) {
-  if (!dsd || !(dsd.nw > 0) || D <= 0) return 0;
-  if (dsd.model === 'marshall_palmer') return dsd.n0 * Math.exp(-dsd.lambda * D);
-  const x = D / dsd.dm;
-  return dsd.nw * dsd.fmu * Math.pow(x, dsd.mu) * Math.exp(-(4 + dsd.mu) * x);
-}
+const RATE_CONST = 6 * Math.PI * 1e-4; // mm^3 m^-3 (m/s) -> mm/h
+const TABLE_INTERVALS = 768;
+const GRID_BREAKS = [D_STOKES_MM, D_ATLAS_MM, 0.8, 1.1, 1.2, 2.0, 2.2, 3.5];
+const GRID_CACHE = new Map();
 
-function simpson(fn, a, b, n = 48) {
-  if (!(b > a)) return 0;
-  if (n % 2) n++;
-  const h = (b - a) / n;
-  let s = fn(a) + fn(b);
-  for (let i = 1; i < n; i++) s += (i % 2 ? 4 : 2) * fn(a + i * h);
-  return (s * h) / 3;
-}
-
-/** Rain rate (mm/h) carried by a DSD. */
-export function rainRateFromDsd(dsd) {
-  return 6 * Math.PI * 1e-4 * simpson((D) => D * D * D * atlasFallSpeed(D) * dsdDensity(dsd, D), dsd.dMin, dsd.dMax, 96);
+/**
+ * Integration grid on [dMin, dMax]: 768 uniform intervals plus every class edge of both
+ * boundary schemes and the fall-speed breakpoints, so class fluxes are exact trapezoid sums.
+ * Holds d, ln d, d^3 and v(d); cached per cutoff pair.
+ */
+function dsdGrid(dMin, dMax) {
+  const key = `${dMin}|${dMax}`;
+  let g = GRID_CACHE.get(key);
+  if (g) return g;
+  const pts = [];
+  const step = (dMax - dMin) / TABLE_INTERVALS;
+  for (let i = 0; i < TABLE_INTERVALS; i++) pts.push(dMin + i * step);
+  pts.push(dMax);
+  for (const b of GRID_BREAKS) if (b > dMin && b < dMax) pts.push(b);
+  pts.sort((a, b) => a - b);
+  const d = [];
+  for (const p of pts) if (!d.length || p !== d[d.length - 1]) d.push(p);
+  const n = d.length;
+  g = { n, d: Float64Array.from(d), lnd: new Float64Array(n), d3: new Float64Array(n), v: new Float64Array(n) };
+  for (let i = 0; i < n; i++) {
+    const x = g.d[i];
+    g.lnd[i] = Math.log(x);
+    g.d3[i] = x * x * x;
+    g.v[i] = fallSpeed(x);
+  }
+  if (GRID_CACHE.size > 32) GRID_CACHE.clear();
+  GRID_CACHE.set(key, g);
+  return g;
 }
 
 /**
- * Build a DSD that carries `rate` mm/h.
- * opts: { drops: 'fine'|'normal'|'fat', model: 'gamma'|'marshall_palmer', mu, dm, nw, dMin, dMax, dmScale }
+ * Trapezoid integrals of the unit-Nw shape f(mu) (D/Dm)^mu exp(-(4+mu) D/Dm) on the grid:
+ * rate = Int D^3 v N dD; with `bins` (4 class edges) also per-class flux = Int v N dD and
+ * first moment Int D v N dD written into `out`.
+ */
+function shapeIntegrals(dm, mu, dMin, dMax, bins, out) {
+  const g = dsdGrid(dMin, dMax);
+  const { n, d, lnd, d3, v } = g;
+  const fm = fMu(mu);
+  const lndm = Math.log(dm);
+  const k = (4 + mu) / dm;
+  let rate = 0;
+  let pf = fm * Math.exp(mu * (lnd[0] - lndm) - k * d[0]) * v[0];
+  if (out) {
+    out.flux.fill(0);
+    out.m1.fill(0);
+  }
+  for (let i = 1; i < n; i++) {
+    const f = fm * Math.exp(mu * (lnd[i] - lndm) - k * d[i]) * v[i];
+    const h = 0.5 * (d[i] - d[i - 1]);
+    rate += h * (pf * d3[i - 1] + f * d3[i]);
+    if (out) {
+      const mid = 0.5 * (d[i] + d[i - 1]);
+      const c = mid < bins[0] ? 0 : mid < bins[1] ? 1 : mid < bins[2] ? 2 : mid < bins[3] ? 3 : 4;
+      out.flux[c] += h * (pf + f);
+      out.m1[c] += h * (pf * d[i - 1] + f * d[i]);
+    }
+    pf = f;
+  }
+  return rate;
+}
+
+function nullable(x) {
+  if (x === null || x === undefined || x === '') return null;
+  const v = Number(x);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** Dm (mm) such that the DSD with fixed Nw carries `rate` mm/h (rate grows monotonically with Dm). */
+function solveDm(nw, mu, dMin, dMax, rate) {
+  let lo = Math.log(0.1);
+  let hi = Math.log(8);
+  for (let i = 0; i < 48; i++) {
+    const mid = 0.5 * (lo + hi);
+    if (nw * RATE_CONST * shapeIntegrals(Math.exp(mid), mu, dMin, dMax) < rate) lo = mid;
+    else hi = mid;
+  }
+  return Math.exp(0.5 * (lo + hi));
+}
+
+/** Number density N(D) in m^-3 mm^-1 (zero outside the cutoffs). */
+export function dsdDensity(dsd, D) {
+  if (!dsd || !(dsd.nw > 0) || !(D > 0) || D < dsd.dMin || D > dsd.dMax) return 0;
+  const x = D / dsd.dm;
+  return dsd.nw * dsd.fmu * Math.exp(dsd.mu * Math.log(x) - (4 + dsd.mu) * x);
+}
+
+/** Rain rate (mm/h) carried by a DSD: 6 pi 1e-4 Int D^3 v(D) N(D) dD. */
+export function rainRateFromDsd(dsd) {
+  if (!dsd || !(dsd.nw > 0) || !(dsd.dm > 0) || !(dsd.dMax > dsd.dMin)) return 0;
+  return RATE_CONST * dsd.nw * shapeIntegrals(dsd.dm, dsd.mu, dsd.dMin, dsd.dMax);
+}
+
+/**
+ * Build the normalized-gamma DSD (Testud et al. 2001; Bringi et al. 2003) that carries `rate` mm/h.
+ *
+ * Dm follows the drop regime and saturates (DROP_REGIMES); drizzle uses Dm 0.25-0.5 mm on
+ * 0.1-1.2 mm drops; Marshall & Palmer (1948) uses Lambda = 4.1 R^-0.21 (mu = 0). Nw is then solved
+ * so that rainRateFromDsd(dsd) == rate (closure). Overrides: `mu` (clamped to -3..20), `dm`, `nw`
+ * (with nw pinned and dm free, Dm is solved instead). `dmScale` moves Dm (size sorting along a
+ * storm arc) with Nw re-solved, unless dm or nw is pinned or the type is drizzle.
+ *
+ * opts: { type, drops: 'fine'|'normal'|'fat', model: 'gamma'|'marshall_palmer', mu, dm, nw, dMin, dMax, dmScale }
  */
 export function dsdFromRate(rate, opts = {}) {
+  const o = opts || {};
   const R = Math.max(0, num(rate, 0));
-  const ch = DROP_CHARACTER[opts.drops] || DROP_CHARACTER.normal;
-  const dMin = clamp(num(opts.dMin, 0.3), 0.05, 2);
-  const dMax = clamp(num(opts.dMax, 6), dMin + 0.2, 8);
-  const dmScale = clamp(num(opts.dmScale, 1), 0.3, 3);
-  if (opts.model === 'marshall_palmer') {
-    const lambda = R > 0 ? 4.1 * Math.pow(R, -0.21) / Math.sqrt(dmScale) : 4.1;
-    const dsd = { model: 'marshall_palmer', n0: R > 0 ? 8000 : 0, lambda, nw: R > 0 ? 8000 : 0, dm: 4 / lambda, mu: 0, fmu: 1, dMin, dMax, rate: R };
-    if (R > 0 && dmScale !== 1) {
-      const r1 = rainRateFromDsd(dsd);
-      if (r1 > 0) dsd.n0 *= R / r1;
-      dsd.nw = dsd.n0;
+  const type = String(o.type || 'rain').toLowerCase();
+  const drizzle = type === 'drizzle' || type === 'freezing_drizzle';
+  const model = String(o.model || 'gamma').toLowerCase().replace(/-/g, '_');
+  const mp = model === 'marshall_palmer' || model === 'mp' || model === 'marshallpalmer';
+  let dMin = Math.max(num(o.dMin, 0.3), 0.01);
+  let dMax = Math.max(num(o.dMax, 6), dMin + 0.05);
+  const Rc = Math.max(R, 1e-3);
+  let dm;
+  let mu;
+  if (drizzle) {
+    dm = clamp(0.35 * Math.pow(Rc / 0.2, 0.08), 0.25, 0.5);
+    mu = 3;
+    dMin = Math.min(dMin, 0.1);
+    dMax = Math.max(Math.min(dMax, 1.2), dMin + 0.05);
+  } else if (mp) {
+    dm = 4 / (4.1 * Math.pow(Rc, -0.21));
+    mu = 0;
+  } else {
+    const r = DROP_REGIMES[o.drops] || DROP_REGIMES.normal;
+    const x = r.a * Math.pow(Rc, r.b);
+    dm = Math.max(DM_FLOOR_MM, x / Math.pow(1 + Math.pow(x / r.cap, r.p), 1 / r.p));
+    mu = r.mu;
+  }
+  const muO = nullable(o.mu);
+  const dmO = nullable(o.dm);
+  const nwO = nullable(o.nw);
+  if (muO !== null) mu = muO;
+  mu = clamp(mu, -3, 20);
+  if (dmO !== null) dm = Math.max(dmO, 0.05);
+  const dmScale = clamp(num(o.dmScale, 1), 0.3, 3);
+  if (R > 0 && Math.abs(dmScale - 1) > 1e-3 && dmO === null && nwO === null && !drizzle) dm = Math.max(dm * dmScale, 0.05);
+
+  let nw = 0;
+  if (R > 0 && type !== 'none') {
+    if (nwO !== null) {
+      nw = Math.max(nwO, 0);
+      if (dmO === null && nw > 0) dm = solveDm(nw, mu, dMin, dMax, R);
+    } else {
+      const r1 = RATE_CONST * shapeIntegrals(dm, mu, dMin, dMax);
+      nw = r1 > 0 ? R / r1 : 0;
     }
-    return dsd;
   }
-  const mu = clamp(num(opts.mu, ch.mu), -2, 15);
-  const dmAuto = R > 0 ? clamp(ch.a * Math.pow(R, ch.b), 0.35, ch.dmMax) : ch.a;
-  const dm = clamp(num(opts.dm, dmAuto * dmScale), 0.2, 4.5);
-  const dsd = { model: 'gamma', nw: 1, dm, mu, fmu: fMu(mu), dMin, dMax, rate: R };
-  if (R <= 0) {
-    dsd.nw = 0;
-    return dsd;
-  }
-  if (Number.isFinite(Number(opts.nw)) && Number(opts.nw) > 0) {
-    dsd.nw = Number(opts.nw);
-    return dsd;
-  }
-  const r1 = rainRateFromDsd(dsd);
-  dsd.nw = r1 > 0 ? R / r1 : 0;
-  return dsd;
+  const fmu = fMu(mu);
+  return { model: mp ? 'marshall_palmer' : 'gamma', nw, dm, mu, fmu, n0: nw * fmu, lambda: (4 + mu) / dm, dMin, dMax, rate: R };
 }
 
 /**
- * Impact flux (m^-2 s^-1), flux-weighted mean diameter (mm) and fall speed per acoustic class.
- * Returns 5 entries: minuscule, small, mid, large, very_large.
+ * Impact flux (m^-2 s^-1), flux-weighted mean diameter (mm) and fall speed per acoustic class:
+ * Medwin, Nystuen et al. (1992) boundaries 0.8 / 1.1 / 2.2 / 3.5 mm, or Nystuen (2001)
+ * 0.8 / 1.2 / 2.0 / 3.5 mm. Returns 5 entries: minuscule, small, mid, large, very_large.
  */
 export function classFlux(dsd, boundaries = 'medwin') {
   const b = CLASS_BOUNDARIES[boundaries] || CLASS_BOUNDARIES.medwin;
   const edges = [dsd.dMin, b[0], b[1], b[2], b[3], dsd.dMax];
+  let acc = null;
+  if (dsd.nw > 0 && dsd.dm > 0 && dsd.dMax > dsd.dMin) {
+    acc = { flux: new Float64Array(5), m1: new Float64Array(5) };
+    shapeIntegrals(dsd.dm, dsd.mu, dsd.dMin, dsd.dMax, b, acc);
+  }
   const out = [];
   for (let c = 0; c < 5; c++) {
     const lo = Math.max(edges[c], dsd.dMin);
     const hi = Math.min(edges[c + 1], dsd.dMax);
     const mid = 0.5 * (edges[c] + edges[c + 1]);
-    if (!(hi > lo) || !(dsd.nw > 0)) {
+    const flux = acc && hi > lo ? dsd.nw * acc.flux[c] : 0;
+    if (!(flux > 0)) {
       out.push({ name: CLASS_NAMES[c], lo: edges[c], hi: edges[c + 1], flux: 0, d: clamp(mid, 0.1, 6), v: atlasFallSpeed(mid) });
       continue;
     }
-    const flux = simpson((D) => dsdDensity(dsd, D) * atlasFallSpeed(D), lo, hi, 24);
-    const m1 = simpson((D) => D * dsdDensity(dsd, D) * atlasFallSpeed(D), lo, hi, 24);
-    const d = flux > 1e-12 ? m1 / flux : 0.5 * (lo + hi);
+    const d = acc.flux[c] > 1e-300 ? clamp(acc.m1[c] / acc.flux[c], lo, hi) : 0.5 * (lo + hi);
     out.push({ name: CLASS_NAMES[c], lo, hi, flux, d, v: atlasFallSpeed(d) });
   }
   return out;
@@ -446,19 +594,13 @@ export function totalFlux(classes, dMinMm = 0) {
 export function resolvePrecipitation(type, rate, opts = {}) {
   const t = String(type || 'rain').toLowerCase();
   const R = Math.max(0, num(rate, 0));
-  const o = { ...opts };
+  const o = { ...opts, type: t };
   let kinds = [0, 0, 0, 0, 0, 1];
   let liquidRate = R;
   let hailFlux = 0;
   let hailD = clamp(num(opts.hailSizeMm, 13), 5, 80);
   if (t === 'none' || R <= 0) {
     liquidRate = 0;
-  } else if (t === 'drizzle' || t === 'freezing_drizzle') {
-    o.drops = 'fine';
-    o.dm = Math.min(num(opts.dm, 0.45), 0.6);
-    o.mu = num(opts.mu, 4);
-    o.dMin = Math.min(num(opts.dMin, 0.1), 0.15);
-    o.dMax = Math.min(num(opts.dMax, 1.2), 1.4);
   } else if (t === 'hail') {
     liquidRate = R * 0.6;
     const vol = (Math.PI / 6) * Math.pow(hailD * 1e-3, 3);
@@ -605,8 +747,8 @@ function bump(p, c, w) {
 }
 
 /**
- * Storm-arc envelope (MASTER_PLAN §3.4): sparse big drops -> downpour (Dm falls while
- * count rises) -> stratiform tail -> drips. Returns multipliers for rain rate, Dm, wind
+ * Storm-arc envelope: sparse big drops -> downpour (Dm falls while the drop count rises)
+ * -> stratiform tail -> drips. Returns multipliers for rain rate, Dm, wind
  * and thunder rate, plus progress 0..1 through the arc.
  */
 export function stormArcEnvelope(arc, tSec, arcMinutes = 20) {
@@ -685,7 +827,7 @@ export function showerEnvelope(key, tSec, character = 'continuous', periodMin = 
 }
 
 // ---------------------------------------------------------------------------
-// Wetness stores (dry -> film -> puddle), MASTER_PLAN §3.3
+// Wetness stores (dry -> film -> puddle)
 // ---------------------------------------------------------------------------
 
 /** Equilibrium film wetness 0..1 and puddle depth (mm) for a rain rate. */
@@ -709,7 +851,7 @@ export function stepWetness(state, rate, dt, aftermathTauMin = 8) {
 }
 
 // ---------------------------------------------------------------------------
-// Materials: modal banks for the rain-surface worklet (MASTER_PLAN §3.3, §5.2)
+// Materials: modal banks for the rain-surface worklet
 // ---------------------------------------------------------------------------
 
 /**

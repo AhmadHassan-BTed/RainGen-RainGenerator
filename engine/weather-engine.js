@@ -1,27 +1,28 @@
 /**
  * WeatherEngine: the real-time browser port of the raingen weather & environment sound
- * engine (MASTER_PLAN Part 2, §7 physics and §9 architecture).
+ * engine.
  *
- * - Control pre-pass at 20 Hz in f64 on the main thread (§9.1): normalized-gamma drop-size
- *   distribution per drop character and storm arc (Bringi et al. 2003), Medwin class impact
+ * - Control pre-pass at 20 Hz in f64 on the main thread: normalized-gamma drop-size
+ *   distribution per drop regime and storm arc (Bringi et al. 2003), Medwin class impact
  *   fluxes, Atlas fall speeds, shower-cell envelopes, wetness stores, normalized Kaimal gusts
  *   advected across the scene by Taylor's hypothesis, log-law wind at each emitter height,
  *   ISO 9613-1 absorption cutoffs.
- * - Level of detail (§7.5): resonant objects and 8 azimuth x 3 distance ground patches within
+ * - Level of detail: resonant objects and 8 azimuth x 3 distance ground patches within
  *   ~3-9 listener heights are rain-surface worklets driven as Cox processes; the far field is a
  *   decorrelated 4-channel bed whose level follows the near field (monopole-like water surfaces
  *   carry a larger share).
- * - Spatial rendering (§9.3): every voice -> PannerNode (HRTF in binaural mode, equal-power in
+ * - Spatial rendering: every voice -> PannerNode (HRTF in binaural mode, equal-power in
  *   stereo, inverse distance law); world (x east, y north, z up) -> Web Audio (x, z, -y).
- * - Places and shelters (§7.9): near interior panels (umbrella, tent, car, porch, attic, room
+ * - Places and shelters: near interior panels (umbrella, tent, car, porch, attic, room
  *   window) plus an exterior heard through an envelope transmission loss (low-pass, shelf, loss;
  *   window opening blends) and a generated room impulse response.
- * - Thunder (§7.7, §9.5): flashes scheduled per storm with counter-based thinning; fractal
+ * - Thunder: flashes scheduled per storm with counter-based thinning; fractal
  *   channels and rolls are synthesized ahead of their arrival, never in the audio callback;
  *   'flash' events are rate-limited for photosensitive safety (merged strokes, <= 3/s).
- * - Master: stems -> safety limiter (-1 dBFS) and soft clip -> analyser; momentary loudness from
- *   BS.1770 K-weighting (two biquads) for the meter.
- * - Determinism (§9.4): randomness is counter-based on the scene seed; offline renders drive the
+ * - Master: stems -> safety limiter (-1 dBFS threshold) and a soft clip whose output never
+ *   exceeds -1 dBFS -> analyser; momentary loudness from BS.1770 K-weighting (two biquads)
+ *   for the meter.
+ * - Determinism: randomness is counter-based on the scene seed; offline renders drive the
  *   same graph with automation curves computed by the same control model.
  */
 
@@ -73,7 +74,7 @@ import { compassName } from './units.js';
 // Constants
 // ---------------------------------------------------------------------------
 
-const PROC = { rain: 'rg-rain-surface', wind: 'rg-wind', bed: 'rg-bed' };
+const PROC = { rain: 'rg-rain-surface', wind: 'rg-wind', bed: 'rg-bed', bus: 'rg-weather' };
 const MODULES = ['./worklets/rain-surface-processor.js', './worklets/wind-processor.js', './worklets/bed-processor.js'];
 const CONTROL_HZ = 20;
 const OFFLINE_CHUNK_SEC = 4;
@@ -93,18 +94,22 @@ const TARGET_WIND_DB = -26; // wind 'air' layer at 8 m/s (scale 1)
 const CAL_AREA = 4;
 const RN = ['r0', 'r1', 'r2', 'r3', 'r4', 'r5'];
 const DN = ['d0', 'd1', 'd2', 'd3', 'd4', 'd5'];
+// Rain surfaces carry only their own drive; the weather they share (class impact rates and
+// diameters, wetness, puddles, liquid rate) is one set of parameters on the rg-weather bus node.
 const PARAM_NAMES = {
-  rain: [...RN, ...DN, 'intensity', 'wind', 'wetness', 'puddle', 'flow', 'gain'],
+  rain: ['intensity', 'wind', 'gain'],
   wind: ['wind', 'gain', 'aux'],
   bed: ['level', 'cutoff', 'drizzle', 'density', 'intensity', 'gain', 'depth'],
+  bus: [...RN, ...DN, 'wetness', 'puddle', 'liquid'],
 };
 const RANGE = {
-  rain: { intensity: [0, 100], wind: [0, 200], wetness: [0, 1], puddle: [0, 2000], flow: [0, 2000], gain: [0, 1000] },
+  rain: { intensity: [0, 100], wind: [0, 200], gain: [0, 1000] },
+  bus: { wetness: [0, 1], puddle: [0, 2000], liquid: [0, 2000] },
   wind: { wind: [0, 200], gain: [0, 1000], aux: [-1000, 1000] },
   bed: { level: [0, 100], cutoff: [100, 24000], drizzle: [0, 100], density: [0, 100], intensity: [0, 100], gain: [0, 1000], depth: [0, 12] },
 };
 // Level of wind-driven objects relative to the 'air' layer, at 1 m from their effective
-// radius (extended sources: a whole crown, a whole span). Provisional, to be matched to recordings.
+// radius (extended sources: a whole crown, a whole span).
 const TYPE_GAIN = { air: 1, tree: 12, grass: 3, wire: 5, flag: 3, chime: 2, wiper: 1.5 };
 const MODE_GAINS = {
   none: {},
@@ -553,7 +558,7 @@ function rampFor(path, scene) {
 }
 
 // ---------------------------------------------------------------------------
-// Control model (class A/B state of MASTER_PLAN §9.4)
+// Control model: smoothed scene values plus evolving state (gusts, wetness)
 // ---------------------------------------------------------------------------
 
 class ControlModel {
@@ -654,7 +659,7 @@ class ControlModel {
     return this._pVal;
   }
 
-  /** Advance class-B state by dt and return the control snapshot for scene time t. */
+  /** Advance the evolving state (gusts, wetness) by dt and return the control snapshot for scene time t. */
   compute(S, t, dt) {
     this.stepLive(dt);
     this.tau += Math.max(0, dt);
@@ -985,6 +990,7 @@ function rainSpec(pc, key, objectId, o) {
     flow: o.flow || null,
     prefill: true,
   };
+  for (const f of ['wetMul', 'puddleMul', 'flowMul']) if (o[f] !== undefined && o[f] !== null) config[f] = num(o[f], 1);
   const { exposure, area: a2, ...rest } = config;
   const spec = {
     key,
@@ -1006,9 +1012,6 @@ function rainSpec(pc, key, objectId, o) {
       gain: num(o.gain, 1) / ref,
       driven: o.driven || null,
       windH: num(o.windH, 1),
-      wetMul: num(o.wetMul, 1),
-      puddleMul: num(o.puddleMul, 1),
-      flowMul: num(o.flowMul, 1),
       intensity: num(o.intensity, 1),
     },
   };
@@ -1581,24 +1584,8 @@ function voiceParams(spec, ctl, model, env) {
   const pos = specPos(spec, L);
   if (spec.proc === 'rain') {
     const c = spec.ctl;
-    if (spec.config.kind === 'rain') {
-      for (let i = 0; i < 6; i++) {
-        o[RN[i]] = ctl.flux[i];
-        o[DN[i]] = ctl.dcls[i];
-      }
-      o.intensity = c.intensity * (c.driven ? drivenFactor(c.driven, ctl, model, pos, L) : 1);
-      o.flow = 0;
-    } else {
-      for (let i = 0; i < 6; i++) {
-        o[RN[i]] = 0;
-        o[DN[i]] = 0;
-      }
-      o.flow = ctl.liquid * c.flowMul;
-      o.intensity = 1;
-    }
+    o.intensity = spec.config.kind === 'rain' ? c.intensity * (c.driven ? drivenFactor(c.driven, ctl, model, pos, L) : 1) : 1;
     o.wind = windAtHeight(model.windRefAt(pos, ctl, L), c.windH, ctl.z0);
-    o.wetness = ctl.film * c.wetMul;
-    o.puddle = ctl.puddle * c.puddleMul;
     o.gain = c.gain;
   } else if (spec.proc === 'wind') {
     o.wind = model.windRefAt(pos, ctl, L);
@@ -1630,6 +1617,17 @@ function initParams(spec, ctl, model, env) {
   const out = {};
   for (const n of PARAM_NAMES[spec.proc]) out[n] = o[n];
   return out;
+}
+
+/** The shared weather on the rg-weather bus: class impact rates and diameters, wetness, puddles, liquid rate. */
+function busParams(ctl, emit) {
+  for (let i = 0; i < 6; i++) {
+    emit(`bus|${RN[i]}`, clampParam('bus', RN[i], ctl.flux[i]));
+    emit(`bus|${DN[i]}`, clampParam('bus', DN[i], ctl.dcls[i]));
+  }
+  emit('bus|wetness', clampParam('bus', 'wetness', ctl.film));
+  emit('bus|puddle', clampParam('bus', 'puddle', ctl.puddle));
+  emit('bus|liquid', clampParam('bus', 'liquid', ctl.liquid));
 }
 
 function airPan(ctl, L) {
@@ -1795,8 +1793,10 @@ function thunderCaption(fl) {
 
 function softClipCurve(n = 4096) {
   const c = new Float32Array(n);
-  const k = 0.891; // -1 dBFS
-  const top = 0.985;
+  // Linear to -2 dBFS, then a tanh knee that never passes -1 dBFS (the compressor's
+  // 2 ms attack lets transients through; this catches them below the stated ceiling).
+  const k = 0.794;
+  const top = 0.891;
   for (let i = 0; i < n; i++) {
     const x = (i / (n - 1)) * 2 - 1;
     const a = Math.abs(x);
@@ -1805,12 +1805,17 @@ function softClipCurve(n = 4096) {
   return c;
 }
 
+let BUS_SEQ = 0;
+
 class SceneGraph {
   constructor(ctx, o = {}) {
     this.ctx = ctx;
     this.offline = !!o.offline;
     this.renderMode = o.renderMode === 'stereo' ? 'stereo' : 'binaural';
     this.onStats = o.onStats || null;
+    this.statsOn = !!(this.onStats && o.stats);
+    this.busId = `wx${++BUS_SEQ}`;
+    this.bus = null;
     this.voices = new Map();
     this.pmap = new Map();
     this.last = new Map();
@@ -1843,6 +1848,14 @@ class SceneGraph {
   _build(withMeter) {
     const ctx = this.ctx;
     const ny = 0.45 * ctx.sampleRate;
+    // The weather bus: one node holds the parameters every rain surface shares. Its (silent)
+    // output feeds each surface's input, so it renders before them in every quantum.
+    try {
+      this.bus = new AudioWorkletNode(ctx, PROC.bus, { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1], processorOptions: { bus: this.busId } });
+      for (const n of PARAM_NAMES.bus) this._reg(`bus|${n}`, this.bus.parameters.get(n));
+    } catch (e) {
+      this.bus = null;
+    }
     this.ext = {};
     this.int = {};
     this.extBus = this._gain();
@@ -2122,14 +2135,16 @@ class SceneGraph {
   addVoice(spec, init, when, L) {
     const ctx = this.ctx;
     let node;
+    const rain = spec.proc === 'rain';
     try {
       node = new AudioWorkletNode(ctx, PROC[spec.proc], {
-        numberOfInputs: 0,
+        numberOfInputs: rain ? 1 : 0,
         numberOfOutputs: 1,
         outputChannelCount: [spec.channels],
-        processorOptions: spec.config,
+        processorOptions: rain ? { ...spec.config, bus: this.busId, stats: this.statsOn } : spec.config,
         parameterData: init,
       });
+      if (rain && this.bus) this.bus.connect(node);
     } catch (e) {
       if (!this._warned) {
         this._warned = true;
@@ -2215,6 +2230,7 @@ class SceneGraph {
       try {
         v.node.port.onmessage = null;
         v.node.disconnect();
+        if (this.bus && v.spec.proc === 'rain') this.bus.disconnect(v.node);
       } catch (e) {
         /* ignore */
       }
@@ -2234,6 +2250,21 @@ class SceneGraph {
     }
     if (this.offline) this.dead.push(kill);
     else setTimeout(kill, 600);
+  }
+
+  /** Turn the rain surfaces' impact-rate reports (4 per second each) on or off. */
+  setStats(on) {
+    const want = !!(on && this.onStats);
+    if (want === this.statsOn) return;
+    this.statsOn = want;
+    for (const v of this.voices.values()) {
+      if (v.spec.proc !== 'rain') continue;
+      try {
+        v.node.port.postMessage({ type: 'stats', on: want });
+      } catch (e) {
+        /* ignore */
+      }
+    }
   }
 
   post(key, msg) {
@@ -2344,6 +2375,7 @@ class SceneGraph {
       try {
         v.node.port.onmessage = null;
         v.node.disconnect();
+        if (this.bus && v.spec.proc === 'rain') this.bus.disconnect(v.node);
       } catch (e) {
         /* ignore */
       }
@@ -2368,6 +2400,15 @@ class SceneGraph {
       }
     }
     this.thunders.clear();
+    if (this.bus) {
+      try {
+        this.bus.port.postMessage({ type: 'dispose' });
+        this.bus.disconnect();
+      } catch (e) {
+        /* ignore */
+      }
+      this.bus = null;
+    }
     if (this.reverb) this.reverb.disconnect();
     const all = [this.extBus, this.intBus, this.post, this.pre, this.master, this.limiter, this.clip, this.out, this.analyser, ...(this.tlNodes || [])];
     for (const s of STEMS) all.push(this.ext[s], this.int[s]);
@@ -2457,14 +2498,16 @@ function calibrate(sr, base) {
       }
       if (!oc.audioWorklet) return cal;
       await loadModules(oc, base);
-      const pd = { intensity: 1, wind: 0, wetness: 0.5, puddle: 0, flow: 0, gain: 1 };
+      const wx = { wetness: 0.5, puddle: 0, liquid: 0 };
       REF_PRECIP.classes.forEach((c, i) => {
-        pd[RN[i]] = c.flux;
-        pd[DN[i]] = c.d;
+        wx[RN[i]] = c.flux;
+        wx[DN[i]] = c.d;
       });
-      const mk = (proc, ch, po, data) => new AudioWorkletNode(oc, PROC[proc], { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [ch], processorOptions: po, parameterData: data });
+      const mk = (proc, ch, po, data, inputs = 0) => new AudioWorkletNode(oc, PROC[proc], { numberOfInputs: inputs, numberOfOutputs: 1, outputChannelCount: [ch], processorOptions: po, parameterData: data });
       const mats = [buildMaterial('concrete', { seed: 1, salt: 'cal', fraction: 0.5, maxModes: 12 }), buildMaterial('grass', { seed: 1, salt: 'cal', fraction: 0.5, maxModes: 12 })];
-      const rain = mk('rain', 1, { id: 'cal-rain', kind: 'rain', area: CAL_AREA, exposure: 1, maxEventsPerSec: 3000, maxModes: 12, coxDepth: 0, seed: 12345, sharedSeed: 54321, materials: mats }, pd);
+      const bus = mk('bus', 1, { bus: 'cal' }, wx);
+      const rain = mk('rain', 1, { id: 'cal-rain', kind: 'rain', area: CAL_AREA, exposure: 1, maxEventsPerSec: 3000, maxModes: 12, coxDepth: 0, seed: 12345, sharedSeed: 54321, materials: mats, bus: 'cal', stats: false }, { intensity: 1, wind: 0, gain: 1 }, 1);
+      bus.connect(rain);
       const air = mk('wind', 2, { id: 'cal-air', mode: 'air', seed: 777, windScale: 1 }, { wind: 8, gain: 1, aux: 0 });
       const bed = mk('bed', 2, { seed: 99 }, { level: 1, cutoff: 8000, drizzle: 0, density: 1, intensity: 1, gain: 1, depth: 0 });
       const drz = mk('bed', 2, { seed: 98 }, { level: 0, cutoff: 8000, drizzle: 1, density: 1, intensity: 1, gain: 1, depth: 0 });
@@ -2738,6 +2781,7 @@ class OfflineJob {
         a[i] = v;
       };
       emitParams(this.plan, ctl, this.model, env, emit);
+      busParams(ctl, emit);
       masterParams(this.plan, ctl, this.cal, this.mix, this.masterDb, this.ctx.sampleRate, emit);
       listenerParams(L, emit);
       this._flashes(ctl, L, t, t + dt);
@@ -2875,6 +2919,7 @@ export class WeatherEngine {
     if (typeof cb !== 'function') return () => {};
     if (!this._events.has(event)) this._events.set(event, new Set());
     this._events.get(event).add(cb);
+    if (event === 'impact-stats' && this._graph) this._graph.setStats(true);
     return () => this.off(event, cb);
   }
 
@@ -2883,6 +2928,7 @@ export class WeatherEngine {
     if (!s) return;
     if (cb) s.delete(cb);
     else s.clear();
+    if (event === 'impact-stats' && this._graph) this._graph.setStats(this._has('impact-stats'));
   }
 
   _emit(event, payload) {
@@ -2957,6 +3003,7 @@ export class WeatherEngine {
       this._graph = new SceneGraph(ctx, {
         renderMode: this._renderModeNow(),
         onStats: (spec, rate) => this._onStats(spec, rate),
+        stats: this._has('impact-stats'),
       });
       this._lastCtxT = ctx.currentTime;
       this._plan = null;
@@ -3240,6 +3287,7 @@ export class WeatherEngine {
       const env = this._env(L);
       const emit = (k, v) => g.set(k, v, now, 0.05);
       emitParams(this._plan, ctl, this._model, env, emit);
+      busParams(ctl, emit);
       masterParams(this._plan, ctl, this._cal, this._mix, this._masterDb, ctx.sampleRate, emit);
       listenerParams(L, (k, v) => g.set(k, v, now, 0.03));
       this._thunderTick(ctl, L, t, now);

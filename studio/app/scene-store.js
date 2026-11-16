@@ -1,10 +1,12 @@
 /**
  * Scene state for the 4D Environment Composer: the open `rainscene` v1 JSON
- * (identical in browser, Python CLI and desktop), a parameter manifest
- * (MASTER_PLAN 6.8), the Auto / Offset / Pinned model (MASTER_PLAN 6.6:
- * resolved = pinned ? user : clamp(driver + offset), offsets stored in
- * perceptual units), undo/redo with one-gesture-one-step, localStorage
- * autosave, user presets, URL-hash sharing and JSON import/export.
+ * (the same file the Python CLI reads), a parameter manifest (path, label,
+ * unit, range, scale and smoothing group of every control), the Auto / Offset /
+ * Pinned model (resolved = pinned ? user : clamp(driver + offset), offsets
+ * stored in perceptual units), undo/redo with one-gesture-one-step,
+ * localStorage autosave, user presets, URL-hash sharing and JSON import/export.
+ * Every storage access is wrapped: private browsing or blocked storage only
+ * turns persistence off.
  *
  * World coordinates: metres, x east, y north, z up.
  */
@@ -102,7 +104,7 @@ export const SURFACE_KEYS = [
  * into scene.studio.smoothing (seconds to 99.5 %).
  */
 export const PARAMS = [
-  // Tier 1: weather
+  // Weather
   { path: 'weather.precipitation.type', label: 'Precipitation', kind: 'enum', options: PRECIP_TYPES, group: 'weather', section: 'Precipitation' },
   { path: 'weather.precipitation.rate_mm_h', label: 'Amount', kind: 'number', scale: 'log', min: 0.02, max: 150, unit: 'mm/h', unitSpoken: 'millimetres per hour', group: 'weather', section: 'Precipitation', smoothing: 'rain' },
   { path: 'weather.precipitation.drops', label: 'Drop character', kind: 'enum', options: [['fine', 'Fine'], ['normal', 'Normal'], ['fat', 'Fat']], group: 'weather', section: 'Precipitation', help: 'Moves Dm along the stratiform / maritime / continental clusters.' },
@@ -125,7 +127,7 @@ export const PARAMS = [
   { path: 'weather.storm_arc', label: 'Storm arc', kind: 'enum', options: opts('arriving', 'steady', 'passing', 'clearing'), group: 'weather', section: 'Air & time' },
   { path: 'weather.arc_minutes', label: 'Arc length', kind: 'number', min: 5, max: 120, step: 1, unit: 'min', unitSpoken: 'minutes', group: 'weather', section: 'Air & time' },
 
-  // Tier 2: place & listener
+  // Place & listener
   { path: 'place.preset', label: 'Place', kind: 'enum', options: PLACE_PRESETS, group: 'place', section: 'Place' },
   { path: 'place.shelter', label: 'Shelter', kind: 'enum', options: SHELTERS, group: 'place', section: 'Place' },
   { path: 'place.window_open', label: 'Window open', kind: 'number', min: 0, max: 1, step: 0.01, unit: '', group: 'place', section: 'Place', format: (v) => `${Math.round(v * 100)} %` },
@@ -133,9 +135,9 @@ export const PARAMS = [
   { path: 'listener.height_m', label: 'Listener height', kind: 'number', scale: 'log', min: 0.3, max: 30, unit: 'm', unitSpoken: 'metres', group: 'listener', section: 'Listener' },
   { path: 'listener.heading_deg', label: 'Heading', kind: 'compass', min: 0, max: 360, step: 1, unit: '°', group: 'listener', section: 'Listener' },
   { path: 'listener.render', label: 'Render', kind: 'enum', options: [['binaural', 'Binaural (headphones)'], ['stereo', 'Stereo (speakers)']], group: 'listener', section: 'Listener' },
-  { path: 'mode', label: 'Mode', kind: 'enum', options: opts('none', 'sleep', 'focus', 'calm', 'asmr'), group: 'listener', section: 'Listener' },
+  { path: 'mode', label: 'Mode', kind: 'enum', options: [['none', 'None'], ['sleep', 'Sleep'], ['focus', 'Focus'], ['calm', 'Relax'], ['asmr', 'ASMR']], group: 'listener', section: 'Listener' },
 
-  // Tier 3: engineer
+  // Engineer: physics, randomness and smoothing
   { path: 'weather.precipitation.mu', label: 'DSD shape μ', kind: 'number', min: -2, max: 10, step: 0.1, unit: '', group: 'engineer', section: 'Engineer', nullable: true },
   { path: 'weather.precipitation.dm_mm', label: 'Dm override', kind: 'number', min: 0.5, max: 4, step: 0.05, unit: 'mm', unitSpoken: 'millimetres', group: 'engineer', section: 'Engineer', nullable: true },
   { path: 'weather.precipitation.class_boundaries', label: 'Class boundaries', kind: 'enum', options: [['medwin', 'Medwin (0.8/1.1/2.2/3.5 mm)'], ['nystuen', 'Nystuen (0.8/1.2/2.0/3.5 mm)']], group: 'engineer', section: 'Engineer' },
@@ -189,13 +191,20 @@ export function deepEqual(a, b) {
 
 const REPLACE_KEYS = new Set(['surfaces', 'objects', 'timeline', 'params', 'track', 'position', 'size', 'overrides', 'vibe', 'loop']);
 
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
 export function deepMerge(base, patch) {
   if (patch === undefined) return base;
   if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return clone(patch);
-  const out = base && typeof base === 'object' && !Array.isArray(base) ? { ...base } : {};
+  const out = isPlainObject(base) ? { ...base } : {};
   for (const [k, v] of Object.entries(patch)) {
+    const cur = out[k];
+    // A value of the wrong shape (a string where a section belongs, an object
+    // where a list belongs) is ignored so a damaged file cannot break the scene.
+    if (isPlainObject(cur) && !isPlainObject(v)) continue;
+    if (Array.isArray(cur) && !Array.isArray(v)) continue;
     if (REPLACE_KEYS.has(k) || v === null || typeof v !== 'object' || Array.isArray(v)) out[k] = clone(v);
-    else out[k] = deepMerge(out[k], v);
+    else out[k] = deepMerge(cur, v);
   }
   return out;
 }
@@ -277,13 +286,35 @@ export function normalizeObject(o) {
   return out;
 }
 
+/**
+ * Give every number / boolean / string leaf the type of its default. A numeric
+ * null stays null: Python scene files use it for "automatic".
+ */
+function coerceLeaves(def, val) {
+  for (const [k, d] of Object.entries(def)) {
+    if (!(k in val)) continue;
+    const v = val[k];
+    if (typeof d === 'number') {
+      if (v !== null && (typeof v !== 'number' || !Number.isFinite(v))) val[k] = num(v, d);
+    } else if (typeof d === 'boolean') {
+      if (typeof v !== 'boolean') val[k] = v === 'true' || v === 1;
+    } else if (typeof d === 'string') {
+      if (typeof v !== 'string') val[k] = d;
+    } else if (isPlainObject(d) && isPlainObject(v) && !REPLACE_KEYS.has(k)) {
+      coerceLeaves(d, v);
+    }
+  }
+}
+
 /** Normalise any rainscene-like object (accepts Python `version` key too). */
 export function normalizeScene(input) {
   const src = input && typeof input === 'object' ? clone(input) : {};
   if (src.version !== undefined && src.rainscene === undefined) src.rainscene = src.version;
   delete src.version;
   const s = deepMerge(defaultScene(), src);
+  coerceLeaves(defaultScene(), s);
   s.rainscene = SCHEMA_VERSION;
+  s.name = typeof s.name === 'string' && s.name.trim() ? s.name.slice(0, 120) : 'Untitled weather';
   s.seed = Math.max(0, Math.floor(num(s.seed, 0x5eedcafe))) % 2 ** 52;
   const p = s.weather.precipitation;
   p.rate_mm_h = Math.min(150, Math.max(0.02, num(p.rate_mm_h, 4)));
@@ -292,7 +323,7 @@ export function normalizeScene(input) {
   w.from_deg = ((num(w.from_deg, 270) % 360) + 360) % 360;
   if (w.gust_factor === null || w.gust_factor === undefined || w.gust_factor === 'auto') w.gust_factor = 1.4;
   const seen = new Set();
-  s.place.objects = (Array.isArray(s.place.objects) ? s.place.objects : []).map((o) => {
+  s.place.objects = (Array.isArray(s.place.objects) ? s.place.objects : []).filter(isPlainObject).map((o) => {
     const n = normalizeObject(o);
     while (seen.has(n.id)) n.id = uid(n.type);
     seen.add(n.id);
@@ -300,7 +331,7 @@ export function normalizeScene(input) {
   });
   s.listener.position = vec3(s.listener.position);
   s.timeline = (Array.isArray(s.timeline) ? s.timeline : [])
-    .filter((k) => k && typeof k.path === 'string')
+    .filter((k) => isPlainObject(k) && typeof k.path === 'string')
     .map((k) => ({ id: k.id || uid('k'), at: Math.max(0, num(typeof k.at === 'string' ? parseTimecode(k.at) : k.at, 0)), path: k.path, value: clone(k.value), curve: ['linear', 'log', 'hold', 'smooth'].includes(k.curve) ? k.curve : 'linear' }))
     .sort((a, b) => a.at - b.at);
   if (!s.overrides || typeof s.overrides !== 'object') s.overrides = {};
@@ -308,7 +339,13 @@ export function normalizeScene(input) {
   const st = s.studio;
   st.duration = Math.max(10, num(st.duration, 300));
   if (!Array.isArray(st.loop) || st.loop.length !== 2) st.loop = [0, st.duration];
+  st.loop = [Math.max(0, num(st.loop[0], 0)), Math.max(0, num(st.loop[1], st.duration))];
   return s;
+}
+
+/** True when parsed JSON plausibly is a rainscene (or a Python scene file). */
+export function looksLikeScene(data) {
+  return isPlainObject(data) && (data.rainscene !== undefined || data.version !== undefined || isPlainObject(data.weather));
 }
 
 export function parseTimecode(str) {
@@ -542,11 +579,12 @@ export class SceneStore {
 
   /* ---------------- whole scene */
   load(scene, { history = true, source = 'load', label = '' } = {}) {
+    const next = normalizeScene(scene);
     if (history) {
       if (this._gesture) this._gesture.changed = true;
       else this._pushUndo(this._snapshot());
     }
-    this.scene = normalizeScene(scene);
+    this.scene = next;
     this._recomputeDrivers();
     this.selection = null;
     this._last = { key: null, t: 0 };
@@ -807,7 +845,7 @@ export class SceneStore {
   }
 
   /**
-   * Move the Tier-0 macros. `partial` = { intensity?, closeness?, wildness? }.
+   * Move the Listener vibe macros. `partial` = { intensity?, closeness?, wildness? }.
    * `base` captures the scene's own character the first time a macro is touched.
    */
   setVibe(partial, { history = true, base = null } = {}) {
@@ -912,12 +950,22 @@ export class SceneStore {
     return JSON.stringify(ordered, null, indent);
   }
 
+  /** Load a rainscene JSON string; throws an Error with a reader-friendly message. */
   importJSON(text) {
-    const data = JSON.parse(text);
-    if (!data || typeof data !== 'object' || (data.rainscene === undefined && data.version === undefined && !data.weather)) {
-      throw new Error('Not a rainscene file (missing "rainscene" / "weather").');
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      throw new Error('it is not valid JSON (the file may be damaged or cut short)');
     }
-    this.load(data, { label: data.name || 'imported' });
+    if (!looksLikeScene(data)) {
+      throw new Error('it is JSON, but not a rainscene file (no "rainscene" or "weather" section)');
+    }
+    try {
+      this.load(data, { label: typeof data.name === 'string' ? data.name : 'imported' });
+    } catch (_) {
+      throw new Error('some of its values could not be read');
+    }
   }
 
   toHash() {
@@ -930,11 +978,18 @@ export class SceneStore {
     return u.toString();
   }
 
+  /** True when the URL hash carries a scene=… share payload (readable or not). */
+  static hasSceneHash(hash) {
+    return /(?:^#|&)scene=/.test(hash || '');
+  }
+
+  /** Scene from a share-link hash, or null when there is none or it cannot be read. */
   static decodeHash(hash) {
-    const m = /(?:^#|&)scene=([A-Za-z0-9_-]+)/.exec(hash || '');
+    const m = /(?:^#|&)scene=([A-Za-z0-9_-]+)(?:&|$)/.exec(hash || '');
     if (!m) return null;
     try {
-      return normalizeScene(JSON.parse(b64urlDecode(m[1])));
+      const data = JSON.parse(b64urlDecode(m[1]));
+      return looksLikeScene(data) ? normalizeScene(data) : null;
     } catch (_) {
       return null;
     }

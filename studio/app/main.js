@@ -1,22 +1,24 @@
 /**
  * Bootstrap of the raingen 4D Environment Composer.
  *
- * Wires one shared parameter graph (scene-store.js, MASTER_PLAN 2.1: "one set of
- * settings, two workspaces") to the views (Listener overlay, Library, 3-D
- * viewport, Inspector, Timeline, Captions) and to the Web Audio engine
- * (../../engine/weather-engine.js, coded against its published API only).
+ * Wires one shared parameter graph (scene-store.js: one set of settings behind
+ * both workspaces) to the views (Listener overlay, Library, 3-D viewport,
+ * Inspector, Timeline, Captions) and to the Web Audio engine
+ * (../../engine/weather-engine.js, used through its public API only).
  *
- * Rules carried here:
- * - No autoplay (MASTER_PLAN 2.2): one big "Press to hear the rain" gesture
- *   starts the AudioContext, then the scene fades in over 3 s to a safe level.
+ * Behaviour:
+ * - No autoplay: one big "Press to hear the rain" gesture starts the
+ *   AudioContext, then the scene fades in over 3 s to a safe level.
  * - Every store change is forwarded to the engine with the parameter's smoothing
- *   time ("time to 99.5 %", MASTER_PLAN 2.6 Engineer > Smoothing).
- * - Flash safety sits outside the graph (MASTER_PLAN 2.7, WCAG 2.3.1): the
- *   engine is told maxFlashesPerSec = 3 and the UI limits again.
+ *   time ("time to 99.5 %", Engineer > Smoothing in the inspector).
+ * - Flash safety (WCAG 2.3.1) sits outside the parameter graph: the engine is
+ *   told maxFlashesPerSec = 3 and the UI limits again.
  * - Flash-to-bang counts real seconds between the 'flash' and 'thunder' events;
  *   distance = c(T) * t with c(T) = 331.3 sqrt(1 + T/273.15) m/s.
- * - Degrades: no WebGL -> audio-only with a message; no AudioWorklet -> the
- *   whole editor still works and exports scenes for the Python CLI.
+ * - Degrades with a plain message instead of failing: no WebGL -> audio-only;
+ *   no AudioWorklet or a blocked AudioContext -> the editor still works and
+ *   exports scenes for the Python CLI; an unreadable share link or file -> the
+ *   current scene stays and a toast says why.
  */
 import { SceneStore, clone, paramSpec } from './scene-store.js';
 import { presetScene, vibeDrivers, DEMO_WALK, stormPosition, rangeBearing } from './presets.js';
@@ -52,12 +54,14 @@ const prefs = {
 
 /* ------------------------------------------------------------------ state */
 
+const storedLayers = prefs.get('layers', {});
+
 const ui = {
   workspace: prefs.get('workspace', 'listener') === 'studio' ? 'studio' : 'listener',
   visuals: ['full', 'calm', 'off'].includes(prefs.get('visuals', 'full')) ? prefs.get('visuals', 'full') : 'full',
   volume: clamp(Number(prefs.get('volume', 50)) || 0, 0, 100),
   singleKeys: prefs.get('singleKeys', true) !== false,
-  layers: prefs.get('layers', {}),
+  layers: storedLayers && typeof storedLayers === 'object' && !Array.isArray(storedLayers) ? storedLayers : {},
   sleepFade: 1,
   fadeInDb: 0,
 };
@@ -70,7 +74,7 @@ const WORKLET_SUPPORTED = AUDIO_SUPPORTED && typeof window.AudioWorkletNode === 
 
 const audio = {
   cls: null, loading: null, engine: null, started: false, state: 'idle',
-  liveRates: new Map(), lastPitch: 0, warnedSilent: false, sceneTimer: 0,
+  liveRates: new Map(), lastPitch: 0, warnedSilent: false, warnedBlocked: false, startP: null, startAt: 0, sceneTimer: 0,
   timeTimer: 0, lastTimePush: 0,
 };
 
@@ -88,9 +92,11 @@ let renderURL = null;
 const store = new SceneStore({ storageKey: LS });
 store.setDriverFn(vibeDrivers);
 const sharedScene = SceneStore.decodeHash(location.hash);
+const brokenShareLink = !sharedScene && SceneStore.hasSceneHash(location.hash);
 const initialScene = sharedScene || store.loadAutosave() || presetScene('leaves-night');
 store.load(initialScene, { history: false, source: 'init', label: initialScene.name });
 if (sharedScene) ownHash = location.hash;
+if (brokenShareLink) clearHash();
 
 /* ------------------------------------------------------------------ small helpers */
 
@@ -111,6 +117,16 @@ async function safeAsync(fn) {
     return undefined;
   }
 }
+
+/** Drop the #… part of the address without adding a history entry. */
+function clearHash() {
+  try {
+    history.replaceState(null, '', location.pathname + location.search);
+  } catch (_) { /* sandboxed frame: leave the address as it is */ }
+  ownHash = '';
+}
+
+const BROKEN_LINK_MESSAGE = 'This share link is damaged or incomplete, so its scene could not be opened. Ask for the link again, or open the scene as a JSON file with Import.';
 
 function slug(name) {
   return String(name || 'weather').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'weather';
@@ -161,8 +177,13 @@ function toast(message, { action = null, timeout = 6000 } = {}) {
 
 function hasWebGL() {
   try {
+    if (!window.WebGLRenderingContext) return false;
     const c = document.createElement('canvas');
-    return !!(window.WebGLRenderingContext && (c.getContext('webgl2') || c.getContext('webgl')));
+    const gl = c.getContext('webgl2') || c.getContext('webgl');
+    if (!gl) return false;
+    // release the probe context at once: browsers cap the number of live contexts
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return true;
   } catch (_) {
     return false;
   }
@@ -195,13 +216,23 @@ function setAudioState(state) {
   if (!chip) return;
   chip.dataset.state = state;
   chip.textContent = {
-    idle: 'Audio off', starting: 'Starting…', live: transport.playing ? 'Live' : 'Paused', unsupported: 'No audio', error: 'Audio error',
+    idle: 'Audio off', starting: 'Starting…', live: transport.playing ? 'Live' : 'Paused', blocked: 'Sound blocked', unsupported: 'No audio', error: 'Audio error',
   }[state] || state;
+}
+
+/** Plain-language reason an audio start failed (the raw error goes to the console). */
+function audioErrorText(err) {
+  const name = err && err.name;
+  const msg = String((err && err.message) || err || '');
+  if (name === 'NotAllowedError') return 'The browser blocked sound on this page. Press Play to allow it.';
+  if (/AudioWorklet|Web Audio/i.test(msg)) return 'This browser cannot run the audio engine (it needs AudioWorklet on an https page).';
+  if (/fetch|import|load|network/i.test(msg) || name === 'TypeError') return 'The audio engine could not be loaded. Check your connection and press Play again.';
+  return 'The audio engine could not start.';
 }
 
 function loadEngineModule() {
   if (audio.cls) return Promise.resolve(audio.cls);
-  if (!WORKLET_SUPPORTED) return Promise.reject(new Error('this browser has no AudioWorklet (it needs a secure https page)'));
+  if (!WORKLET_SUPPORTED) return Promise.reject(new Error('AudioWorklet is not available (it needs a secure https page)'));
   if (!audio.loading) {
     audio.loading = import(ENGINE_URL).then((m) => {
       const C = m.WeatherEngine || m.default;
@@ -283,7 +314,7 @@ function applyGain() {
   safe(() => audio.engine.setMasterGainDb(Math.max(-120, db)));
 }
 
-/** First-play safety: ramp the master in over 3 s (MASTER_PLAN 2.2). */
+/** First-play safety: ramp the master in over 3 s from -48 dB. */
 function fadeIn(sec = 3) {
   const t0 = performance.now();
   ui.fadeInDb = -48;
@@ -300,30 +331,113 @@ function fadeIn(sec = 3) {
   }, 50);
 }
 
-async function startAudio() {
-  if (audio.started) return true;
+const SLOW_START_MS = 6000;
+
+/** Resolves to 'ok', 'timeout' (after ms) or { error }; never rejects. */
+function settle(promise, ms) {
+  return Promise.race([
+    Promise.resolve(promise).then(() => 'ok', (error) => ({ error })),
+    new Promise((resolve) => { setTimeout(() => resolve('timeout'), ms); }),
+  ]);
+}
+
+/** Browsers only let an AudioContext start after the visitor has interacted with the page. */
+function mayStartAudio() {
+  const ua = navigator.userActivation;
+  return !ua || ua.isActive || ua.hasBeenActive;
+}
+
+function inGesture() {
+  const ua = navigator.userActivation;
+  return !ua || ua.isActive;
+}
+
+function audioFailed(err) {
+  console.warn('[studio] audio start failed:', err);
+  setAudioState(err && err.name === 'NotAllowedError' ? 'blocked' : 'error');
+  toast(`${audioErrorText(err)} You can still build, animate and export scenes.`);
+  return false;
+}
+
+/**
+ * Start the engine once. Resolves true (sound running), false (no sound; the
+ * reason is shown) or null (this attempt was replaced by a newer one).
+ */
+function startAudio() {
+  if (audio.started) return Promise.resolve(true);
+  if (audio.startP) {
+    // A start that has hung this long had its AudioContext refused by the browser;
+    // a new press of Play retires it and starts again inside this gesture.
+    if (performance.now() - audio.startAt < SLOW_START_MS || !inGesture()) return audio.startP;
+    audio.engine = null;
+  }
+  const p = startAudioOnce().finally(() => {
+    if (audio.startP === p) audio.startP = null;
+  });
+  audio.startP = p;
+  audio.startAt = performance.now();
+  return p;
+}
+
+async function startAudioOnce() {
   if (!WORKLET_SUPPORTED) {
     setAudioState('unsupported');
     return false;
   }
-  setAudioState('starting');
-  try {
-    const e = await ensureEngine();
-    await e.start();
-    if (e.context && e.context.state === 'suspended') await safeAsync(() => e.resume());
-    audio.started = true;
-    pushWholeScene();
-    safe(() => e.setVisualSafety({ maxFlashesPerSec: 3 }));
-    safe(() => e.setTime(transport.t));
-    fadeIn(3);
-    setAudioState('live');
-    return true;
-  } catch (err) {
-    console.error('[studio] audio start failed', err);
-    setAudioState('error');
-    toast(`Audio could not start (${err && err.message ? err.message : err}). You can still build, animate and export scenes.`);
+  if (!mayStartAudio()) {
+    setAudioState('blocked');
+    warnBlocked();
     return false;
   }
+  audio.warnedBlocked = false;
+  setAudioState('starting');
+  let e;
+  try {
+    e = await ensureEngine();
+  } catch (err) {
+    return audioFailed(err);
+  }
+  const begun = e.start();
+  const slow = setTimeout(() => {
+    if (audio.engine === e && !audio.started) toast('Sound is taking a while to start. If you hear nothing, press Play again.');
+  }, SLOW_START_MS);
+  const res = await begun.then(() => 'ok', (error) => ({ error }));
+  clearTimeout(slow);
+  if (audio.engine !== e) {
+    // replaced by a newer attempt while this one hung: make sure it stays silent
+    if (res === 'ok') safe(() => e.stop());
+    return null;
+  }
+  if (res !== 'ok') return audioFailed(res.error);
+  if (e.context && e.context.state === 'suspended') await settle(e.resume(), 1500);
+  audio.started = true;
+  audio.warnedBlocked = false;
+  pushWholeScene();
+  safe(() => e.setVisualSafety({ maxFlashesPerSec: 3 }));
+  safe(() => e.setTime(transport.t));
+  fadeIn(3);
+  setAudioState(engineRunning() ? 'live' : 'blocked');
+  if (!engineRunning()) warnBlocked();
+  return true;
+}
+
+/** The browser keeps the AudioContext suspended until a click or key press (autoplay policy). */
+function warnBlocked() {
+  if (audio.warnedBlocked) return;
+  audio.warnedBlocked = true;
+  toast('The browser is holding the sound back until you allow it.', {
+    action: { label: 'Start sound', fn: () => allowSound() },
+  });
+}
+
+/** Called from a click: resume the suspended engine, or start playback with sound. */
+async function allowSound() {
+  if (audio.started && audio.engine && transport.playing) {
+    await settle(audio.engine.resume(), 3000);
+    setAudioState(engineRunning() ? 'live' : 'blocked');
+    return;
+  }
+  await play();
 }
 
 function bindEngine(e) {
@@ -336,6 +450,17 @@ function bindEngine(e) {
   on('impact-stats', onImpactStats);
   on('meter', onMeter);
   on('caption', onEngineCaption);
+  on('state', ({ state }) => {
+    if (!audio.started || audio.engine !== e) return;
+    if (state === 'running') {
+      audio.warnedBlocked = false;
+      setAudioState('live');
+    } else if (state !== 'closed' && transport.playing) {
+      // suspended or interrupted by the browser while playing (not by our own pause)
+      setAudioState('blocked');
+      warnBlocked();
+    }
+  });
 }
 
 /* ------------------------------------------------------------------ engine events */
@@ -454,7 +579,7 @@ const SCENE_SYNC_PATHS = /^(timeline|overrides|vibe|name|seed|presetId|studio)(\
 
 store.on('change', (e) => {
   if (e.paths.includes('name') || e.kind === 'load' || e.kind === 'restore') {
-    document.title = `${store.scene.name} · raingen Composer`;
+    document.title = `${store.scene.name} · raingen 4D Composer`;
     const gs = $('#gate-scene');
     if (gs) gs.textContent = store.scene.name;
     updateMediaSession();
@@ -522,8 +647,21 @@ async function play() {
   if (transport.playing) return;
   hideGate();
   const ok = await startAudio();
+  if (ok === null || transport.playing) return;
+  if (!ok && audio.state === 'blocked') {
+    // keep the transport stopped: the next press of Play is the gesture that lets sound start
+    updateTransportUI();
+    return;
+  }
   if (ok && audio.engine) {
-    if (!engineRunning()) await safeAsync(() => audio.engine.resume());
+    if (!engineRunning()) await settle(audio.engine.resume(), 3000);
+    if (!engineRunning()) {
+      setAudioState('blocked');
+      warnBlocked();
+      updateTransportUI();
+      return;
+    }
+    if (audio.state === 'blocked') setAudioState('live');
     engineSetTime(transport.t, true);
   }
   transport.playing = true;
@@ -535,7 +673,7 @@ async function play() {
     audio.warnedSilent = true;
     toast(WORKLET_SUPPORTED
       ? 'Playing the timeline silently: the audio engine is not available.'
-      : 'This browser cannot run the audio engine (AudioWorklet needs a secure https page). The world and timeline still play; export the scene for the Python CLI.');
+      : 'Sound is not available here (the audio engine needs AudioWorklet on an https page). The world and timeline still play; export the scene for the Python CLI.');
   }
 }
 
@@ -784,20 +922,42 @@ function addFromLibrary(key) {
 }
 
 function exportJSON() {
-  download(new Blob([store.toJSON()], { type: 'application/json' }), `${slug(store.scene.name)}.rainscene.json`);
-  toast('Scene exported. The Python CLI renders it too: raingen render scene.json');
+  const file = `${slug(store.scene.name)}.rainscene.json`;
+  download(new Blob([store.toJSON()], { type: 'application/json' }), file);
+  toast(`Exported ${file}. The Python CLI renders it offline too: raingen render ${file}`);
 }
+
+const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
 
 async function importFile(file) {
   if (!file) return;
-  try {
-    const text = await file.text();
-    store.importJSON(text);
-    seek(0);
-    toast(`Opened “${store.scene.name}”.`, { action: { label: 'Undo', fn: () => store.undo() } });
-  } catch (err) {
-    toast(`Could not open ${file.name}: ${err.message || err}`);
+  if (file.size > MAX_IMPORT_BYTES) {
+    toast(`Could not open ${file.name}: it is too large to be a scene file.`);
+    return;
   }
+  let text;
+  try {
+    text = await file.text();
+  } catch (_) {
+    toast(`Could not read ${file.name}. Try saving it again and re-importing.`);
+    return;
+  }
+  try {
+    store.importJSON(text);
+  } catch (err) {
+    toast(`Could not open ${file.name}: ${err && err.message ? err.message : 'it is not a rainscene file'}. Your current scene is unchanged.`);
+    return;
+  }
+  seek(0);
+  toast(`Opened “${store.scene.name}”.`, { action: { label: 'Undo', fn: () => store.undo() } });
+}
+
+/** Save the current scene to My presets and say whether it worked. */
+function savePreset(name) {
+  const nm = store.saveUserPreset(name);
+  if (nm) toast(`Saved “${nm}” to My presets.`);
+  else toast('Could not save: browser storage is full or blocked (private browsing?). Use Export to keep the scene as a file.');
+  return nm;
 }
 
 async function share() {
@@ -889,7 +1049,7 @@ function showGate() {
   $('#gate-scene').textContent = store.scene.name;
   if (!WORKLET_SUPPORTED) {
     $('#gate-note').textContent = AUDIO_SUPPORTED
-      ? 'This page cannot run the audio engine here (AudioWorklet needs https). You can still build the world, animate it and export it for the Python CLI.'
+      ? 'The audio engine cannot run here: it needs a browser with AudioWorklet, on an https page. You can still build the world, animate it and export it for the Python CLI.'
       : 'This browser has no Web Audio. You can still build the world and export it for the Python CLI.';
     $('#gate-play span').textContent = 'Enter the composer';
   }
@@ -903,33 +1063,6 @@ function hideGate() {
   if (g.hidden) return;
   g.hidden = true;
   document.documentElement.classList.remove('gate-open');
-}
-
-/* ------------------------------------------------------------------ theme */
-
-function currentTheme() {
-  return document.documentElement.getAttribute('data-theme') || 'system';
-}
-
-function applyThemeLabel() {
-  const t = currentTheme();
-  const b = $('#btn-theme');
-  b.setAttribute('aria-label', `Theme: ${t}. Switch theme`);
-  b.title = `Theme: ${t}`;
-}
-
-function cycleTheme() {
-  const order = ['system', 'light', 'dark'];
-  const next = order[(order.indexOf(currentTheme()) + 1) % order.length];
-  const root = document.documentElement;
-  if (next === 'system') root.removeAttribute('data-theme');
-  else root.setAttribute('data-theme', next);
-  try {
-    if (next === 'system') localStorage.removeItem('rg-theme');
-    else localStorage.setItem('rg-theme', next);
-  } catch (_) { /* storage blocked */ }
-  applyThemeLabel();
-  announce(`Theme: ${next}`);
 }
 
 /* ------------------------------------------------------------------ media session */
@@ -1015,7 +1148,7 @@ function onModeChange(mode) {
 
 async function initViewport() {
   if (!hasWebGL()) {
-    showVpFallback('This browser or device has WebGL turned off, so the 3-D view cannot be drawn.');
+    showVpFallback('This browser or device cannot use WebGL (or has it turned off), so the 3-D view cannot be drawn.');
     return;
   }
   try {
@@ -1045,9 +1178,13 @@ async function initViewport() {
     if (ui.workspace === 'listener') viewport.frameListener();
     document.documentElement.classList.add('has-webgl');
   } catch (err) {
-    console.error('[studio] viewport failed', err);
+    console.warn('[studio] 3-D view unavailable:', err);
     viewport = null;
-    showVpFallback(`The 3-D view could not start (${err && err.message ? err.message : err}).`);
+    $('#viewport').textContent = '';
+    const offline = /fetch|import|module|specifier/i.test(String((err && err.message) || ''));
+    showVpFallback(offline
+      ? 'The 3-D view could not be loaded (check your connection and reload), so the composer is running without it.'
+      : 'This device could not start the 3-D view (WebGL failed to initialise), so the composer is running without it.');
   }
 }
 
@@ -1067,7 +1204,6 @@ function bindTopbar() {
     e.target.value = '';
   });
   $('#btn-share').addEventListener('click', () => share());
-  $('#btn-theme').addEventListener('click', () => cycleTheme());
   $('#btn-help').addEventListener('click', () => openDialog($('#dlg-help'), document.activeElement));
   const vs = $('#vol-studio');
   vs.addEventListener('input', () => setVolume(parseFloat(vs.value), { from: 'studio' }));
@@ -1162,10 +1298,8 @@ function bindDialogs() {
     const sub = e.submitter;
     if (sub && sub.value !== 'save') return;
     e.preventDefault();
-    const nm = store.saveUserPreset($('#save-name').value);
     closeDialog($('#dlg-save'));
-    if (nm) toast(`Saved “${nm}” to My presets.`);
-    else toast('Could not save: browser storage is full or blocked. Export the scene instead.');
+    savePreset($('#save-name').value);
   });
 
   const single = $('#opt-single-keys');
@@ -1333,11 +1467,17 @@ function bindEnvironment() {
   window.addEventListener('hashchange', () => {
     if (location.hash === ownHash) return;
     const sc = SceneStore.decodeHash(location.hash);
-    if (!sc) return;
+    if (!sc) {
+      if (SceneStore.hasSceneHash(location.hash)) {
+        clearHash();
+        toast(BROKEN_LINK_MESSAGE);
+      }
+      return;
+    }
     ownHash = location.hash;
     store.load(sc, { label: sc.name });
     seek(0);
-    toast(`Opened the shared scene “${sc.name}”.`, { action: { label: 'Save to My presets', fn: () => store.saveUserPreset(sc.name) } });
+    toast(`Opened the shared scene “${sc.name}”.`, { action: { label: 'Save to My presets', fn: () => savePreset(sc.name) } });
   });
   window.addEventListener('beforeunload', () => store.saveAutosave());
   document.addEventListener('visibilitychange', () => {
@@ -1369,11 +1509,10 @@ function boot() {
   bindDropImport();
   bindKeys();
   bindEnvironment();
-  applyThemeLabel();
   setVolume(ui.volume);
   setVisuals(ui.visuals);
   setWorkspace(ui.workspace, { quiet: true });
-  document.title = `${store.scene.name} · raingen Composer`;
+  document.title = `${store.scene.name} · raingen 4D Composer`;
   updateMediaSession();
   setAudioState(WORKLET_SUPPORTED ? 'idle' : 'unsupported');
   updateTransportUI();
@@ -1381,9 +1520,11 @@ function boot() {
   if (WORKLET_SUPPORTED) loadEngineModule().catch((err) => console.warn('[studio] engine module not loaded yet:', err && err.message ? err.message : err));
   initViewport();
   showGate();
-  if (sharedScene) toast(`Opened the shared scene “${sharedScene.name}”.`, { action: { label: 'Save to My presets', fn: () => store.saveUserPreset(sharedScene.name) } });
+  if (sharedScene) toast(`Opened the shared scene “${sharedScene.name}”.`, { action: { label: 'Save to My presets', fn: () => savePreset(sharedScene.name) } });
+  if (brokenShareLink) toast(BROKEN_LINK_MESSAGE, { timeout: 12000 });
   requestAnimationFrame(frame);
   void library;
+  document.documentElement.dataset.ready = 'true';
 }
 
 boot();

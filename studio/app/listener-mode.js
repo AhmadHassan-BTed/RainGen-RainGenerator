@@ -1,15 +1,14 @@
 /**
- * Listener workspace (Tier 0, MASTER_PLAN 2.3): a full-bleed world with a
- * minimal overlay. Three big sliders drive the Tier-0 macros through the
- * scene-store's Auto / Offset / Pinned graph (anchors in presets.js:
- * Intensity 0 dry . 20 drizzle 0.3 mm/h . 40 moderate 5 mm/h . 60 heavy
- * 20 mm/h . 80 thunderstorm 40 mm/h . 100 extreme 80 mm/h; Closeness in five
- * stops "Out in it" -> "Indoors, window shut"; Calm-Wild drives gust factor
- * 1.15-1.9, shower contrast and flash rate), scene cards with user presets
- * first (MASTER_PLAN 2.4), "Describe your weather" (deterministic parser,
- * MASTER_PLAN 2.8), the Weather Orb (radius = intensity, angle = character,
- * with inertia), a sleep timer with "Fade out as I fall asleep" and the
- * Visuals Full / Calm / Off switch.
+ * Listener workspace: a full-bleed world with a minimal overlay. Three big
+ * sliders drive the vibe macros through the scene-store's Auto / Offset /
+ * Pinned graph (anchors in presets.js: Intensity 0 dry . 20 drizzle 0.3 mm/h .
+ * 40 moderate 5 mm/h . 60 heavy 20 mm/h . 80 thunderstorm 40 mm/h . 100
+ * extreme 80 mm/h; Closeness in five stops "Out in it" -> "Indoors, window
+ * shut"; Calm-Wild drives gust factor 1.15-1.9, shower contrast and flash
+ * rate), scene cards with the user's own presets first, "Describe your
+ * weather" (the deterministic parser in describe.js), the Weather Orb
+ * (radius = intensity, angle = character, with inertia), a sleep timer with
+ * "Fade out as I fall asleep" and the Visuals Full / Calm / Off switch.
  */
 import { PRESETS, presetScene, inferVibe, VIBE_DEFAULT } from './presets.js';
 import { parseDescription } from './describe.js';
@@ -69,7 +68,7 @@ const CLOSE_STOPS = [
   [0, 'Out in it'], [25, 'Under a tree or umbrella'], [50, 'Porch or tent'], [75, 'Indoors, window open'], [100, 'Indoors, window shut'],
 ];
 
-const MODES = [['calm', 'Relax'], ['sleep', 'Sleep'], ['focus', 'Focus'], ['asmr', 'ASMR'], ['none', 'Studio (no limits)']];
+const MODES = [['calm', 'Relax'], ['sleep', 'Sleep'], ['focus', 'Focus'], ['asmr', 'ASMR'], ['none', 'None (full studio mix)']];
 const SLEEP_CHOICES = [[0, 'Off'], [15, '15 min'], [30, '30 min'], [45, '45 min'], [60, '1 hour'], [90, '1½ hours'], [120, '2 hours']];
 
 function characterWord(w) {
@@ -250,7 +249,7 @@ export class ListenerMode {
     const form = h('form', { class: 'lm-describe', role: 'search' },
       h('label', { for: 'lm-describe', class: 'lm-label' }, 'Describe your weather'),
       h('div', { class: 'lm-describe-row' }, this.describeInput, h('button', { type: 'submit', class: 'btn btn-primary btn-small' }, 'Apply')),
-      h('p', { class: 'hint' }, 'English for now. Rain words, mm/h, Beaufort names, “force 6”, “30 mph gusts”, “from the west”, thunder distance or seconds, surfaces, shelters, time and season. Also filters the cards.'),
+      h('p', { class: 'hint' }, 'Understands English: rain words, mm/h, Beaufort names, “force 6”, “30 mph gusts”, “from the west”, thunder distance or seconds, surfaces, shelters, time and season. Also filters the cards.'),
       this.chipsEl,
     );
     let t = 0;
@@ -343,10 +342,10 @@ export class ListenerMode {
 
     return this._sheet('options', 'Sleep & display',
       h('div', { class: 'lm-field' }, h('label', { for: 'lm-sleep', class: 'lm-label' }, 'Stop after'), this.sleepSel),
-      h('label', { class: 'lm-check', for: 'lm-sleep-fade' }, this.sleepFade, ' Fade out as I fall asleep (last 15 minutes)'),
+      h('label', { class: 'lm-check', for: 'lm-sleep-fade' }, this.sleepFade, ' Fade out as I fall asleep (up to the last 15 minutes)'),
       this.sleepStatus,
       h('div', { class: 'lm-field' }, h('label', { for: 'lm-mode', class: 'lm-label' }, 'Mode'), this.modeSel),
-      h('p', { class: 'hint' }, 'Sleep keeps thunder distant and caps the rain; Focus removes thunder; ASMR brings detail close.'),
+      h('p', { class: 'hint' }, 'Sleep pulls thunder and wind well back, softens lightning and lowers the overall level; Focus and Relax pull thunder and wind back; ASMR brings close detail forward.'),
       h('div', { class: 'lm-field' }, h('span', { class: 'lm-label', id: 'lm-vis-label' }, 'Visuals'), vis),
       h('p', { class: 'hint' }, 'Calm softens animation and turns lightning into a gentle glow. Off stops the 3-D view (audio keeps playing). Flashes never exceed 3 per second.'));
   }
