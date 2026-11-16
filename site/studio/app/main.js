@@ -21,6 +21,7 @@
  *   current scene stays and a toast says why.
  */
 import { SceneStore, clone, paramSpec } from './scene-store.js';
+import { unlockAudio } from '../../engine/unlock.js';
 import { presetScene, vibeDrivers, DEMO_WALK, stormPosition, rangeBearing } from './presets.js';
 import { Library, instantiate, objectLabel } from './library.js';
 import { Inspector } from './inspector.js';
@@ -247,10 +248,10 @@ function loadEngineModule() {
   return audio.loading;
 }
 
-async function ensureEngine() {
+async function ensureEngine(context = null) {
   if (audio.engine) return audio.engine;
   const C = await loadEngineModule();
-  const e = new C({});
+  const e = new C({ context });
   bindEngine(e);
   audio.engine = e;
   return e;
@@ -390,10 +391,12 @@ async function startAudioOnce() {
     return false;
   }
   audio.warnedBlocked = false;
+  // Before any await: Safari/iOS only start audio created inside the user's gesture.
+  const unlocked = unlockAudio(audio.engine ? audio.engine.context : null);
   setAudioState('starting');
   let e;
   try {
-    e = await ensureEngine();
+    e = await ensureEngine(unlocked);
   } catch (err) {
     return audioFailed(err);
   }

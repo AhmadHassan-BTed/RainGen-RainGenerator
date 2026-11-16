@@ -2970,13 +2970,16 @@ export class WeatherEngine {
     this._starting = (async () => {
       const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
       if (!AC) throw new Error('Web Audio is not available in this browser.');
-      let ctx;
+      // A context created inside the user's gesture (see unlock.js) is the only kind Safari/iOS will play.
+      let ctx = this.opts.context && this.opts.context.state !== 'closed' ? this.opts.context : null;
       const ctxOpts = { latencyHint: this.opts.latencyHint };
       if (num(this.opts.sampleRate, 0) > 0) ctxOpts.sampleRate = num(this.opts.sampleRate, 48000);
-      try {
-        ctx = new AC(ctxOpts);
-      } catch (e) {
-        ctx = new AC();
+      if (!ctx) {
+        try {
+          ctx = new AC(ctxOpts);
+        } catch (e) {
+          ctx = new AC();
+        }
       }
       if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') {
         try {

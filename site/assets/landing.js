@@ -1,3 +1,4 @@
+import { unlockAudio, releaseAudio } from '../engine/unlock.js';
 /* raingen landing page. Progressive enhancement: the page reads fine without it. */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -418,11 +419,14 @@ listenBtn.addEventListener('click', async () => {
   if (busy) return;
   if (listening) {
     clearInterval(fadeTimer);
+    releaseAudio();
     try { await engine.suspend(); } catch (e) { /* already suspended */ }
     setListening(false);
     setStatus('Paused. Press to resume.');
     return;
   }
+  // Must run before any await: Safari/iOS only start audio created inside the click itself.
+  const unlocked = unlockAudio(engine ? engine.context : null);
   busy = true;
   listenBtn.setAttribute('aria-busy', 'true');
   setStatus('Starting the engine…');
@@ -430,7 +434,7 @@ listenBtn.addEventListener('click', async () => {
     if (!engine) {
       const mod = await loadEngine();
       const Ctor = mod.WeatherEngine || mod.default;
-      const e = new Ctor({});
+      const e = new Ctor({ context: unlocked });
       await e.start();
       if (e.context && e.context.state === 'suspended') await e.context.resume();
       e.setVisualSafety?.({ maxFlashesPerSec: 3 });
@@ -443,6 +447,10 @@ listenBtn.addEventListener('click', async () => {
     } else {
       engine.setMasterGainDb?.(FADE_FROM_DB);
       await engine.resume();
+    }
+    if (engine.context && engine.context.state !== 'running') {
+      setStatus('Your browser is holding the sound. Press Listen again; on iPhone, also check the volume.', true);
+      return;
     }
     fadeInMaster();
     setListening(true);
