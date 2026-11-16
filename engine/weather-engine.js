@@ -2652,7 +2652,7 @@ class OfflineJob {
     this.base = { position: engine._listener.position.slice(), headingDeg: engine._listener.headingDeg, pitchDeg: engine._listener.pitchDeg };
     this.model = new ControlModel(this.scene.seed);
     this.graph = new SceneGraph(octx, { offline: true, renderMode: o.renderMode, meter: false });
-    this.quality = engine._quality;
+    this.quality = engine._quality === 'low' ? 'balanced' : engine._quality;
     this.mix = { ...engine._mix };
     this.masterDb = engine._masterDb;
     this.dt = 1 / CONTROL_HZ;
@@ -2923,11 +2923,13 @@ export class WeatherEngine {
       const nav = globalThis.navigator;
       const cores = nav && nav.hardwareConcurrency ? nav.hardwareConcurrency : 8;
       const mobile = nav && /Mobi|Android|iPhone|iPad/i.test(nav.userAgent || '');
-      if (mobile || cores <= 2) return 'low';
+      // Live playback must stay inside one audio thread next to the 3-D view, so only very
+      // wide machines default above 'low'; offline renders lift this (see OfflineJob).
+      if (!mobile && cores >= 16) return 'balanced';
     } catch (e) {
       /* ignore */
     }
-    return 'balanced';
+    return 'low';
   }
 
   /** True while the AudioContext is rendering. */
@@ -3353,7 +3355,9 @@ export class WeatherEngine {
       const emit = (k, v) => g.set(k, v, now, 0.05);
       emitParams(this._plan, ctl, this._model, env, emit);
       busParams(ctl, emit);
-      masterParams(this._plan, ctl, this._cal, this._mix, this._masterDb, ctx.sampleRate, emit);
+      // The 'low' live tier renders far fewer voices; make up their energy so it is not quieter.
+      const makeupDb = this._quality === 'low' ? 12 : 0;
+      masterParams(this._plan, ctl, this._cal, this._mix, this._masterDb + makeupDb, ctx.sampleRate, emit);
       listenerParams(L, (k, v) => g.set(k, v, now, 0.03));
       this._thunderTick(ctl, L, t, now);
       this._eventsTick(ctl, dt);
