@@ -964,7 +964,12 @@ function matSpec(pc, name, salt, fraction, o = {}) {
 /** A rain-surface voice (rain on a patch or object, a drip line, or a gutter/downspout flow). */
 function rainSpec(pc, key, objectId, o) {
   const area = Math.max(0.01, num(o.area, 1));
-  const modes = o.modes ?? 12;
+  // Live CPU budget: every voice runs a per-sample modal bank on the single audio thread,
+  // so lower tiers trade modal detail and event density for real-time headroom.
+  const q = pc.env.quality;
+  const modes0 = o.modes ?? 12;
+  const modes = q === 'low' ? Math.min(modes0, 4) : q === 'balanced' ? Math.max(3, Math.ceil(modes0 / 2)) : modes0;
+  const evBudget = q === 'low' ? 0.4 : q === 'balanced' ? 0.6 : 1;
   const materials = (o.mats || [['concrete', 1]]).slice(0, 4).map(([n, f, extra], i) =>
     matSpec(pc, n, `${key}:${i}`, Math.max(0.001, num(f, 1)), { area: extra && extra.area !== undefined ? extra.area : area, maxModes: modes, depthMm: extra ? extra.depthMm : undefined }),
   );
@@ -974,7 +979,7 @@ function rainSpec(pc, key, objectId, o) {
     kind: o.kind || 'rain',
     area: +area.toFixed(4),
     exposure: +clamp(num(o.exposure, 1), 0, 4).toFixed(4),
-    maxEventsPerSec: Math.max(50, Math.round(num(o.maxEv, 1500) * pc.env.evScale)),
+    maxEventsPerSec: Math.max(50, Math.round(num(o.maxEv, 1500) * pc.env.evScale * evBudget)),
     maxModes: modes,
     maxBubbles: o.bubbles ?? 32,
     coxDepth: 0.35,
@@ -1542,6 +1547,26 @@ function planScene(S, ctl, env) {
 // ---------------------------------------------------------------------------
 // Per-tick parameters
 // ---------------------------------------------------------------------------
+
+/**
+ * Keep at most `cap` voices for live playback: listener-attached voices first, then the nearest.
+ * Every voice runs on the one audio thread, so a scene with many objects can outgrow it.
+ */
+function capVoices(plan, cap, L) {
+  if (!(cap > 0) || plan.voices.size <= cap) return;
+  const lp = L.pos || [0, 0, 0];
+  const ranked = [];
+  for (const [key, spec] of plan.voices) {
+    if (spec.posMode === 'listener') {
+      ranked.push([key, -1]);
+      continue;
+    }
+    const p = specPos(spec, L);
+    ranked.push([key, Math.hypot(p[0] - lp[0], p[1] - lp[1], p[2] - lp[2])]);
+  }
+  ranked.sort((a, b) => a[1] - b[1]);
+  for (let i = cap; i < ranked.length; i++) plan.voices.delete(ranked[i][0]);
+}
 
 function specPos(spec, L) {
   if (spec.posMode === 'listener') {
@@ -2888,6 +2913,9 @@ export class WeatherEngine {
     this._lastCtl = null;
     this._lastL = null;
     this._tickErr = false;
+    // Live voice budget; the load governor in _tickNow lowers it if the audio clock falls behind.
+    this._voiceCap = this._quality === 'low' ? 8 : this._quality === 'high' ? 24 : 12;
+    this._loadWin = null;
   }
 
   static _autoQuality() {
@@ -3058,6 +3086,34 @@ export class WeatherEngine {
     this._plan = null;
     this._planSig = '';
     this._stats.clear();
+  }
+
+  /** If the audio clock runs slower than real time (the graph is too heavy), shed the farthest voices. */
+  _governLoad(ctx, now) {
+    if (ctx.state !== 'running') {
+      this._loadWin = null;
+      return;
+    }
+    const t = nowMs();
+    const w = this._loadWin;
+    // Skip the first seconds after start or a rebuild: worklet JIT warm-up runs slow by itself.
+    if (!w) {
+      this._loadWin = { t: t + 8000, c: now };
+      return;
+    }
+    if (t < w.t) {
+      w.c = now;
+      return;
+    }
+    if (t - w.t < 3000) return;
+    const speed = (now - w.c) / ((t - w.t) / 1000);
+    this._loadWin = { t, c: now };
+    if (speed < 0.93 && this._voiceCap > 6) {
+      this._voiceCap = Math.max(6, Math.round(this._voiceCap * 0.7));
+      this._ver++;
+      this._loadWin = { t: t + 8000, c: now };
+      this._emit('load', { speed, voiceCap: this._voiceCap });
+    }
   }
 
   async suspend() {
@@ -3267,6 +3323,7 @@ export class WeatherEngine {
     if (!ctx || !g) return;
     try {
       const now = ctx.currentTime;
+      this._governLoad(ctx, now);
       let dt = now - this._lastCtxT;
       this._lastCtxT = now;
       if (!(dt > 0) || ctx.state !== 'running') dt = 0;
@@ -3287,6 +3344,7 @@ export class WeatherEngine {
         const S = overlay(this.scene, ctl.tl);
         const env = this._env(L);
         const plan = planScene(S, ctl, env);
+        capVoices(plan, this._voiceCap, env.listener);
         env.fieldSum = plan.fieldSum;
         applyPlan(g, this._plan, plan, ctl, this._model, env, now);
         this._plan = plan;
