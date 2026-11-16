@@ -1,6 +1,6 @@
 /**
  * "Describe your weather": a deterministic parser from plain words to a
- * rainscene patch (MASTER_PLAN 6.7). Known vocabulary only, no network, no ML:
+ * rainscene patch. Known vocabulary only, no network, no ML:
  * rain words and WMO intensities, mm/h and in/h, Beaufort names, "force 6",
  * "30 mph gusts", "from the west" / "westerly", thunder distance words, km/miles,
  * flash-to-bang seconds (distance = t * c(T)), surfaces, shelters, places, time,

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://ahmadhassan-bted.github.io/RainGen-RainGenerator/sitemap.xml

@@ -1,5 +1,5 @@
 /**
- * Human units and labels for the weather engine (MASTER_PLAN §6.3, §6.9).
+ * Human units and labels for the weather engine.
  *
  * - Beaufort scale: WMO-No. 306 / WMO Manual on Marine Meteorological Services,
  *   land descriptions after the UK Met Office table. Continuous mapping uses the

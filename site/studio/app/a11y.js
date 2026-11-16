@@ -1,8 +1,8 @@
 /**
  * Accessibility and human-unit helpers for the raingen 4D Environment Composer.
  *
- * - Spoken values follow MASTER_PLAN section 6.10: every control reads in human
- *   units ("force 5, fresh breeze, 30 km/h from the west").
+ * - Spoken values: every control reads in human units ("force 5, fresh
+ *   breeze, 30 km/h from the west"), never as a bare number.
  * - FlashLimiter implements the WCAG 2.3.1 general flash threshold (no more than
  *   three flashes in any one-second period) and merges multi-stroke lightning
  *   (return strokes 40-60 ms apart) into a single visual flash. With

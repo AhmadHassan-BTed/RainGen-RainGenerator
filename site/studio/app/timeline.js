@@ -1,20 +1,20 @@
 /**
  * Timeline: the fourth dimension of the 4D Environment Composer.
  *
- * A dope sheet in the grammar of Unreal Sequencer / Houdini / Pro Tools lanes
- * (MASTER_PLAN 3.5): one lane per animated parameter path (the same canonical
- * dotted id everywhere), keyframes you can drag, a playhead that scrubs the
- * world, a loop region, storm-arc presets and record (latch) mode.
+ * A dope sheet in the grammar of Unreal Sequencer / Houdini / Pro Tools lanes:
+ * one lane per animated parameter path (the same canonical dotted id
+ * everywhere), keyframes you can drag, a playhead that scrubs the world, a
+ * loop region, storm-arc presets and record (latch) mode.
  *
- * Automation priority follows MASTER_PLAN 2.7: automation lane -> lock ->
- * driver + offset, so while a lane is active it wins; a lane being recorded is
- * "latched" and the user's live gesture wins instead.
+ * Automation priority: automation lane -> pin -> driver + offset, so while a
+ * lane is active it wins; a lane being recorded is "latched" and the user's
+ * live gesture wins instead.
  * Curves: linear; log (geometric x(u) = a (b/a)^u, perceptually even for mm/h
  * and km, which the ear judges by ratio); hold; smooth (Hermite smoothstep).
  * Compass angles interpolate along the shortest arc.
  * Timecode: mm:ss.cc and SMPTE HH:MM:SS:FF at 30 fps non-drop (SMPTE ST 12-1).
- * No-drag alternatives per MASTER_PLAN 2.9: Points table, P adds a point at the
- * playhead, Alt+Left/Right jumps between points, Ctrl+G goes to a time.
+ * Every drag has a keyboard alternative: the Points table, P adds a point at
+ * the playhead, Alt+Left/Right jumps between points, Ctrl+G goes to a time.
  */
 import { PARAMS, paramSpec, clone } from './scene-store.js';
 import { STORM_ARCS } from './presets.js';
@@ -923,7 +923,7 @@ export class Timeline {
     this.gotoInput.select();
   }
 
-  /** Storm-arc preset: rewrite the rain / wind / thunder lanes over the arc length (MASTER_PLAN 3.4). */
+  /** Storm-arc preset: rewrite the rain / wind / thunder lanes over the arc length (shapes in presets.js STORM_ARCS). */
   applyArc(name) {
     const fn = STORM_ARCS[name];
     if (!fn) return;

@@ -1,6 +1,6 @@
 /**
  * rg-rain-surface: precipitation impacts on one surface patch or object.
- * Physics after MASTER_PLAN §3.2-3.5 and §5.2:
+ * Physics:
  *
  * - Events: one doubly stochastic (Cox) process per drop class: Poisson inside a render
  *   quantum, rate modulated by multiplicative 1/f noise (Lovejoy & Schertzer 2008) and by
@@ -19,12 +19,16 @@
  * - Splashes: drops on dry hard surfaces shed micro-impacts 5-50 ms later.
  * - Drips: integrate-and-fire catchments, Tate's-law drop volume, chaotic jitter at high
  *   flow (Shaw 1984). Flow: gutter/downspout bubble cloud through open-pipe resonances
- *   f_n = n c / 2L (a hypothesis, MASTER_PLAN §3.9).
+ *   f_n = n c / 2L.
  * - Level of detail: above maxEventsPerSec the remaining events are rendered as
  *   variance-matched noise excitation (Campbell's theorem), keeping the energy exact.
  *
  * Static configuration arrives in processorOptions (and 'config' port messages); every
- * time-varying quantity is a k-rate AudioParam so offline renders are deterministic.
+ * time-varying quantity is a k-rate AudioParam so offline renders are deterministic. The
+ * weather shared by every surface (class impact rates and diameters, film wetness, puddle
+ * depth, liquid rate) lives on one rg-weather bus node: its output feeds each surface's input,
+ * so the bus is rendered first in every quantum and the surfaces read its values directly.
+ * A surface only carries its own intensity, wind and gain.
  */
 
 const TWO_PI = Math.PI * 2;
@@ -42,6 +46,31 @@ const BUB_ALPHA = [2, 2, 2.5, 2.5, 2.2, 2.0, 2.2];
 const BUB_AMP = [0, 0.12, 0.08, 0.6, 0.9, 0.7, 0.8];
 const V2 = 9.65 - 10.3 * Math.exp(-1.2);
 const FREF = 4 * V2 * V2;
+// Terminal fall speed of liquid drops (Atlas et al. 1973 from 0.5 mm, Stokes drag below 0.1 mm,
+// linear bridge between), tabulated every 5 um up to 10 mm (interpolation error < 1e-5 m/s).
+const VT_STEP = 0.005;
+const VT_N = 2001;
+const VT = new Float64Array(VT_N + 1);
+{
+  const k = (9.81 * 1e-6 * (998 - 1.204)) / (18 * 1.81e-5);
+  const vS = k * 0.01;
+  const vA = 9.65 - 10.3 * Math.exp(-0.3);
+  for (let i = 0; i <= VT_N; i++) {
+    const d = i * VT_STEP;
+    VT[i] = d >= 0.5 ? 9.65 - 10.3 * Math.exp(-0.6 * d) : d >= 0.1 ? vS + ((vA - vS) * (d - 0.1)) / 0.4 : k * d * d;
+  }
+}
+function liquidFallSpeed(D) {
+  const x = D / VT_STEP;
+  if (!(x > 0)) return 0.1;
+  if (x >= VT_N) return 9.65 - 10.3 * Math.exp(-0.6 * D);
+  const i = x | 0;
+  const v = VT[i] + (VT[i + 1] - VT[i]) * (x - i);
+  return v > 0.1 ? v : 0.1;
+}
+// Shared weather per bus id: r0..r5, d0..d5, wetness, puddle, liquid.
+const BUSES = new Map();
+const BUS_SIZE = 15;
 const F2MM_N = 0.83 * 998 * 4e-6 * V2 * V2;
 const KIND = { solid: 0, water: 1, membrane: 2, soft: 3 };
 const RN = ['r0', 'r1', 'r2', 'r3', 'r4', 'r5'];
@@ -231,21 +260,18 @@ class Mat {
 
 class RainSurfaceProcessor extends AudioWorkletProcessor {
   static get parameterDescriptors() {
-    const d = [];
-    for (let i = 0; i < 6; i++) d.push({ name: RN[i], defaultValue: 0, minValue: 0, maxValue: 1e7, automationRate: 'k-rate' });
-    for (let i = 0; i < 6; i++) d.push({ name: DN[i], defaultValue: 0, minValue: 0, maxValue: 100, automationRate: 'k-rate' });
-    d.push({ name: 'intensity', defaultValue: 0, minValue: 0, maxValue: 100, automationRate: 'k-rate' });
-    d.push({ name: 'wind', defaultValue: 0, minValue: 0, maxValue: 200, automationRate: 'k-rate' });
-    d.push({ name: 'wetness', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' });
-    d.push({ name: 'puddle', defaultValue: 0, minValue: 0, maxValue: 2000, automationRate: 'k-rate' });
-    d.push({ name: 'flow', defaultValue: 0, minValue: 0, maxValue: 2000, automationRate: 'k-rate' });
-    d.push({ name: 'gain', defaultValue: 1, minValue: 0, maxValue: 1000, automationRate: 'k-rate' });
-    return d;
+    return [
+      { name: 'intensity', defaultValue: 0, minValue: 0, maxValue: 100, automationRate: 'k-rate' },
+      { name: 'wind', defaultValue: 0, minValue: 0, maxValue: 200, automationRate: 'k-rate' },
+      { name: 'gain', defaultValue: 1, minValue: 0, maxValue: 1000, automationRate: 'k-rate' },
+    ];
   }
 
   constructor(options) {
     super();
+    const po = (options && options.processorOptions) || {};
     this.sr = sampleRate;
+    this.statsOn = po.stats !== false;
     this.pos = 0;
     this.abs = 0;
     this.qT = new Float64Array(QCAP);
@@ -258,7 +284,13 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     this.qN = 0;
     this.bOn = new Uint8Array(MAXB);
     this.bStart = new Float64Array(MAXB);
-    this.bPh = new Float64Array(MAXB);
+    // Rising-pitch bubble as a rotating phasor z (sin = Im z) whose step w itself rotates by dw.
+    this.bZr = new Float64Array(MAXB);
+    this.bZi = new Float64Array(MAXB);
+    this.bWr = new Float64Array(MAXB);
+    this.bWi = new Float64Array(MAXB);
+    this.bDr = new Float64Array(MAXB);
+    this.bDi = new Float64Array(MAXB);
     this.bF = new Float64Array(MAXB);
     this.bDf = new Float64Array(MAXB);
     this.bEnv = new Float64Array(MAXB);
@@ -288,16 +320,22 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     this.store = 0;
     this.dribAcc = 0;
     this.streamExcess = 0;
+    this.blockEvents = 0;
+    this.wind = 0;
+    this.wet = 0;
+    this.puddleDepth = 0;
+    this.puddleCover = 0;
+    this.wResLast = 0;
     this.lastCfg = {};
-    this.statsOn = true;
-    this.configure((options && options.processorOptions) || {});
+    this.configure(po);
     this.port.onmessage = (e) => this.onMessage(e.data);
   }
 
   _alloc(n) {
-    this.exA = new Float64Array(n);
-    this.exB = new Float64Array(n);
-    this.exN = new Float64Array(n);
+    // Excitation scratch shares the rings' element type so the inner loops stay monomorphic.
+    this.exA = new Float32Array(n);
+    this.exB = new Float32Array(n);
+    this.exN = new Float32Array(n);
     this.acc = new Float64Array(n);
     this.mixBuf = new Float64Array(n);
   }
@@ -307,6 +345,10 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     this.lastCfg = c;
     const sr = this.sr;
     this.id = String(c.id ?? '');
+    this.busId = String(c.bus ?? 'main');
+    this.wetMul = Math.max(0, num(c.wetMul, 1));
+    this.puddleMul = Math.max(0, num(c.puddleMul, 1));
+    this.flowMul = Math.max(0, num(c.flowMul, 1));
     this.kind = c.kind === 'drip' ? 1 : c.kind === 'flow' ? 2 : 0;
     this.area = Math.max(0, num(c.area, 1));
     this.exposure = clamp(num(c.exposure, 1), 0, 4);
@@ -477,7 +519,7 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     if (c === 5 && kind === 1) return 11.45 * Math.sqrt(D / 10);
     if (kind === 2) return 0.85 + 0.3 * this.rng.next();
     if (kind === 3) return 1.4 + 0.3 * D;
-    return Math.max(0.1, 9.65 - 10.3 * Math.exp(-0.6 * D));
+    return liquidFallSpeed(D);
   }
 
   enqueue(tAbs, D, V, c, kind, mi, micro) {
@@ -594,9 +636,10 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     const nAmp = A * (m.noise + 0.25 * this.wet * (m.kind === 0 ? 1 : 0.5));
     if (nAmp > 1e-6) this.noiseBurst(m, off, nAmp, m.noiseDecay * Math.sqrt(Math.max(0.3, D) / 2) * (1 + this.wet));
     if (!micro && kind === 0 && m.splash > 0 && D > 0.8) {
-      const k = rng.poisson(m.splash * 1.6 * Math.pow(D / 2, 1.5) * (1 + 0.5 * this.wet));
+      const h = 0.5 * D;
+      const k = rng.poisson(m.splash * 1.6 * h * Math.sqrt(h) * (1 + 0.5 * this.wet));
       for (let s = 0; s < k; s++) {
-        const delay = 0.005 * Math.pow(10, rng.next());
+        const delay = 0.005 * Math.exp(2.302585092994046 * rng.next());
         this.enqueue(this.abs + off + delay * sr, 0.25 + 0.5 * rng.next(), 1 + 2 * rng.next(), c, 0, mi, true);
       }
     }
@@ -613,10 +656,15 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     const Ln = Math.min(480, Math.ceil(tau * 4));
     const k = Math.exp(-1 / tau);
     let e = amp;
-    const base = this.pos + off;
+    const j0 = (this.pos + off) & RMASK;
+    const n1 = Math.min(Ln, RING - j0);
     const r = m.ringN;
-    for (let i = 0; i < Ln; i++) {
-      r[(base + i) & RMASK] += e;
+    for (let i = 0; i < n1; i++) {
+      r[j0 + i] += e;
+      e *= k;
+    }
+    for (let i = 0; i < Ln - n1; i++) {
+      r[i] += e;
       e *= k;
     }
   }
@@ -673,11 +721,18 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     } else {
       this.activeBubbles++;
     }
+    const k = TWO_PI / this.sr;
+    const df = (f0 * 0.1 * beta) / this.sr;
     this.bOn[v] = 1;
     this.bStart[v] = startAbs;
-    this.bPh[v] = 0;
+    this.bZr[v] = 1;
+    this.bZi[v] = 0;
+    this.bWr[v] = Math.cos(k * f0);
+    this.bWi[v] = Math.sin(k * f0);
+    this.bDr[v] = Math.cos(k * df);
+    this.bDi[v] = Math.sin(k * df);
     this.bF[v] = f0;
-    this.bDf[v] = (f0 * 0.1 * beta) / this.sr;
+    this.bDf[v] = df;
     this.bEnv[v] = 1;
     this.bDec[v] = Math.exp(-beta / this.sr);
     this.bAmp[v] = amp;
@@ -830,23 +885,30 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     if (N > this.mixBuf.length) this._alloc(N);
     const sr = this.sr;
     const P = parameters;
-    for (let c = 0; c < 6; c++) {
-      const r = P[RN[c]];
-      const d = P[DN[c]];
-      this.rates[c] = r && r.length ? r[0] : 0;
-      this.dpar[c] = d && d.length ? d[0] : 0;
+    const S = BUSES.get(this.busId);
+    if (S) {
+      for (let c = 0; c < 6; c++) {
+        this.rates[c] = S[c];
+        this.dpar[c] = S[6 + c];
+      }
+    } else {
+      this.rates.fill(0);
+      this.dpar.fill(0);
     }
     const intensity = Math.max(0, P.intensity ? P.intensity[0] : 0);
     const wind = Math.max(0, P.wind ? P.wind[0] : 0);
-    const wet = clamp(P.wetness ? P.wetness[0] : 0, 0, 1);
-    const puddle = Math.max(0, P.puddle ? P.puddle[0] : 0);
-    const flow = Math.max(0, P.flow ? P.flow[0] : 0);
     const gain = Math.max(0, P.gain ? P.gain[0] : 1);
+    const wet = S ? clamp(S[12] * this.wetMul, 0, 1) : 0;
+    const puddle = S ? Math.max(0, S[13] * this.puddleMul) : 0;
+    const flow = S ? Math.max(0, S[14] * this.flowMul) : 0;
     this.wind = wind;
     this.wet = wet;
     this.puddleDepth = puddle;
     this.puddleCover = puddle > 0.05 ? 1 - Math.exp(-puddle / 6) : 0;
-    for (const m of this.mats) {
+    const mats = this.mats;
+    const nMats = mats.length;
+    for (let mi = 0; mi < nMats; mi++) {
+      const m = mats[mi];
       if (Math.abs(m.wetSet - wet) > 0.02) m.update(wet, sr);
       m.share = m.kind === 1 ? 0 : m.puddleable ? m.fraction * (1 - this.puddleCover) : m.fraction;
     }
@@ -867,30 +929,46 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    const exA = this.exA;
-    const exB = this.exB;
-    const exN = this.exN;
     const acc = this.acc;
     const mix = this.mixBuf;
     mix.fill(0, 0, N);
     let ns = this.ns;
     const base = this.pos;
+    // The rings are read in place when this quantum does not wrap around them (always, for
+    // 128-frame quanta), and cleared with one fill afterwards.
+    const direct = base + N <= RING;
 
-    for (let mi = 0; mi < this.mats.length; mi++) {
-      const m = this.mats[mi];
+    for (let mi = 0; mi < nMats; mi++) {
+      const m = mats[mi];
       if (m.kind === 1) continue;
-      const rA = m.ringA;
-      const rB = m.ringB;
-      const rNz = m.ringN;
-      for (let i = 0; i < N; i++) {
-        const j = (base + i) & RMASK;
-        exA[i] = rA[j];
-        rA[j] = 0;
-        exB[i] = rB[j];
-        rB[j] = 0;
-        exN[i] = rNz[j];
-        rNz[j] = 0;
+      let xa;
+      let xb;
+      let xn;
+      let o;
+      if (direct) {
+        xa = m.ringA;
+        xb = m.ringB;
+        xn = m.ringN;
+        o = base;
+      } else {
+        xa = this.exA;
+        xb = this.exB;
+        xn = this.exN;
+        o = 0;
+        const rA = m.ringA;
+        const rB = m.ringB;
+        const rNz = m.ringN;
+        for (let i = 0; i < N; i++) {
+          const j = (base + i) & RMASK;
+          xa[i] = rA[j];
+          rA[j] = 0;
+          xb[i] = rB[j];
+          rB[j] = 0;
+          xn[i] = rNz[j];
+          rNz[j] = 0;
+        }
       }
+      // Events above maxEventsPerSec: variance-matched low-passed noise on both buses.
       const rv = this.residVar * m.share;
       if (rv > 0) {
         const a = this.resA;
@@ -901,40 +979,70 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
           ns ^= ns >>> 17;
           ns ^= ns << 5;
           lp += a * (s * (ns / 2147483648) - lp);
-          exA[i] += 0.5 * lp;
-          exB[i] += 0.5 * lp;
+          xa[o + i] += 0.5 * lp;
+          xb[o + i] += 0.5 * lp;
         }
         m.resLp = lp;
       }
+      // Modal bank: even modes ride bus A, odd modes bus B; two modes per pass over the block.
       acc.fill(0, 0, N);
       const nm = m.n;
-      for (let k = 0; k < nm; k++) {
-        const ex = m.bus[k] ? exB : exA;
-        const c1 = m.c1[k];
-        const c2 = m.c2[k];
-        const b = m.b[k];
-        let y1 = m.y1[k];
-        let y2 = m.y2[k];
+      const C1 = m.c1;
+      const C2 = m.c2;
+      const B = m.b;
+      const Y1 = m.y1;
+      const Y2 = m.y2;
+      let k = 0;
+      for (; k + 1 < nm; k += 2) {
+        const a1 = C1[k];
+        const a2 = C2[k];
+        const ab = B[k];
+        const b1 = C1[k + 1];
+        const b2 = C2[k + 1];
+        const bb = B[k + 1];
+        let p1 = Y1[k];
+        let p2 = Y2[k];
+        let q1 = Y1[k + 1];
+        let q2 = Y2[k + 1];
         for (let i = 0; i < N; i++) {
-          const y = c1 * y1 - c2 * y2 + b * ex[i];
-          y2 = y1;
-          y1 = y;
-          acc[i] += y;
+          const ya = a1 * p1 - a2 * p2 + ab * xa[o + i];
+          const yb = b1 * q1 - b2 * q2 + bb * xb[o + i];
+          p2 = p1;
+          p1 = ya;
+          q2 = q1;
+          q1 = yb;
+          acc[i] += ya + yb;
         }
-        if (y1 < 1e-18 && y1 > -1e-18) y1 = 0;
-        if (y2 < 1e-18 && y2 > -1e-18) y2 = 0;
-        m.y1[k] = y1;
-        m.y2[k] = y2;
+        Y1[k] = p1 < 1e-18 && p1 > -1e-18 ? 0 : p1;
+        Y2[k] = p2 < 1e-18 && p2 > -1e-18 ? 0 : p2;
+        Y1[k + 1] = q1 < 1e-18 && q1 > -1e-18 ? 0 : q1;
+        Y2[k + 1] = q2 < 1e-18 && q2 > -1e-18 ? 0 : q2;
       }
+      if (k < nm) {
+        const a1 = C1[k];
+        const a2 = C2[k];
+        const ab = B[k];
+        let p1 = Y1[k];
+        let p2 = Y2[k];
+        for (let i = 0; i < N; i++) {
+          const ya = a1 * p1 - a2 * p2 + ab * xa[o + i];
+          p2 = p1;
+          p1 = ya;
+          acc[i] += ya;
+        }
+        Y1[k] = p1 < 1e-18 && p1 > -1e-18 ? 0 : p1;
+        Y2[k] = p2 < 1e-18 && p2 > -1e-18 ? 0 : p2;
+      }
+      // Directly radiated click (dF/dt), wet-slap / rustle noise bursts, material low-pass.
       const cg = m.click * (1 - 0.45 * wet);
       let prev = m.prevF;
       let lpY = m.lpY;
       const lpA = m.lpA;
       for (let i = 0; i < N; i++) {
-        const F = exA[i] + exB[i];
+        const F = xa[o + i] + xb[o + i];
         let y = acc[i] + cg * (F - prev);
         prev = F;
-        const e = exN[i];
+        const e = xn[o + i];
         if (e !== 0) {
           ns ^= ns << 13;
           ns ^= ns >>> 17;
@@ -949,6 +1057,11 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
       }
       m.prevF = prev;
       m.lpY = lpY < 1e-18 && lpY > -1e-18 ? 0 : lpY;
+      if (direct) {
+        xa.fill(0, o, o + N);
+        xb.fill(0, o, o + N);
+        xn.fill(0, o, o + N);
+      }
     }
 
     // Water clicks (water materials and puddled patches share one radiating surface).
@@ -956,17 +1069,26 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
       const rW = this.ringW;
       let wPrev = this.wPrev;
       const wc = this.wClick;
-      for (let i = 0; i < N; i++) {
-        const j = (base + i) & RMASK;
-        const F = rW[j];
-        rW[j] = 0;
-        mix[i] += wc * (F - wPrev);
-        wPrev = F;
+      if (direct) {
+        for (let i = 0; i < N; i++) {
+          const F = rW[base + i];
+          mix[i] += wc * (F - wPrev);
+          wPrev = F;
+        }
+        rW.fill(0, base, base + N);
+      } else {
+        for (let i = 0; i < N; i++) {
+          const j = (base + i) & RMASK;
+          const F = rW[j];
+          rW[j] = 0;
+          mix[i] += wc * (F - wPrev);
+          wPrev = F;
+        }
       }
       this.wPrev = wPrev;
       if (this.residWater > 0) {
         const s = Math.sqrt(this.residWater) * 1.2;
-        let last = this.wResLast || 0;
+        let last = this.wResLast;
         for (let i = 0; i < N; i++) {
           ns ^= ns << 13;
           ns ^= ns >>> 17;
@@ -979,10 +1101,9 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Minnaert bubbles with rising pitch.
+    // Minnaert bubbles with rising pitch: sin(phase) from a rotating phasor (no per-sample sin).
     if (this.activeBubbles > 0) {
       const absStart = this.abs;
-      const k = TWO_PI / sr;
       let active = 0;
       for (let v = 0; v < this.maxBub; v++) {
         if (!this.bOn[v]) continue;
@@ -993,22 +1114,35 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
         }
         if (i0 < 0) i0 = 0;
         i0 = Math.floor(i0);
-        let ph = this.bPh[v];
-        let f = this.bF[v];
+        let zr = this.bZr[v];
+        let zi = this.bZi[v];
+        let wr = this.bWr[v];
+        let wi = this.bWi[v];
+        const dr = this.bDr[v];
+        const di = this.bDi[v];
         let env = this.bEnv[v];
-        const df = this.bDf[v];
         const dec = this.bDec[v];
         const amp = this.bAmp[v];
         for (let i = i0; i < N; i++) {
-          ph += k * f;
-          f += df;
-          mix[i] += amp * env * Math.sin(ph);
+          const t = zr * wr - zi * wi;
+          zi = zr * wi + zi * wr;
+          zr = t;
+          const u = wr * dr - wi * di;
+          wi = wr * di + wi * dr;
+          wr = u;
+          mix[i] += amp * env * zi;
           env *= dec;
         }
+        const f = this.bF[v] + this.bDf[v] * (N - i0);
         if (env < 1e-4 || f > 0.48 * sr) {
           this.bOn[v] = 0;
         } else {
-          this.bPh[v] = ph % TWO_PI;
+          const gz = 1 / Math.sqrt(zr * zr + zi * zi);
+          const gw = 1 / Math.sqrt(wr * wr + wi * wi);
+          this.bZr[v] = zr * gz;
+          this.bZi[v] = zi * gz;
+          this.bWr[v] = wr * gw;
+          this.bWi[v] = wi * gw;
           this.bF[v] = f;
           this.bEnv[v] = env;
           active++;
@@ -1046,6 +1180,12 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
           }
           mix[i] = 0.6 * x + 0.8 * s;
         }
+        // Resonators ringing down on silence would otherwise decay into subnormal numbers.
+        for (let p = 0; p < this.pipe.length; p++) {
+          const q = this.pipe[p];
+          if (q[5] < 1e-20 && q[5] > -1e-20) q[5] = 0;
+          if (q[6] < 1e-20 && q[6] > -1e-20) q[6] = 0;
+        }
       }
     }
 
@@ -1069,7 +1209,7 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
     if (idle && energy < 1e-13) {
       this.quiet++;
       if (this.quiet === 12) {
-        for (const m of this.mats) m.silence();
+        for (let mi = 0; mi < nMats; mi++) mats[mi].silence();
         this.dcX = 0;
         this.dcY = 0;
         this.wPrev = 0;
@@ -1099,4 +1239,53 @@ class RainSurfaceProcessor extends AudioWorkletProcessor {
   }
 }
 
+/**
+ * rg-weather: the weather bus. Its k-rate parameters are the drop-class impact rates r0..r5
+ * (m^-2 s^-1), the class mean diameters d0..d5 (mm), film wetness (0-1), puddle depth (mm)
+ * and the liquid rain rate (mm/h) feeding drips and gutters. Each quantum it publishes them
+ * for every rg-rain-surface node on the same bus; it outputs silence.
+ */
+class WeatherBusProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    const d = [];
+    for (let i = 0; i < 6; i++) d.push({ name: RN[i], defaultValue: 0, minValue: 0, maxValue: 1e7, automationRate: 'k-rate' });
+    for (let i = 0; i < 6; i++) d.push({ name: DN[i], defaultValue: 0, minValue: 0, maxValue: 100, automationRate: 'k-rate' });
+    d.push({ name: 'wetness', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' });
+    d.push({ name: 'puddle', defaultValue: 0, minValue: 0, maxValue: 2000, automationRate: 'k-rate' });
+    d.push({ name: 'liquid', defaultValue: 0, minValue: 0, maxValue: 2000, automationRate: 'k-rate' });
+    return d;
+  }
+
+  constructor(options) {
+    super();
+    const po = (options && options.processorOptions) || {};
+    this.busId = String(po.bus ?? 'main');
+    this.state = new Float64Array(BUS_SIZE);
+    this.alive = true;
+    BUSES.set(this.busId, this.state);
+    this.port.onmessage = (e) => {
+      if (e.data && e.data.type === 'dispose') {
+        this.alive = false;
+        if (BUSES.get(this.busId) === this.state) BUSES.delete(this.busId);
+      }
+    };
+  }
+
+  process(inputs, outputs, parameters) {
+    const s = this.state;
+    for (let i = 0; i < 6; i++) {
+      const r = parameters[RN[i]];
+      const d = parameters[DN[i]];
+      s[i] = r && r.length ? r[0] : 0;
+      s[6 + i] = d && d.length ? d[0] : 0;
+    }
+    s[12] = parameters.wetness ? parameters.wetness[0] : 0;
+    s[13] = parameters.puddle ? parameters.puddle[0] : 0;
+    s[14] = parameters.liquid ? parameters.liquid[0] : 0;
+    if (BUSES.get(this.busId) !== s && this.alive) BUSES.set(this.busId, s);
+    return this.alive;
+  }
+}
+
 registerProcessor('rg-rain-surface', RainSurfaceProcessor);
+registerProcessor('rg-weather', WeatherBusProcessor);

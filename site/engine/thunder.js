@@ -1,5 +1,5 @@
 /**
- * Lightning channels and thunder synthesis for the browser engine (MASTER_PLAN §7.7, §9.5).
+ * Lightning channels and thunder synthesis for the browser engine.
  * Design: "signal-based, physics-inspired" (Fineberg; Reiss, Tez & Selfridge, AES 150, 2021).
  *
  * - Channel: tortuous piecewise-linear random walk, mean direction change ~16 deg per
@@ -14,7 +14,7 @@
  *   apart (Rakov & Uman 2003) that re-excite the channel below the cloud base.
  * - Propagation: delay r / c(T), spherical spreading 1/r, broadside directivity of each
  *   element, ISO 9613-1 absorption applied per log-distance band (14 bands share one
- *   low-pass, MASTER_PLAN §9.5), the refraction shadow r = sqrt(2c/a)(sqrt(h_s) + sqrt(h_r))
+ *   low-pass), the refraction shadow r = sqrt(2c/a)(sqrt(h_s) + sqrt(h_r))
  *   with a = dc/dz from the lapse rate, and wind refraction c_eff = c + u cos(theta).
  * - Rumble: the arrival-energy envelope, convolved with an exponential terrain/cloud echo
  *   tail, modulates decorrelated low-passed noise: the signal-based layer that carries the

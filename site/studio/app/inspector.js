@@ -1,8 +1,8 @@
 /**
- * Inspector panel: human-unit controls over the shared parameter graph
- * (MASTER_PLAN 6.3-6.6). With nothing selected it shows the WEATHER tier,
- * PLACE & LISTENER and a collapsed ENGINEER section; with an object selected it
- * shows that object's material, size, params, rain exposure and impact rate.
+ * Inspector panel: human-unit controls over the shared parameter graph.
+ * With nothing selected it shows WEATHER, PLACE & LISTENER and a collapsed
+ * ENGINEER section; with an object selected it shows that object's material,
+ * size, params, rain exposure and impact rate.
  * Every control carries an Auto / Offset / Pinned provenance badge (shape + text),
  * Alt-click re-links, right-click (or Shift+F10) offers "Animate".
  */
@@ -125,12 +125,12 @@ export class Inspector {
     for (const v of this.visibility) v.el.hidden = !v.test(s);
   }
 
-  /* ------------------------------------------------------------------ weather tier */
+  /* ------------------------------------------------------------------ weather */
   _renderWeather() {
     const s = this.store.scene;
     const head = h('div', { class: 'panel-head' },
       h('h2', { id: 'inspector-title', text: 'Weather' }),
-      h('span', { class: 'tier-chip', text: 'Tier 1 · human units' }),
+      h('span', { class: 'tier-chip', text: 'Human units' }),
     );
     const name = h('input', {
       type: 'text', class: 'scene-name', value: s.name, 'aria-label': 'Scene name', maxlength: 120,
@@ -176,13 +176,13 @@ export class Inspector {
     for (const p of ['weather.temperature_c', 'weather.humidity_pct', 'weather.hour', 'weather.season', 'weather.storm_arc', 'weather.arc_minutes']) air.append(this._row(paramSpec(p)));
 
     const place = sec('Place & listener', true, 'tier-2');
-    place.append(h('p', { class: 'tier-note', text: 'Tier 2 · where you are and how you listen' }));
+    place.append(h('p', { class: 'tier-note', text: 'Where you are and how you listen' }));
     for (const p of ['place.preset', 'place.shelter']) place.append(this._row(paramSpec(p)));
     place.append(this._surfaceMix());
     for (const p of ['place.window_open', 'place.wipers', 'listener.height_m', 'listener.heading_deg', 'listener.render', 'mode']) place.append(this._row(paramSpec(p)));
 
     const eng = sec('Engineer', false, 'tier-3');
-    eng.append(h('p', { class: 'tier-note', text: 'Tier 3 · physics, randomness and smoothing' }));
+    eng.append(h('p', { class: 'tier-note', text: 'Physics, randomness and smoothing' }));
     eng.append(this._seedRow());
     eng.append(this._nullableRow(paramSpec('weather.precipitation.mu'), 3));
     eng.append(this._nullableRow(paramSpec('weather.precipitation.dm_mm'), 1.6));
@@ -310,7 +310,9 @@ export class Inspector {
       const ticks = h('div', { class: 'detents', 'aria-hidden': 'true' });
       for (const [v, lab] of WMO_DETENTS) {
         const x = (Math.log(v / spec.min) / Math.log(spec.max / spec.min)) * 100;
-        ticks.append(h('span', { class: 'detent', style: { left: `${x}%` }, title: `${v} mm/h`, text: lab }));
+        // the slider is narrow, so the closely spaced heavy/intense ticks carry their names as tooltips only
+        const shown = lab === 'drizzle' || lab === 'moderate' || lab === 'cloudburst' ? lab : '';
+        ticks.append(h('span', { class: 'detent', style: { left: `${x}%` }, title: lab ? `${lab}: ${v} mm/h` : `${v} mm/h`, text: shown }));
       }
       ctl.append(ticks);
     }
@@ -626,7 +628,7 @@ export class Inspector {
       },
     });
     const row = h('div', { class: 'row' }, h('div', { class: 'row-head' }, h('label', { for: id, class: 'row-label', text: 'Seed (hex)' })), h('div', { class: 'ctl-line' }, inp, btn),
-      h('p', { class: 'row-help', text: 'Same scene + seed = the same audio, bit for bit.' }));
+      h('p', { class: 'row-help', text: 'The seed fixes the random detail: the same scene and seed give the same render.' }));
     this.controls.set('seed', { update: (v) => { if (document.activeElement !== inp) inp.value = (v >>> 0 === v ? v.toString(16) : Math.floor(v).toString(16)).toUpperCase(); }, row });
     return row;
   }
@@ -753,7 +755,7 @@ export class Inspector {
         P('radius_m', 'Radius', 'm', 0.3, 1.5, 0.05);
         break;
       case 'gutter':
-        P('length_m', 'Length', 'm', 0.5, 30, 0.5, { note: () => 'Gutter/downspout model is a hypothesis until checked against recordings.' });
+        P('length_m', 'Length', 'm', 0.5, 30, 0.5, { note: () => 'Fed by the roof it sits under: the flow builds and fades over about half a minute as the rain changes.' });
         break;
       case 'downspout':
         P('height_m', 'Height', 'm', 0.5, 20, 0.1);

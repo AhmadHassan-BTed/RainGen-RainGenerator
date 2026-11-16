@@ -1,9 +1,9 @@
 /**
  * The 3-D viewport of the 4D Environment Composer (Three.js r160).
  *
- * A world, not knobs (MASTER_PLAN 7.6): objects, a listener with its
- * "hearing footprint" (for ground impacts heard at height h, 50 % of the
- * intensity comes from within radius h and 90 % from within 3h, section 3.5),
+ * A world, not knobs: objects, a listener with its "hearing footprint" (for
+ * dipole-like ground impacts heard at height h, the fraction of intensity from
+ * within radius R is R^2 / (R^2 + h^2): 50 % within h, 90 % within 3h),
  * storm cells as actors on editable track splines, wind streamlines, lightning
  * from the engine's channel geometry and a thunder wavefront expanding at c(T).
  *
@@ -37,7 +37,10 @@ export function expandDist(r) {
 export function webglAvailable() {
   try {
     const c = document.createElement('canvas');
-    return !!(c.getContext('webgl2') || c.getContext('webgl'));
+    const gl = c.getContext('webgl2') || c.getContext('webgl');
+    if (!gl) return false;
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return true;
   } catch (_) {
     return false;
   }
@@ -118,7 +121,6 @@ export class Viewport {
    * @param {{store: any, onListenerLive?: Function, onCaption?: Function, onDemoEnd?: Function, onModeChange?: Function}} opts
    */
   constructor(container, opts) {
-    if (!webglAvailable()) throw new Error('WebGL is not available in this browser.');
     this.container = container;
     this.store = opts.store;
     this.onListenerLive = opts.onListenerLive || (() => {});
@@ -1665,12 +1667,6 @@ export class Viewport {
     if (this.selHelper) this.selHelper.update();
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
-  }
-
-  /** Small PNG snapshot of the current view (for share cards). */
-  snapshot() {
-    this.renderer.render(this.scene, this.camera);
-    return this.renderer.domElement.toDataURL('image/png');
   }
 
   dispose() {

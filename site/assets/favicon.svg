@@ -1,15 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <defs>
-    <linearGradient id="f-drop" x1="18" y1="4" x2="46" y2="62" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#a6e6ff"/>
-      <stop offset="0.55" stop-color="#4bb8f5"/>
-      <stop offset="1" stop-color="#1d67cc"/>
-    </linearGradient>
-    <style>
-      .wave { stroke: #061224; }
-      @media (prefers-color-scheme: light) { .wave { stroke: #04101f; } }
-    </style>
-  </defs>
-  <path d="M32 2C32 2 10 27 10 41.5a22 22 0 0 0 44 0C54 27 32 2 32 2Z" fill="url(#f-drop)"/>
-  <path class="wave" d="M16 42h7l4-10 5 17 5-17 4 10h7" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#000"/>
+  <path d="M32 9C32 9 17 27.5 17 38.5a15 15 0 0 0 30 0C47 27.5 32 9 32 9Z" fill="#f5f7fa"/>
+  <path d="M23 39.5h4l2.5-6 3.5 11 3.4-14 3 11 1.6-2H44" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

@@ -6,8 +6,8 @@ Describe the weather the way you would experience it (heavy rain, a gusty wester
 
 `raingen` is a physics-driven weather and environment sound engine. Rain is built from drop-size distributions striking real materials, wind is heard through the trees, wires and gaps it excites, thunder comes from a lightning-shaped source that is heard at the speed of sound for the air temperature, and shelters, rooms and the aftermath (drips, gutters, wet ground) change everything the way they do outside. Every render is a pure function of **scene + seed + engine version**, so a 10-hour storm can be shared as a 400-byte scene file and reproduced exactly.
 
-- **Live demo (browser prototype):** <https://ahmadhassan-bted.github.io/RainGen-RainGenerator/>
-- **4D Environment Composer (studio prototype):** <https://ahmadhassan-bted.github.io/RainGen-RainGenerator/studio/>
+- **Website with a live in-browser demo:** <https://ahmadhassan-bted.github.io/RainGen-RainGenerator/>
+- **4D Environment Composer:** <https://ahmadhassan-bted.github.io/RainGen-RainGenerator/studio/>
 - **The plan, the science and the roadmap:** [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md)
 
 > **Project status: alpha.** This repository holds the Python reference implementation of the engine (`raingen/`) and the classic pygame simulator (`rain_generator/`). The engine is new prototype code: treat its sound and numbers as unverified until the Phase 0/1 tests and listening checks in the plan are done. A Rust real-time core, DAW/game plugins and native apps are on the roadmap, not in this repository yet.
@@ -189,7 +189,7 @@ Scene (human units, JSON/YAML)  + timeline automation + Auto/Offset/Pinned overr
 | `raingen.io` | streaming WAV/RF64/FLAC writers, UCS naming, captions |
 | `raingen.live`, `raingen.control`, `raingen.wellness` | live weather providers, OSC, wellness modes, dose meter, claims linter |
 | `raingen.render`, `raingen.engine`, `raingen.api`, `raingen.cli` | offline renderer, real-time engine, public API, command line |
-| `site/` | the browser prototype and the 4D Composer (JavaScript / Web Audio) |
+| `site/` | the website: landing page, browser engine and 4D Composer (JavaScript / Web Audio), published to GitHub Pages |
 
 All randomness comes from `RngFactory.get(layer, block)`, so adding a sound layer never changes any other layer, and the same scene and seed render the same audio on the same build.
 

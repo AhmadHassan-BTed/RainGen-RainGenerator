@@ -3,21 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>raingen · 4D Environment Composer</title>
-<meta name="description" content="Build the world, not the knobs: place roofs, trees, puddles, cars and storm cells in 3-D, move through time, and hear physics-driven rain, wind and thunder from wherever you stand.">
-<meta name="theme-color" content="#070b14" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#eef2f8" media="(prefers-color-scheme: light)">
-<meta name="color-scheme" content="dark light">
+<title>raingen · 4D Composer</title>
+<meta name="description" content="Build the world, not the knobs: place roofs, trees, puddles, cars and storm cells in 3-D, move through time, and hear physics-driven rain, wind and thunder from wherever you stand. Runs in your browser.">
+<link rel="canonical" href="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/studio/">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="raingen">
+<meta property="og:title" content="raingen · 4D Composer">
+<meta property="og:description" content="Place roofs, trees, cars and storm cells in 3-D, move through time and hear physics-driven rain, wind and thunder from wherever you stand. In the browser, no install.">
+<meta property="og:url" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/studio/">
+<meta property="og:image" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/assets/og.png">
+<meta property="og:image:alt" content="raingen: physics-driven weather sound">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="raingen · 4D Composer">
+<meta name="twitter:description" content="Build a weather scene in 3-D and hear physics-driven rain, wind and thunder from wherever you stand.">
+<meta name="twitter:image" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/assets/og.png">
+<meta name="twitter:image:alt" content="raingen: physics-driven weather sound">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
-<script>
-  /* Apply the pinned theme before first paint (shared key with the landing page). */
-  (function () {
-    try {
-      var t = localStorage.getItem('rg-theme');
-      if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
-    } catch (e) { /* storage blocked: follow the system theme */ }
-  })();
-</script>
 <script type="importmap">
 {
   "imports": {
@@ -90,9 +93,6 @@
     <button type="button" id="btn-import" class="btn btn-ghost" title="Open a rainscene JSON file">Import</button>
     <input type="file" id="file-import" accept=".json,application/json" hidden>
     <button type="button" id="btn-share" class="btn btn-primary" title="Copy a link with the whole scene inside it">Share</button>
-    <button type="button" id="btn-theme" class="icon-btn" aria-label="Theme: system. Switch theme" title="Theme: system">
-      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18z"/><circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
-    </button>
     <button type="button" id="btn-help" class="icon-btn" aria-label="Help and keyboard shortcuts" title="Help (F1 or ?)" aria-keyshortcuts="F1">?</button>
   </div>
 </header>
@@ -186,7 +186,6 @@
           <dt><kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>2</kbd></dt><dd>Listener / Studio workspace</dd>
           <dt><kbd>Ctrl</kbd>+<kbd>Z</kbd></dt><dd>Undo · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redo</dd>
           <dt><kbd>Ctrl</kbd>+<kbd>S</kbd></dt><dd>Save as my preset</dd>
-          <dt><kbd>Ctrl</kbd>+<kbd>G</kbd></dt><dd>Go to time (accepts 1:30 or 00:01:30:00)</dd>
           <dt><kbd>T</kbd></dt><dd>Strike lightning now</dd>
           <dt><kbd>F1</kbd> or <kbd>?</kbd></dt><dd>This help</dd>
           <dt>Sliders</dt><dd>Arrows fine, <kbd>PgUp</kbd>/<kbd>PgDn</kbd> coarse, <kbd>Home</kbd>/<kbd>End</kbd></dd>
@@ -209,6 +208,7 @@
         <h3>Timeline</h3>
         <dl class="keys">
           <dt><kbd>P</kbd></dt><dd>Add a point at the playhead on the selected track</dd>
+          <dt><kbd>Ctrl</kbd>+<kbd>G</kbd></dt><dd>Go to time (accepts 1:30 or 00:01:30:00)</dd>
           <dt><kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd></dt><dd>Previous / next point</dd>
           <dt><kbd>I</kbd> · <kbd>O</kbd> · <kbd>L</kbd></dt><dd>Loop in · loop out · loop on/off</dd>
           <dt>On a point</dt><dd>Arrows move it (<kbd>Shift</kbd> 1 s), Up/Down change the value, <kbd>C</kbd> cycles the curve</dd>
@@ -288,8 +288,41 @@
 
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-<noscript><style>.gate { display: none !important; }</style><p class="noscript">The composer needs JavaScript. The Python CLI renders the same scenes offline: <code>raingen render scene.json</code>.</p></noscript>
+<noscript>
+  <style>.gate, .app, .skip-link, .topbar > :not(.brand) { display: none !important; }</style>
+  <div class="noscript">
+    <p><strong>The 4D Composer needs JavaScript.</strong> Turn it on for this site and reload the page.</p>
+    <p>The Python CLI renders the same scenes offline: <code>raingen render scene.json</code>. <a href="https://github.com/AhmadHassan-BTed/RainGen-RainGenerator">Get raingen on GitHub</a> or go <a href="../">back to the raingen home page</a>.</p>
+  </div>
+</noscript>
 
 <script type="module" src="app/main.js"></script>
+<script>
+  /* If the composer did not start (a browser without ES modules, or a script that
+     failed to load), the start screen explains that instead of offering dead buttons. */
+  window.addEventListener('load', function () {
+    if (document.documentElement.getAttribute('data-ready')) return;
+    var gate = document.getElementById('gate');
+    var inner = gate && gate.querySelector('.gate-inner');
+    if (!inner) return;
+    while (inner.firstChild) inner.removeChild(inner.firstChild);
+    function para(id, cls, text) {
+      var p = document.createElement('p');
+      if (id) p.id = id;
+      p.className = cls;
+      p.textContent = text;
+      inner.appendChild(p);
+    }
+    para('gate-title', 'gate-kicker', 'raingen · 4D Composer');
+    para('', 'gate-scene', 'The composer could not start here');
+    para('gate-scene', 'gate-note', 'It needs a current version of Chrome, Edge, Firefox or Safari with JavaScript turned on. If you are on one, check your connection and reload the page.');
+    var back = document.createElement('a');
+    back.className = 'link-btn';
+    back.href = '../';
+    back.textContent = 'Back to the raingen home page';
+    inner.appendChild(back);
+    gate.hidden = false;
+  });
+</script>
 </body>
 </html>

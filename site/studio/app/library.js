@@ -1,7 +1,7 @@
 /**
- * Library panel: drag-and-drop palette of world objects (MASTER_PLAN 7.6
- * "build the world, not the knobs") plus an accessible scene outline that
- * mirrors the viewport as a keyboard / screen-reader operable list.
+ * Library panel: drag-and-drop palette of world objects ("build the world,
+ * not the knobs") plus an accessible scene outline that mirrors the viewport
+ * as a keyboard / screen-reader operable list.
  */
 import { make, MATERIALS } from './presets.js';
 import { uid } from './scene-store.js';
@@ -45,7 +45,7 @@ export const LIBRARY = [
   {
     group: 'Water flow',
     items: [
-      { key: 'gutter', label: 'Gutter', desc: 'Trickle + bubble cloud (hypothesis model)', material: 'metal', make: (p) => make.gutter(id('gutter'), p[0], p[1], 2.6, 5) },
+      { key: 'gutter', label: 'Gutter', desc: 'Roof run-off: trickle and bubble cloud', material: 'metal', make: (p) => make.gutter(id('gutter'), p[0], p[1], 2.6, 5) },
       { key: 'downspout', label: 'Downspout', desc: 'Pipe resonance, gurgle', material: 'metal', make: (p) => make.downspout(id('downspout'), p[0], p[1], 2.6) },
       { key: 'eave', label: 'Eave drips', desc: 'Integrate-and-fire drips (Tate drops)', material: 'wood', make: (p) => make.eave(id('eave'), p[0], p[1], 2.6, 4) },
     ],
@@ -274,12 +274,14 @@ export class Library {
 
   _markSelection() {
     const sel = this.store.selection;
-    this.outline?.querySelectorAll('[role="option"]').forEach((li) => {
+    if (!this.outline) return;
+    let active = null;
+    this.outline.querySelectorAll('[role="option"]').forEach((li) => {
       const on = li.dataset.id === sel;
       li.setAttribute('aria-selected', on ? 'true' : 'false');
-      if (on) {
-        this.outline.setAttribute('aria-activedescendant', li.id || (li.id = `outline-${sel}`));
-      }
+      if (on) active = li.id || (li.id = `outline-${sel}`);
     });
+    if (active) this.outline.setAttribute('aria-activedescendant', active);
+    else this.outline.removeAttribute('aria-activedescendant');
   }
 }

@@ -1,6 +1,7 @@
-# Publishes site/ (the browser prototype and the 4D Composer) plus docs/MASTER_PLAN.md to the
-# gh-pages branch with plain git. In the repository settings, set Pages to deploy from the
-# gh-pages branch (root). Only actions/checkout is used; the push authenticates with GITHUB_TOKEN.
+# Publishes site/ (the landing page, the browser engine and the 4D Composer) to the gh-pages
+# branch with plain git. Only site/ is published: internal design documents stay in the repository.
+# In the repository settings, set Pages to deploy from the gh-pages branch (root). Only
+# actions/checkout is used; the push authenticates with GITHUB_TOKEN.
 name: Pages
 
 on:
@@ -8,7 +9,6 @@ on:
     branches: [ main ]
     paths:
       - "site/**"
-      - "docs/MASTER_PLAN.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -30,7 +30,11 @@ jobs:
         run: |
           set -euo pipefail
           test -f site/index.html
-          cp docs/MASTER_PLAN.md site/MASTER_PLAN.md
+          # internal planning documents must never be published
+          if find site -iname 'MASTER_PLAN*' -o -iname 'plan.html' | grep -q .; then
+            echo "::error::site/ contains an internal planning document; remove it before publishing."
+            exit 1
+          fi
           touch site/.nojekyll
 
       - name: Publish to gh-pages
