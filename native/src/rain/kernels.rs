@@ -387,7 +387,9 @@ pub const CLICK_BIN_MAX: i32 = 200;
 pub const DUR_PER_OCT: f64 = 3.0;
 pub const DUR_BIN_MIN: i32 = -3;
 pub const DUR_BIN_MAX: i32 = 12;
-pub const SPLASH_VARIANTS: usize = 8;
+/// Noise bursts per duration bin. Few variants repeat the same burst on every drip of a node (one
+/// drop size -> one bin) and print its fine structure on the drips as a fixed colour.
+pub const SPLASH_VARIANTS: usize = 32;
 pub const RAD_PER_OCT: f64 = 36.0;
 pub const RBIN_MIN: i32 = 120;
 pub const RBIN_MAX: i32 = 300;

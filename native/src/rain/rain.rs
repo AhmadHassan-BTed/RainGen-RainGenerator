@@ -412,6 +412,20 @@ pub struct RainPatchVoice {
     fbuf: Vec<f32>,
 }
 
+/// Share of the rain on a gutter channel that strikes metal. The open channel (~0.12 m wide) runs
+/// with roof water whenever it rains, so drops falling into it land on flowing water (heard in the
+/// gutter's own runoff voice, gutters.rs); only the rolled lip and the outer face are struck dry,
+/// ~ 3 cm of the plan width. Downspouts are closed pipes (exposure 0) and other patches 1.
+pub const GUTTER_LIP_SHARE: f32 = 0.25;
+
+fn gutter_metal_share(patch: &Patch) -> f32 {
+    if patch.kind == PatchKind::Gutter && !super::is_downspout(patch) {
+        GUTTER_LIP_SHARE
+    } else {
+        1.0
+    }
+}
+
 impl RainPatchVoice {
     pub fn new(bc: &mut BuildCtx, patch: &Patch, full: bool) -> RainPatchVoice {
         let sr = bc.sr as f32;
@@ -432,7 +446,9 @@ impl RainPatchVoice {
         let (n_var, spread_v) = if is_water {
             (0, 0.0)
         } else if single_panel {
-            (1, 0.03)
+            // one panel: its modes are fixed, but each drop strikes another spot and so excites
+            // another mix of them (variant_modes' mode-shape weights); no detuning
+            (lod.var.0.clamp(1, 2), 0.0)
         } else {
             let mut nv = if kind == MaterialKind::Vegetation { lod.var.1 } else { lod.var.0 };
             if !full {
@@ -467,7 +483,7 @@ impl RainPatchVoice {
             nx: normal[0],
             ny: normal[1],
             nz: normal[2],
-            base: patch.area_m2 * patch.exposure.max(0.0),
+            base: patch.area_m2 * patch.exposure.max(0.0) * gutter_metal_share(patch),
             spreading: spreading_gain(r_eq),
             caps: if full { lod.voice_cap } else { lod.gran_cap },
             dense_thr: if full { lod.dense } else if is_water { 0.25 * lod.dense } else { 0.02 * lod.dense },

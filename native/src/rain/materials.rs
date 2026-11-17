@@ -49,18 +49,27 @@ const MODE_GAP_RATIO: f32 = 1.414;
 const MODE_FILL_MIN_HZ: f32 = 250.0;
 /// Spacing of the filling modes (third octave).
 const MODE_FILL_RATIO: f32 = 1.26;
+/// Gaps are filled only between ringing modes: loss factor eta = 2.2 / (T60 f) below this (metal,
+/// glass). A lossy panel's modes are broad and its sound is the impact click, so filling its
+/// gaps would only add ringing partials it does not have (measured: wood / plastic / membranes
+/// sounding like struck metal when every material was filled).
+const MODE_FILL_MAX_ETA: f32 = 0.03;
+/// ... and only on hard solids (hardness >= this: metals, glass).
+const MODE_FILL_MIN_HARDNESS: f32 = 0.9;
 
-/// The material's modes, with gaps wider than half an octave filled. A plate's modal density is
-/// constant in frequency (n = S/(4 pi) sqrt(rho h / D), Cremer & Heckl), so a table that lists the
-/// lowest plate modes and then jumps to a log-spaced high series (tin_roof: 408 Hz -> 900 Hz)
-/// leaves a hole that real panels do not have: measured as a 15-17 dB notch at 500-630 Hz in
-/// the attic presets. The filling modes take log-interpolated T60 and gain from their neighbours.
+/// The material's modes, with gaps wider than half an octave filled for ringing hard solids. A
+/// plate's modal density is constant in frequency (n = S/(4 pi) sqrt(rho h / D), Cremer & Heckl),
+/// so a table that lists the lowest plate modes and then jumps to a log-spaced high series
+/// leaves a hole that real panels do not have. The filling modes take log-interpolated T60 and
+/// gain from their neighbours. The physically derived tables of raingen/synth/materials.py have
+/// no such holes, so this only guards hand-made tables.
 fn modes_of(m: &Material) -> Vec<(f32, f32, f32)> {
     let mut v: Vec<(f32, f32, f32)> = m.modes.iter().map(|md| (md.freq_hz, md.t60_s, md.gain)).collect();
     v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    if v.len() < 2 {
+    if v.len() < 2 || m.kind != MaterialKind::Solid || m.hardness < MODE_FILL_MIN_HARDNESS {
         return v;
     }
+    let eta = |md: &(f32, f32, f32)| 2.2 / (md.1.max(1e-4) * md.0.max(1.0));
     let mut out = Vec::with_capacity(v.len() + 8);
     for i in 0..v.len() {
         out.push(v[i]);
@@ -70,7 +79,7 @@ fn modes_of(m: &Material) -> Vec<(f32, f32, f32)> {
         let (a, b) = (v[i], v[i + 1]);
         // only above the fundamental region: the lowest plate / membrane modes are genuinely
         // sparse (constant density per Hz means wide ratios at the bottom)
-        if a.0 < MODE_FILL_MIN_HZ || b.0 / a.0 <= MODE_GAP_RATIO {
+        if a.0 < MODE_FILL_MIN_HZ || b.0 / a.0 <= MODE_GAP_RATIO || eta(&a).max(eta(&b)) > MODE_FILL_MAX_ETA {
             continue;
         }
         let k = ((b.0 / a.0).ln() / MODE_FILL_RATIO.ln()).ceil() as usize;
@@ -209,7 +218,12 @@ impl<'a> Materials<'a> {
 
 /// Modes of bank variant v of a material (variant 0: the material itself): detuned and re-damped
 /// by log-normal factors (stream "rain/bank/{name}/{spread}/{v}"), each gain scaled by
-/// 1/sqrt(damping factor) so every mode keeps its impulse energy.
+/// 1/sqrt(damping factor) so every mode keeps its impulse energy, and re-weighted for another
+/// impact point: a mode's excitation and radiation go with its shape at the struck point,
+/// phi^2 ~ (2 sin^2 u)(2 sin^2 w) for a plate (mean 1). Each variant is a different spot of the
+/// surface, so successive drops do not strike the same chord (with spread 0, a single panel keeps
+/// its frequencies and only the excited mix changes). The draw is floored at -12 dB (no exact
+/// nodal hits: drops have a finite footprint) and renormalised to unit mean energy.
 pub fn variant_modes(rngf: &RngFactory, mat: &MatData, spread: f32, v: usize) -> Vec<(f32, f32, f32)> {
     if v == 0 || mat.modes.is_empty() {
         return mat.modes.clone();
@@ -217,10 +231,18 @@ pub fn variant_modes(rngf: &RngFactory, mat: &MatData, spread: f32, v: usize) ->
     let mut r = rngf.get(&format!("rain/bank/{}/{}/{}", mat.name, spread, v), 0);
     let det: Vec<f64> = (0..mat.modes.len()).map(|_| (spread as f64 * r.normal()).exp()).collect();
     let dmp: Vec<f64> = (0..mat.modes.len()).map(|_| (0.15 * r.normal()).exp()).collect();
+    let mut shape: Vec<f64> = (0..mat.modes.len())
+        .map(|_| {
+            let (u, w) = (std::f64::consts::PI * r.uniform(), std::f64::consts::PI * r.uniform());
+            (4.0 * u.sin().powi(2) * w.sin().powi(2)).max(0.063)
+        })
+        .collect();
+    let mean = shape.iter().sum::<f64>() / shape.len() as f64;
+    shape.iter_mut().for_each(|s| *s /= mean.max(1e-9));
     mat.modes
         .iter()
-        .zip(det.iter().zip(dmp.iter()))
-        .map(|((f, t, g), (a, b))| (f * *a as f32, t * *b as f32, g / (*b as f32).sqrt()))
+        .enumerate()
+        .map(|(i, (f, t, g))| (f * det[i] as f32, t * dmp[i] as f32, g * (shape[i].sqrt() / dmp[i].sqrt()) as f32))
         .collect()
 }
 

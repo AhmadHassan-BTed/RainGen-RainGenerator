@@ -130,8 +130,23 @@ def patches_json(patches) -> str:
     return json.dumps(_plain(list(patches)), separators=(",", ":"))
 
 
+def _live_precip_types(d: dict) -> Optional[list]:
+    """precip_types 'live': a scene without precipitation still builds its rain voices (silent
+    until rain starts), so a live change from 'none' to rain glides instead of rebuilding."""
+    t = str(((d.get("weather") or {}).get("precipitation") or {}).get("type") or "rain").lower()
+    if t != "none":
+        return None
+    types = {"none", "rain"}
+    for k in d.get("timeline") or ():
+        if isinstance(k, dict) and str(k.get("path", "")).endswith("precipitation.type") and k.get("value"):
+            types.add(str(k["value"]).lower())
+    return sorted(types)
+
+
 def scene_json(scene: Scene, precip_types=None) -> str:
     d = json.loads(scene.to_json())
+    if precip_types == "live":
+        precip_types = _live_precip_types(d)
     if precip_types is not None:
         pt = precip_types if isinstance(precip_types, str) else [str(p) for p in precip_types]
         d.setdefault("native", {})["precip_types"] = pt
@@ -416,10 +431,12 @@ class NativeSession:
                 log.warning("raingen native: weather state not carried over: %s", exc)
 
     # -- incremental structure ------------------------------------------------------
-    def prepare_update(self, scene: Scene, wanted: Optional[Callable[[], bool]] = None):
+    def prepare_update(self, scene: Scene, wanted: Optional[Callable[[], bool]] = None,
+                       ready: Optional[Callable[[], None]] = None):
         """Lay `scene` out around the reference pose, build its World and send the voice graph
         (Rust diffs it against the running one: unchanged voices keep playing). Any thread; the
-        World is swapped in by `commit_update` on the rendering thread. None when no longer wanted."""
+        World is swapped in by `commit_update` on the rendering thread. None when no longer wanted.
+        `ready` (blocking) is called just before the graph is sent (the caller renders ahead)."""
         from .core.rng import RngFactory
         from .physics.layout import build_layout
         from .physics.world import World
@@ -431,6 +448,8 @@ class NativeSession:
             rngf = RngFactory(int(sc.seed))
             patches = build_layout(sc)
             world = World(sc, rngf, sr=self.sr, block=self.block)
+            if ready is not None:
+                ready()
             if wanted is not None and not wanted():
                 return None
             self.engine.set_scene(scene_json(sc, self.precip_types), patches_json(patches))

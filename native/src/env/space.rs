@@ -25,6 +25,8 @@ use crate::types::{Scene, Shelter, Stem, N_AMBI};
 use std::f64::consts::PI;
 
 const C_AIR: f64 = 343.0;
+/// Minimum delay of a reflection after the direct sound and between successive reflections (ms).
+const MIN_ER_MS: f64 = 5.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PlaceKind {
@@ -247,7 +249,7 @@ impl PlaceSpace {
         let shelter = scene.place.shelter;
         let mut rng = cfg.rng.get("place.space", 0);
         let surf = surfaces(kind, shelter, &mut rng, scene.listener.height_m as f64);
-        let taps: Vec<(usize, f32, f32, [f32; N_AMBI])> = surf
+        let mut taps: Vec<(usize, f32, f32, [f32; N_AMBI])> = surf
             .iter()
             .filter_map(|&(d, g, lp, az, el)| {
                 let delay = (2.0 * d / C_AIR * sr as f64).round() as usize;
@@ -260,6 +262,16 @@ impl PlaceSpace {
                 Some((delay, g as f32, a as f32, sh_gains(az as f32, el as f32, 0.25)))
             })
             .collect();
+        // reflections at least MIN_ER_MS after the direct sound and after each other: closer
+        // pairs (a porch ceiling and the wall behind, the two facades of a street) comb-filter
+        // the field ("pipe" colour) instead of being heard as space
+        taps.sort_by_key(|t| t.0);
+        let min_d = (MIN_ER_MS * 1e-3 * sr as f64).round() as usize;
+        let mut prev = 0usize;
+        for t in taps.iter_mut() {
+            t.0 = t.0.max(prev + min_d);
+            prev = t.0;
+        }
         let mut tail = tail_of(kind);
         match shelter {
             // the shelter's own room (places.rs) carries the long enclosed tail

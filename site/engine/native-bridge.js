@@ -126,6 +126,20 @@ class Lane {
   }
 }
 
+/*
+ * Parameters that rebuild the engine's voices: held until the control settles (pointer released,
+ * or 250 ms without a change from keys / menus) so a drag across several shelters costs one
+ * rebuild. A precipitation type change is structural only across families: none / drizzle /
+ * rain / showers share their voices and glide.
+ */
+const STRUCTURAL_PARAM = /^place\.(shelter|preset)$/;
+const PRECIP_TYPE = 'weather.precipitation.type';
+const LIQUID = new Set(['none', 'drizzle', 'rain', 'showers']);
+const precipFamily = (t) => (LIQUID.has(String(t)) ? 'liquid' : String(t));
+const SETTLE_MS = 250;
+const RELEASE_MS = 120;
+const MAX_HOLD_MS = 5000;
+
 export class NativeBridge {
   /** opts: { base: '' (same origin), hello: the /native/hello reply if already fetched } */
   constructor(opts = {}) {
@@ -156,6 +170,49 @@ export class NativeBridge {
     this._poseSeq = 0;
     this._listenerLane = new Lane(this, '/native/listener', LISTENER_MS);
     this._seekLane = new Lane(this, '/native/seek', SEEK_MS);
+    // structural changes held until the control settles (see STRUCTURAL_PARAM)
+    this._held = new Map();
+    this._heldTimer = 0;
+    this._heldSince = 0;
+    this._pointerDown = false;
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      const down = () => { this._pointerDown = true; };
+      const up = () => {
+        this._pointerDown = false;
+        if (this._held.size) this._armHeld(RELEASE_MS);
+      };
+      window.addEventListener('pointerdown', down, true);
+      for (const ev of ['pointerup', 'pointercancel', 'blur']) window.addEventListener(ev, up, true);
+    }
+  }
+
+  _isStructural(p, oldValue, value) {
+    if (STRUCTURAL_PARAM.test(p)) return true;
+    if (p !== PRECIP_TYPE) return false;
+    return this._held.has(p) || precipFamily(oldValue) !== precipFamily(value);
+  }
+
+  _armHeld(ms) {
+    clearTimeout(this._heldTimer);
+    this._heldTimer = setTimeout(() => this._releaseHeld(), ms);
+  }
+
+  _releaseHeld() {
+    this._heldTimer = 0;
+    if (!this._held.size) return;
+    if (this._pointerDown && performance.now() - this._heldSince < MAX_HOLD_MS) {
+      this._armHeld(SETTLE_MS);                 // still dragging: the pointer-up releases it
+      return;
+    }
+    for (const [p, e] of this._held) this._pending.params.set(p, e);
+    this._held.clear();
+    this._scheduleFlush();
+  }
+
+  _dropHeld() {
+    clearTimeout(this._heldTimer);
+    this._heldTimer = 0;
+    this._held.clear();
   }
 
   /** GET /native/hello: the server's reply, or null when the page is not served by raingen studio. */
@@ -434,6 +491,7 @@ export class NativeBridge {
   stop() {
     clearTimeout(this._flushTimer);
     this._flushTimer = 0;
+    this._dropHeld();
     this._listenerLane.cancel();
     this._seekLane.cancel();
     this._started = false;
@@ -464,6 +522,7 @@ export class NativeBridge {
     this.scene = clone(scene);
     if (!this._started) return true;
     const q = this._pending;
+    this._dropHeld();                           // the whole scene supersedes held changes
     q.scene = clone(scene);
     q.params.clear();
     q.objects.clear();
@@ -474,9 +533,17 @@ export class NativeBridge {
   setParam(path, value, rampSec = 0.5) {
     const p = String(path || '');
     if (!p) return false;
+    const old = p === PRECIP_TYPE && this.scene ? this.scene.weather?.precipitation?.type : undefined;
     if (this.scene && !p.startsWith('mix.')) setPath(this.scene, p, value);
     if (!this._started) return true;
-    this._pending.params.set(p, { value: clone(value), ramp: Number.isFinite(Number(rampSec)) ? Number(rampSec) : 0.5 });
+    const entry = { value: clone(value), ramp: Number.isFinite(Number(rampSec)) ? Number(rampSec) : 0.5 };
+    if (this._isStructural(p, old, value)) {
+      if (!this._held.size) this._heldSince = performance.now();
+      this._held.set(p, entry);
+      this._armHeld(SETTLE_MS);
+      return true;
+    }
+    this._pending.params.set(p, entry);
     this._scheduleFlush();
     return true;
   }

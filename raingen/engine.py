@@ -97,7 +97,9 @@ def _live_paths() -> tuple[tuple[str, ...], tuple[str, ...]]:
 
     numeric, discrete = [], []
     for s in mf.PARAMS:
-        if s.id.startswith("weather.") and s.id != "weather.precipitation.type":
+        # precipitation.type is live within a family; _structure_key turns a cross-family change
+        # (rain <-> snow / hail) into a rebuild.
+        if s.id.startswith("weather."):
             (numeric if s.is_numeric else discrete).append(s.id)
         elif s.id in tuple(f"place.{p}" for p in _LIVE_PLACE):
             numeric.append(s.id)
@@ -114,17 +116,30 @@ def _safe_get(scene: Scene, path: str, default: Any = None) -> Any:
 _LIVE_LISTENER = ("position", "heading_deg", "pitch_deg")
 
 
-def _structure_key(scene: Scene, live_listener: bool = False) -> str:
+# Liquid rain types share the same generators (only the drop-size distribution and timing
+# differ, and those glide), so switching between them must not rebuild voices.
+_PRECIP_FAMILY = {"drizzle": "liquid", "rain": "liquid", "showers": "liquid"}
+# Extra render-ahead around a structural update (native core): the new voices' first blocks and
+# the old/new voice crossfade cost up to ~2-4x a normal block for ~150 ms; this much audio is
+# rendered ahead first so that never reaches the output as an underrun.
+_HEADROOM_S = 0.25
+_HEADROOM_WAIT_S = 0.35              # at most this long waiting for the headroom before sending
+_HEADROOM_HOLD_S = 0.35              # keep it through the voice fade (150 ms) and the first blocks
+
+
+def _structure_key(scene: Scene, live_listener: bool = False, none_live: bool = False) -> str:
     """Everything that needs a new pipeline when it changes (geometry, generators, master).
 
     live_listener: the pipeline follows the listener pose live (native core), so position and
-    heading are not structure.
+    heading are not structure. none_live: 'none' precipitation is in the liquid family (a live
+    native pipeline keeps its rain voices built and silent then; see native.scene_json 'live').
     """
     d = scene.to_dict()
     vibe = d.get("vibe") or {}
     skip = ("render",) + (_LIVE_LISTENER if live_listener else ())
+    ptype = d["weather"]["precipitation"]["type"]
     key = {
-        "type": d["weather"]["precipitation"]["type"],
+        "type": "liquid" if (none_live and ptype == "none") else _PRECIP_FAMILY.get(ptype, ptype),
         "place": {k: v for k, v in d["place"].items() if k not in _LIVE_PLACE},
         "listener": {k: v for k, v in d["listener"].items() if k not in skip},
         "mode": d.get("mode"),
@@ -325,6 +340,8 @@ class Engine:
         self.underruns = 0
         self.xruns = 0
         self.cpu_load = 0.0
+        self.slow_blocks = 0                 # render blocks that took longer than real time
+        self._block_ms: "collections.deque" = collections.deque(maxlen=64)   # last ~1.4 s of block times
         self._markers: list = []             # (render-clock time it is heard, marker on the scene clock)
         self._marker_lock = threading.Lock()
         self.markers_delivered = 0
@@ -336,6 +353,9 @@ class Engine:
         self._full_pending = False
         self.pipeline_rebuilds = 0           # new pipelines built after start (layout changes, Python core)
         self.scene_updates = 0               # incremental structural updates (native core)
+        self._target_blocks = max(1, int(math.ceil(self.buffer_s * SAMPLE_RATE / BLOCK)))
+        self._extra_blocks = 0               # extra render-ahead while a structural update lands
+        self._extra_until = -1               # block index after which it is released
 
     # ------------------------------------------------------------------ public state
     @property
@@ -373,6 +393,14 @@ class Engine:
             except Exception:
                 dev = 0.0
         return max(0.0, self._consumed / self.sr_out - self._chain_latency / SAMPLE_RATE - dev)
+
+    @property
+    def block_ms_max(self) -> float:
+        """The slowest render block (ms, pipeline + crossfade + governor) of the last ~1.4 s."""
+        try:
+            return max(self._block_ms) if self._block_ms else 0.0
+        except ValueError:                   # appended to while iterating
+            return 0.0
 
     @property
     def volume_db(self) -> float:
@@ -651,7 +679,7 @@ class Engine:
     def _make_pipeline(self, scene: Scene):
         if self.native:
             from .native import NativeSession
-            return NativeSession(scene, self.layout, stems=False)
+            return NativeSession(scene, self.layout, stems=False, precip_types="live")
         from .render import BlockRenderer
         return BlockRenderer(scene, self.layout, stems=False)
 
@@ -716,7 +744,7 @@ class Engine:
             self._markers = []
 
     def _skey(self, scene: Scene) -> str:
-        return _structure_key(scene, live_listener=self.native)
+        return _structure_key(scene, live_listener=self.native, none_live=self.native)
 
     def _can_update(self) -> bool:
         """True when a structural change can update the running native pipeline in place."""
@@ -735,19 +763,30 @@ class Engine:
         scene = self._prepare(eff)
         if self._can_update():
             pipe = self._pipe
+            # render ahead before the new voice graph goes in (see _HEADROOM_S)
+            self._extra_blocks = int(math.ceil(_HEADROOM_S * SAMPLE_RATE / BLOCK))
+            self._extra_until = 1 << 62
+
+            def ready() -> None:
+                end = time.monotonic() + _HEADROOM_WAIT_S
+                while (gen == self._build_gen and not self._stop.is_set() and time.monotonic() < end
+                       and len(self._fifo) < self._target_blocks + self._extra_blocks):
+                    time.sleep(0.005)
 
             def update():
                 try:
-                    prep = pipe.prepare_update(scene, wanted=lambda: gen == self._build_gen)
+                    prep = pipe.prepare_update(scene, wanted=lambda: gen == self._build_gen, ready=ready)
                     if prep is not None:
                         self._built = (gen, "update", (pipe, prep), scene)
                 except Exception as exc:
                     log.exception("raingen engine: scene update failed; keeping the current scene")
                     self.error = exc
+                    self._extra_until = self._index
 
             threading.Thread(target=update, name="raingen-update", daemon=True).start()
             return
         self._full_pending = True
+        self._extra_until = self._index
 
         def build():
             try:
@@ -788,6 +827,8 @@ class Engine:
             self._built = None
             pipe, prep = obj
             if gen != self._build_gen or pipe is not self._pipe:
+                if gen == self._build_gen:
+                    self._extra_until = self._index
                 return
             played = pipe.commit_update(prep)          # World state carried; voices diffed in Rust
             cur = self._carry_live(played)
@@ -796,6 +837,8 @@ class Engine:
             self._new_governor_if_needed(scene)
             self._update_latency()
             self.scene_updates += 1
+            if gen == self._build_gen:
+                self._extra_until = self._index + int(math.ceil(_HEADROOM_HOLD_S * SAMPLE_RATE / BLOCK))
             return
         if self._xf is not None:
             return                      # a crossfade in progress finishes first (dropping its old side clicks)
@@ -992,6 +1035,9 @@ class Engine:
         self._index += 1
         dt = time.perf_counter() - t_start
         self.cpu_load = 0.9 * self.cpu_load + 0.1 * dt / (BLOCK / SAMPLE_RATE)
+        self._block_ms.append(dt * 1e3)
+        if dt > BLOCK / SAMPLE_RATE:
+            self.slow_blocks += 1
         return y
 
     @staticmethod
@@ -1077,7 +1123,6 @@ class Engine:
         self._pushed += int(block.shape[0])
 
     def _produce(self) -> None:
-        target_blocks = max(1, int(math.ceil(self.buffer_s * SAMPLE_RATE / BLOCK)))
         block_s = BLOCK / SAMPLE_RATE
         from .render import limit_threads
 
@@ -1087,7 +1132,9 @@ class Engine:
                 self._primed.set()
                 while not self._stop.is_set():
                     self._drain()
-                    if len(self._fifo) >= target_blocks:
+                    if self._extra_blocks and self._index >= self._extra_until:
+                        self._extra_blocks = 0
+                    if len(self._fifo) >= self._target_blocks + self._extra_blocks:
                         time.sleep(0.25 * block_s)
                         continue
                     self._push(self._master(self._raw_block()))

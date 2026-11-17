@@ -974,7 +974,7 @@ const MATERIAL_ALIASES: &[(&str, &str)] = &[
     ("vehicle", "car_body"), ("windshield", "glass"), ("windscreen", "glass"), ("pane", "glass"),
     ("glazing", "window"), ("timber", "wood"), ("deck", "wood"), ("plank", "wood"), ("fence", "wood"),
     ("polycarbonate", "plastic"), ("bin", "plastic"), ("stone", "concrete"), ("pavement", "concrete"),
-    ("paving", "concrete"), ("sidewalk", "concrete"), ("brick", "concrete"), ("road", "asphalt"),
+    ("paving", "concrete"), ("sidewalk", "concrete"), ("brick", "brick_wall"), ("road", "asphalt"),
     ("tarmac", "asphalt"), ("roof", "tile"), ("roof_tile", "tile"), ("slate", "tile"),
     ("ceramic", "tile"), ("pebbles", "gravel"), ("mud", "soil"), ("dirt", "soil"), ("earth", "soil"),
     ("forest_floor", "leaves"), ("lawn", "grass"), ("meadow", "grass"), ("deciduous", "leaves"),

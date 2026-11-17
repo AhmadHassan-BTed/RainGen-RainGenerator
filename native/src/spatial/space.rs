@@ -13,6 +13,13 @@
 //!   re-encoded at a fixed direction, e.g. a tree trunk or a far tree line). Each tap has a
 //!   one-pole low-pass (surface absorption + air absorption over the extra path) and an
 //!   optional one-pole high-pass (scatterers only act for ka > 1).
+//!   A listener-centred image has one delay for the whole field, but the rain sources spread over
+//!   metres, so their reflections arrive over a few ms around it: a single coherent delay printed
+//!   a comb (a "pipe" colour) on the field. Each tap is therefore a small cluster: `SUB` sub-taps
+//!   per SH channel (image taps) or on W (scatterers) at randomised offsets within +-`jitter_ms`,
+//!   different per channel, so the reflected field is diffuse and decorrelated between the ears.
+//!   Taps sit at least `MIN_ER_MS` after the direct sound and after each other (no flutter faster
+//!   than ~200 Hz); only the alley keeps a gentle wall-to-wall flutter.
 //! * Diffuse tail: a 16-line Hadamard FDN fed omni (W), one line per ACN channel with the SN3D
 //!   diffuse-field weights sqrt(16 / (2n + 1)), per-line one-pole damping solved for the mid
 //!   RT60 and the 8 kHz HF ratio. Its level is calibrated at construction from its own impulse
@@ -31,6 +38,14 @@ const F_HI_HZ: f64 = 8000.0;
 /// Share of rain_far fed to the early reflections (far sources: the reflection path is barely
 /// longer than the direct one, so their reflections add little that is not already diffuse).
 const FAR_FEED_ER: f32 = 0.35;
+/// Minimum delay of a reflection and minimum spacing between successive taps (ms).
+const MIN_ER_MS: f32 = 5.0;
+/// Sub-taps per tap (per SH channel for images, on W for scatterers).
+const SUB: usize = 3;
+/// Spread of a tap's sub-taps: +-(fraction of its delay), clamped (ms).
+const JITTER_FRAC: f32 = 0.2;
+const JITTER_MIN_MS: f32 = 1.5;
+const JITTER_MAX_MS: f32 = 5.0;
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -101,22 +116,23 @@ const CITY: &[TapSpec] = &[
     m(139.4, 0.06, 4500.0, 0b010),
     m(148.3, 0.05, 4500.0, 0b000),
 ];
-// Narrow alley, walls ~4.5 m apart: flutter between the parallel walls every 2W/c ~ 26 ms
-// (images every W/c ~ 13 ms), hard surfaces -> little HF loss; dead end as an x image.
+// Narrow alley, walls ~4.5 m apart: a gentle flutter between the parallel walls every 2W/c ~ 26 ms
+// (images every W/c ~ 13 ms), hard surfaces -> little HF loss; dead end as an x image. Gains
+// below the image-source values: rough brick and doorways scatter part of each order.
 const ALLEY: &[TapSpec] = &[
-    m(11.3, 0.28, 8000.0, 0b010),
-    m(14.1, 0.24, 8000.0, 0b000),
-    m(23.7, 0.17, 7000.0, 0b000),
-    m(29.2, 0.15, 7000.0, 0b010),
-    m(37.9, 0.11, 6000.0, 0b010),
-    m(43.4, 0.09, 6000.0, 0b000),
-    m(47.1, 0.08, 5000.0, 0b001),
-    m(55.8, 0.06, 5000.0, 0b000),
+    m(11.3, 0.20, 8000.0, 0b010),
+    m(17.6, 0.15, 8000.0, 0b000),
+    m(23.7, 0.13, 7000.0, 0b000),
+    m(29.2, 0.11, 7000.0, 0b010),
+    m(37.9, 0.08, 6000.0, 0b010),
+    m(43.4, 0.07, 6000.0, 0b000),
+    m(49.1, 0.06, 5000.0, 0b001),
+    m(55.8, 0.05, 5000.0, 0b000),
 ];
 // Garden / suburb: the house facade ~4 m behind (x image, 22 ms), a neighbour ~10 m to the side,
 // hedge / trees scattering; short, quiet tail.
 const GARDEN: &[TapSpec] = &[
-    m(22.0, 0.22, 6000.0, 0b001),
+    m(22.0, 0.18, 6000.0, 0b001),
     p(35.0, 0.07, 4500.0, 250.0, 120.0, 0.0),
     m(62.0, 0.10, 5000.0, 0b010),
     p(80.0, 0.05, 3500.0, 250.0, -60.0, 0.0),
@@ -167,7 +183,8 @@ fn profile_for(scene: &Scene) -> Profile {
 }
 
 struct Tap {
-    d: usize,
+    /// sub-tap delays (samples): per SH channel for images; row 0 for scatterers
+    d: [[usize; SUB]; N_AMBI],
     lp_a: f32,
     hp_a: f32,
     /// per-channel output gain (sign mask x gain, or SH x maxRE x gain)
@@ -398,15 +415,33 @@ impl SpaceProcessor {
         let w = per_acn(&maxre_weights());
         let mut taps = Vec::new();
         let mut max_d = 1;
-        for t in prof.taps {
-            let d = ((t.ms * 1e-3 * sr).round() as usize).max(1);
-            max_d = max_d.max(d);
+        let mut rng = cfg.rng.get("place.space.er", 0);
+        let mut specs: Vec<TapSpec> = prof.taps.to_vec();
+        specs.sort_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap_or(std::cmp::Ordering::Equal));
+        let mut prev = 0.0f32;
+        for t in specs.iter_mut() {
+            t.ms = t.ms.max(prev + MIN_ER_MS);
+            prev = t.ms;
+        }
+        let sub_g = 1.0 / (SUB as f32).sqrt();
+        for t in &specs {
+            let jit = (JITTER_FRAC * t.ms).clamp(JITTER_MIN_MS, JITTER_MAX_MS).min(t.ms - 1.0);
+            let mut d = [[1usize; SUB]; N_AMBI];
+            for row in d.iter_mut() {
+                for (k, v) in row.iter_mut().enumerate() {
+                    // stratified within +-jit so the sub-taps never pile up on one delay
+                    let lo = -jit + 2.0 * jit * k as f32 / SUB as f32;
+                    let ms = t.ms + lo + 2.0 * jit / SUB as f32 * rng.uniform_f32();
+                    *v = ((ms * 1e-3 * sr).round() as usize).max(1);
+                    max_d = max_d.max(*v);
+                }
+            }
             let (out, mirror) = match t.kind {
                 Kind::Mirror(mask) => {
                     let s = mirror_signs(mask);
                     let mut o = [0f32; N_AMBI];
                     for k in 0..N_AMBI {
-                        o[k] = s[k] * t.gain;
+                        o[k] = s[k] * t.gain * sub_g;
                     }
                     (o, true)
                 }
@@ -414,7 +449,7 @@ impl SpaceProcessor {
                     let y = sh_real((az as f64).to_radians(), (el as f64).to_radians());
                     let mut o = [0f32; N_AMBI];
                     for k in 0..N_AMBI {
-                        o[k] = (y[k] * w[k]) as f32 * t.gain;
+                        o[k] = (y[k] * w[k]) as f32 * t.gain * sub_g;
                     }
                     (o, false)
                 }
@@ -518,7 +553,6 @@ impl BusProcessor for SpaceProcessor {
                 }
             }
             for t in self.taps.iter_mut() {
-                let start = (self.wpos + len - t.d) % len;
                 if t.mirror {
                     for c in 0..N_AMBI {
                         let g = t.out[c];
@@ -527,17 +561,24 @@ impl BusProcessor for SpaceProcessor {
                         }
                         let ring = &self.ring[c * len..(c + 1) * len];
                         let out = &mut self.wet[c * n..(c + 1) * n];
-                        let mut r = start;
+                        let mut r = [0usize; SUB];
+                        for k in 0..SUB {
+                            r[k] = (self.wpos + len - t.d[c][k]) % len;
+                        }
                         let (mut s, mut h) = (t.lp[c], t.hp[c]);
                         let (a, ha) = (t.lp_a, t.hp_a);
                         for o in out.iter_mut() {
-                            s += a * (ring[r] - s);
+                            let mut x = 0.0;
+                            for rk in r.iter_mut() {
+                                x += ring[*rk];
+                                *rk += 1;
+                                if *rk == len {
+                                    *rk = 0;
+                                }
+                            }
+                            s += a * (x - s);
                             h += ha * (s - h);
                             *o += g * (s - h);
-                            r += 1;
-                            if r == len {
-                                r = 0;
-                            }
                         }
                         t.lp[c] = if s.abs() < 1e-25 { 0.0 } else { s };
                         t.hp[c] = if h.abs() < 1e-25 { 0.0 } else { h };
@@ -545,19 +586,26 @@ impl BusProcessor for SpaceProcessor {
                 } else {
                     // scatterer: W -> band-limit -> encode at its direction
                     let ring = &self.ring[..len];
-                    let mut r = start;
+                    let mut r = [0usize; SUB];
+                    for k in 0..SUB {
+                        r[k] = (self.wpos + len - t.d[0][k]) % len;
+                    }
                     let (mut s, mut h) = (t.lp[0], t.hp[0]);
                     let (a, ha) = (t.lp_a, t.hp_a);
                     for i in 0..n {
-                        s += a * (ring[r] - s);
+                        let mut x = 0.0;
+                        for rk in r.iter_mut() {
+                            x += ring[*rk];
+                            *rk += 1;
+                            if *rk == len {
+                                *rk = 0;
+                            }
+                        }
+                        s += a * (x - s);
                         h += ha * (s - h);
                         let y = s - h;
                         for c in 0..N_AMBI {
                             self.wet[c * n + i] += t.out[c] * y;
-                        }
-                        r += 1;
-                        if r == len {
-                            r = 0;
                         }
                     }
                     t.lp[0] = if s.abs() < 1e-25 { 0.0 } else { s };

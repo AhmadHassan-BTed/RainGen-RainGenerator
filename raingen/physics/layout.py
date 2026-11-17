@@ -46,7 +46,7 @@ _MATERIAL_ALIASES = {
     "aluminum": "metal_sheet", "corrugated": "tin_roof", "tin": "tin_roof", "roof": "tile",
     "car": "car_body", "vehicle": "car_body", "tent_fabric": "tent", "tarp": "canvas", "tarpaulin": "canvas",
     "stone": "concrete", "rock": "concrete", "pavement": "concrete", "paving": "concrete",
-    "sidewalk": "concrete", "cobbles": "tile", "cobblestone": "tile", "brick": "tile", "slate": "tile",
+    "sidewalk": "concrete", "cobbles": "tile", "cobblestone": "tile", "brick": "brick_wall", "slate": "tile",
     "road": "asphalt", "tarmac": "asphalt", "decking": "wood", "deck": "wood", "timber": "wood",
     "snow_fresh": "snow", "snow_old": "snow", "ice": "glass", "gutter": "metal_gutter",
     "glass_pane": "glass", "windowpane": "window", "plexiglass": "plastic", "polycarbonate": "plastic",
