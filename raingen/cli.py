@@ -11,6 +11,7 @@
     raingen manifest --format osc
     raingen lint-claims README.md site/index.html
     raingen scene "drizzle in a pine forest at dawn" --out forest.json
+    raingen studio tent-in-a-storm          # the 4D Composer in an app window, sound from the Rust core
 
 Scene arguments accept a preset name, a .json/.yaml/.wxscene file, a METAR or plain words
 (several words need no quotes: `raingen render heavy rain on a tent --minutes 5`).
@@ -354,6 +355,13 @@ def cmd_play(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_studio(a: argparse.Namespace) -> int:
+    from .studio import serve
+
+    return serve(_join(a.what) if a.what else None, port=a.port, window=not a.no_window, layout=a.layout,
+                 device=a.device, quality=a.quality or "game", site=a.site, autoplay=a.play, verbose=a.verbose)
+
+
 def cmd_manifest(a: argparse.Namespace) -> int:
     from .api import manifest
 
@@ -486,6 +494,19 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--engine", choices=("auto", "native", "python"), default="auto",
                     help="synthesis core: native (Rust, cpal output) when installed, or python (sounddevice)")
     pl.set_defaults(func=cmd_play)
+
+    st = sub.add_parser("studio", help="the 4D Composer GUI in an app window, its sound from the native core")
+    st.add_argument("what", nargs="*", help="scene to open: preset, scene file, METAR or plain words (optional)")
+    st.add_argument("--port", "-p", type=int, help="local port (default 8790, or the next free one)")
+    st.add_argument("--no-window", action="store_true", help="do not open a window; print the URL")
+    st.add_argument("--layout", "-l", choices=LAYOUTS,
+                    help="fixed output layout (default: follow the Composer's binaural / stereo switch)")
+    st.add_argument("--device", help="output device (index or name)")
+    st.add_argument("--quality", choices=("mobile", "game", "studio", "cinematic"), help="live quality (default game)")
+    st.add_argument("--play", action="store_true", help="start the sound at once, before the Composer presses Play")
+    st.add_argument("--site", help="folder with the Composer files (default: this checkout or the installed copy)")
+    st.add_argument("--verbose", "-v", action="store_true", help="log requests and engine starts")
+    st.set_defaults(func=cmd_studio)
 
     mf = sub.add_parser("manifest", help="export the parameter manifest")
     mf.add_argument("--format", "-f", default="json-schema", choices=MANIFEST_FORMATS)

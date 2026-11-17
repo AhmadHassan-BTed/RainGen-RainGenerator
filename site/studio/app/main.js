@@ -33,6 +33,7 @@ import {
 } from './a11y.js';
 
 const ENGINE_URL = '../../engine/weather-engine.js?v=20261117a';
+const BRIDGE_URL = '../../engine/native-bridge.js?v=20261117a';
 const LS = 'raingen.studio';
 const DEG = Math.PI / 180;
 
@@ -72,6 +73,46 @@ const nowS = () => performance.now() / 1000;
 
 const AUDIO_SUPPORTED = typeof window.AudioContext === 'function' || typeof window.webkitAudioContext === 'function';
 const WORKLET_SUPPORTED = AUDIO_SUPPORTED && typeof window.AudioWorkletNode === 'function' && window.isSecureContext !== false;
+
+/*
+ * Native mode: served by `raingen studio` (a local Python server), the sound comes from the
+ * Rust core through ../../engine/native-bridge.js (same interface as WeatherEngine). `raingen
+ * studio` opens the page with ?engine=native; on a local host the page also asks
+ * /native/hello. Anywhere else (GitHub Pages) nothing changes. ?engine=browser forces Web Audio.
+ */
+const ENGINE_FLAG = (() => {
+  try {
+    return new URLSearchParams(location.search).get('engine');
+  } catch (_) {
+    return null;
+  }
+})();
+const LOCAL_HOST = /^(127\.0\.0\.1|localhost|\[::1\])$/.test(location.hostname);
+const native = { on: ENGINE_FLAG === 'native', pending: false, ready: Promise.resolve(false), cls: null, hello: null };
+if (ENGINE_FLAG === 'native' || (LOCAL_HOST && ENGINE_FLAG !== 'browser' && location.protocol === 'http:')) {
+  native.pending = true;
+  native.ready = import(BRIDGE_URL)
+    .then(async (m) => {
+      native.cls = m.NativeBridge || m.default;
+      native.hello = await native.cls.detect();
+      native.on = !!native.hello;
+      return native.on;
+    })
+    .catch((err) => {
+      console.warn('[studio] native bridge unavailable:', err && err.message ? err.message : err);
+      native.on = false;
+      return false;
+    })
+    .finally(() => {
+      native.pending = false;
+      queueMicrotask(() => onNativeDetected());
+    });
+}
+
+/** Sound is possible: the native engine (raingen studio) or Web Audio with AudioWorklet. */
+function audioCapable() {
+  return native.on || WORKLET_SUPPORTED;
+}
 
 const audio = {
   cls: null, loading: null, engine: null, started: false, state: 'idle',
@@ -216,9 +257,44 @@ function setAudioState(state) {
   const chip = $('#audio-status');
   if (!chip) return;
   chip.dataset.state = state;
-  chip.textContent = {
+  const txt = native.on ? nativeChipText(state) : {
     idle: 'Audio off', starting: 'Starting…', live: transport.playing ? 'Live' : 'Paused', blocked: 'Sound blocked', unsupported: 'No audio', error: 'Audio error',
   }[state] || state;
+  if (chip.textContent !== txt) chip.textContent = txt;
+}
+
+/** 'Rust engine · 101 voices' (the sound is played by the raingen studio process). */
+function nativeChipText(state) {
+  const e = audio.engine && audio.engine.native ? audio.engine : null;
+  const info = (e && (e._stats || e.info)) || native.hello || {};
+  const kind = info.engine === 'python' ? 'Python engine' : 'Rust engine';
+  const n = e ? e.voices : 0;
+  if (state === 'starting') return `${kind} · starting…`;
+  if (state === 'error') return `${kind} · error`;
+  if (state === 'live') return transport.playing ? `${kind} · ${n ? `${n} voices` : 'live'}` : `${kind} · paused`;
+  return `${kind} · ready`;
+}
+
+/** Called once the /native/hello probe has answered (or failed). */
+function onNativeDetected() {
+  if (!native.on) {
+    if (ENGINE_FLAG === 'native') {
+      toast('The raingen studio server is not answering, so the browser audio engine is used instead.');
+    }
+    if (!audio.started) setAudioState(audioCapable() ? 'idle' : 'unsupported');
+    return;
+  }
+  const chip = $('#audio-status');
+  if (chip) chip.title = `Sound from the ${native.hello.engine === 'python' ? 'Python' : 'native Rust'} core (raingen studio ${native.hello.version || ''}, ${native.hello.layout || 'binaural'})`;
+  if (!audio.started) setAudioState('idle');
+  const h = native.hello;
+  // the scene named on the command line (`raingen studio tent-in-a-storm`) opens once per server run
+  if (h.scene && h.sceneId && prefs.get('nativeSceneId', '') !== h.sceneId && !sharedScene) {
+    prefs.set('nativeSceneId', h.sceneId);
+    store.load(h.scene, { label: h.scene.name || 'raingen scene' });
+    seek(0);
+    toast(`Opened “${store.scene.name}” from raingen studio.`);
+  }
 }
 
 /** Plain-language reason an audio start failed (the raw error goes to the console). */
@@ -250,8 +326,9 @@ function loadEngineModule() {
 
 async function ensureEngine(context = null) {
   if (audio.engine) return audio.engine;
-  const C = await loadEngineModule();
-  const e = new C({ context });
+  if (native.pending) await native.ready;
+  const C = native.on ? native.cls : await loadEngineModule();
+  const e = new C({ context, hello: native.hello });
   bindEngine(e);
   audio.engine = e;
   return e;
@@ -356,7 +433,9 @@ function inGesture() {
 function audioFailed(err) {
   console.warn('[studio] audio start failed:', err);
   setAudioState(err && err.name === 'NotAllowedError' ? 'blocked' : 'error');
-  toast(`${audioErrorText(err)} You can still build, animate and export scenes.`);
+  toast(native.on
+    ? `The Rust engine could not start: ${err && err.message ? err.message : err}`
+    : `${audioErrorText(err)} You can still build, animate and export scenes.`);
   return false;
 }
 
@@ -369,7 +448,7 @@ function startAudio() {
   if (audio.startP) {
     // A start that has hung this long had its AudioContext refused by the browser;
     // a new press of Play retires it and starts again inside this gesture.
-    if (performance.now() - audio.startAt < SLOW_START_MS || !inGesture()) return audio.startP;
+    if (native.on || performance.now() - audio.startAt < SLOW_START_MS || !inGesture()) return audio.startP;
     audio.engine = null;
   }
   const p = startAudioOnce().finally(() => {
@@ -381,6 +460,8 @@ function startAudio() {
 }
 
 async function startAudioOnce() {
+  if (native.pending) await native.ready;
+  if (native.on) return startNativeAudio();
   if (!WORKLET_SUPPORTED) {
     setAudioState('unsupported');
     return false;
@@ -424,6 +505,32 @@ async function startAudioOnce() {
   return true;
 }
 
+/**
+ * Native mode: the raingen studio process plays the sound, so there is no AudioContext to
+ * unlock and no gesture to wait for; the scene goes with the start request.
+ */
+async function startNativeAudio() {
+  setAudioState('starting');
+  let e;
+  try {
+    e = await ensureEngine();
+  } catch (err) {
+    return audioFailed(err);
+  }
+  safe(() => e.setScene(clone(store.scene)));
+  safe(() => e.setRenderMode(renderModeOf(store.scene)));
+  const res = await settle(e.start(), 90000);
+  if (audio.engine !== e) return null;
+  if (res !== 'ok') return audioFailed(res === 'timeout' ? new Error('the engine did not start in time') : res.error);
+  audio.started = true;
+  pushWholeScene();
+  safe(() => e.setVisualSafety({ maxFlashesPerSec: 3 }));
+  safe(() => e.setTime(transport.t));
+  fadeIn(3);
+  setAudioState('live');
+  return true;
+}
+
 /** The browser keeps the AudioContext suspended until a click or key press (autoplay policy). */
 function warnBlocked() {
   if (audio.warnedBlocked) return;
@@ -453,6 +560,24 @@ function bindEngine(e) {
   on('impact-stats', onImpactStats);
   on('meter', onMeter);
   on('caption', onEngineCaption);
+  if (e.native) {
+    on('stats', () => {
+      if (audio.engine === e) setAudioState(audio.state);
+    });
+    on('error', (d) => {
+      console.warn('[studio] native engine:', d.where, d.message);
+      if (audio.engine === e) toast(`Rust engine: ${d.message || 'error'}`);
+    });
+    on('server', ({ up }) => {
+      if (audio.engine !== e || !audio.started) return;
+      if (up) {
+        setAudioState('live');
+      } else {
+        setAudioState('error');
+        toast('The raingen studio process is not answering. Start `raingen studio` again and reload this window.');
+      }
+    });
+  }
   on('state', ({ state }) => {
     if (!audio.started || audio.engine !== e) return;
     if (state === 'running') {
@@ -876,6 +1001,10 @@ async function strike() {
     args.distanceKm = s.weather.thunder.distance_km;
     args.bearingDeg = s.weather.thunder.bearing_deg;
   }
+  if (native.on) {
+    toast('Manual strikes are synthesized by the browser engine; the Rust engine plays the storm in the scene (turn Thunder on, or add a storm).');
+    return;
+  }
   if (!transport.playing) await play();
   if (audio.started) {
     const res = safe(() => audio.engine.strikeLightning(args));
@@ -996,8 +1125,8 @@ function openRenderDialog() {
   const st = store.scene.studio;
   const secs = st.loopOn ? Math.round(st.loop[1] - st.loop[0]) : Math.min(Math.round(st.duration), 600);
   $('#render-seconds').value = String(Math.max(1, secs));
-  $('#render-status').textContent = WORKLET_SUPPORTED ? '' : 'Rendering needs AudioWorklet (a modern browser on an https page).';
-  $('#render-go').disabled = !WORKLET_SUPPORTED;
+  $('#render-status').textContent = native.on ? 'Renders through the Rust engine (raingen studio).' : WORKLET_SUPPORTED ? '' : 'Rendering needs AudioWorklet (a modern browser on an https page).';
+  $('#render-go').disabled = !audioCapable();
   $('#render-progress').value = 0;
   openDialog($('#dlg-render'), document.activeElement);
 }
@@ -1050,7 +1179,7 @@ async function doRender() {
 function showGate() {
   const g = $('#gate');
   $('#gate-scene').textContent = store.scene.name;
-  if (!WORKLET_SUPPORTED) {
+  if (!audioCapable()) {
     $('#gate-note').textContent = AUDIO_SUPPORTED
       ? 'The audio engine cannot run here: it needs a browser with AudioWorklet, on an https page. You can still build the world, animate it and export it for the Python CLI.'
       : 'This browser has no Web Audio. You can still build the world and export it for the Python CLI.';
@@ -1517,10 +1646,10 @@ function boot() {
   setWorkspace(ui.workspace, { quiet: true });
   document.title = `${store.scene.name} · raingen 4D Composer`;
   updateMediaSession();
-  setAudioState(WORKLET_SUPPORTED ? 'idle' : 'unsupported');
+  setAudioState(audioCapable() ? 'idle' : 'unsupported');
   updateTransportUI();
   timeline.setTime(0, { apply: true, force: true });
-  if (WORKLET_SUPPORTED) loadEngineModule().catch((err) => console.warn('[studio] engine module not loaded yet:', err && err.message ? err.message : err));
+  if (WORKLET_SUPPORTED && !native.on) loadEngineModule().catch((err) => console.warn('[studio] engine module not loaded yet:', err && err.message ? err.message : err));
   initViewport();
   showGate();
   if (sharedScene) toast(`Opened the shared scene “${sharedScene.name}”.`, { action: { label: 'Save to My presets', fn: () => savePreset(sharedScene.name) } });

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=62.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -91,6 +91,16 @@ thunderstorm = "rain_generator.simulator:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rain_generator*", "raingen*"]
+
+# The 4D Composer (site/) for `raingen studio`; installed under <prefix>/share/raingen/site
+# (raingen.studio.find_site falls back to it when not run from a checkout).
+[tool.setuptools.data-files]
+"share/raingen/site" = ["site/*.html", "site/*.txt", "site/*.xml"]
+"share/raingen/site/assets" = ["site/assets/*"]
+"share/raingen/site/engine" = ["site/engine/*.js"]
+"share/raingen/site/engine/worklets" = ["site/engine/worklets/*.js"]
+"share/raingen/site/studio" = ["site/studio/*.html", "site/studio/*.css"]
+"share/raingen/site/studio/app" = ["site/studio/app/*.js"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
