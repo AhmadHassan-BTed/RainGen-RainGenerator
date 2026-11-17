@@ -963,7 +963,15 @@ function setVolume(pct, { from = null } = {}) {
 
 function setVisuals(mode) {
   ui.visuals = ['full', 'calm', 'off'].includes(mode) ? mode : 'full';
+  if (ui.visuals !== 'off') ui.lastOnVisuals = ui.visuals;
   prefs.set('visuals', ui.visuals);
+  const sb = $('#btn-scene');
+  if (sb) {
+    const off = ui.visuals === 'off';
+    sb.setAttribute('aria-pressed', String(off));
+    sb.title = off ? 'Scene is off: turn the 3-D scene back on' : 'Scene off: stop 3-D drawing, all CPU to the sound';
+    sb.setAttribute('aria-label', sb.title);
+  }
   viewport?.setVisualsMode(ui.visuals);
   listener?.setVisualsUI(ui.visuals);
   for (const i of $$('input[name="vp-visuals"]')) i.checked = i.value === ui.visuals;
@@ -1410,6 +1418,7 @@ function bindViewportToolbar() {
     if (viewport) viewport.autoShelter = e.target.checked;
   });
   for (const r of $$('input[name="vp-visuals"]')) r.addEventListener('change', () => r.checked && setVisuals(r.value));
+  $('#btn-scene')?.addEventListener('click', () => setVisuals(ui.visuals === 'off' ? (ui.lastOnVisuals || 'full') : 'off'));
 }
 
 function bindDialogs() {

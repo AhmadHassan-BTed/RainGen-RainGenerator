@@ -1639,3 +1639,6 @@ html[data-visuals="off"] .flash-glow { display: none; }
 
 html.gate-open .topbar,
 html.gate-open .app { filter: blur(1px); }
+
+/* Scene off: the 3-D view is not drawn; the button shows the pressed state */
+#btn-scene[aria-pressed="true"] { color: var(--accent); }
