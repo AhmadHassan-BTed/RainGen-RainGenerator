@@ -840,7 +840,8 @@ def _preset_level(name: str, seconds: float = 2.0, seed: int = 1) -> tuple[float
     ("window-rain-bedroom", 24.0, 45.0),
     ("focus-steady-roof", 27.0, 45.0),                       # 8 mm/h fine drops on the same roof
     ("steady-rain-leaves-night", 44.3, 50.3),                # unchanged by the interior fixes (47.3, +-3 dB)
-    ("tin-roof-cabin-storm", 65.5, 71.5),                    # unchanged (68.5, +-3 dB)
+    # showery: 2 s are one draw of the slow shower / Cox state (seeds 1-5: 65.3-72.1 dB, mean 68.5)
+    ("tin-roof-cabin-storm", 64.5, 72.5),
 ])
 def test_preset_levels_stay_in_their_physical_window(name, lo, hi):
     rms, peak = _preset_level(name)

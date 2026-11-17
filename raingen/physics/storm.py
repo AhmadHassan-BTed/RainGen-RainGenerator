@@ -66,6 +66,11 @@ _ARC_BLEND_S = 20.0
 _COX_OCTAVES = 13
 _COX_BASE_S = 0.1
 _COX_SIGMA = {"continuous": 0.22, "intermittent": 0.30, "showery": 0.35}
+# Finest octave of the shared (whole-scene) rate modulation per character. Seconds-scale drop
+# clustering is local: each surface patch carries its own independent modulator in the native
+# core, and thousands of them average out, so the scene-wide rate only drifts slowly. Steady
+# rain: >= ~100 s (octave 10: 102 s); showers / intermittent: >= ~25 s (octave 8).
+_COX_MIN_OCTAVE = {"continuous": 10, "intermittent": 8, "showery": 8}
 
 _LATERAL_MISS_KM = 0.3
 _INTERMITTENT_KNOT_S = 40.0
@@ -235,12 +240,14 @@ class StormSystem:
             cache[k] = v
         return v
 
-    def cox_modulation(self, t: float, sigma: float) -> float:
-        """Mean-one multiplicative 1/f modulation at time t (0.1 s .. ~7 min)."""
+    def cox_modulation(self, t: float, sigma: float, min_octave: int = 0) -> float:
+        """Mean-one multiplicative 1/f modulation at time t (0.1 s .. ~7 min); octaves below
+        `min_octave` (period 0.1 s * 2^min_octave) are left out at the same per-octave depth."""
         if sigma <= 0.0:
             return 1.0
+        lo = min(max(int(min_octave), 0), _COX_OCTAVES - 1)
         g = 0.0
-        for o in range(_COX_OCTAVES):
+        for o in range(lo, _COX_OCTAVES):
             period = _COX_BASE_S * (2.0 ** o)
             x = t / period
             k = int(math.floor(x))
@@ -251,7 +258,8 @@ class StormSystem:
             g += a + (b - a) * e
         g *= sigma / math.sqrt(_COX_OCTAVES)
         # cosine-interpolated knots carry ~3/4 of the knot variance on average
-        return math.exp(g - 0.375 * sigma * sigma)
+        var = sigma * sigma * (_COX_OCTAVES - lo) / _COX_OCTAVES
+        return math.exp(g - 0.375 * var)
 
     # ---------------------------------------------------------------- thunder cells
     def _main_cell(self, t: float, dt: float, weather, vals: dict, shower_act: float) -> StormCellState:
@@ -343,7 +351,7 @@ class StormSystem:
             slow *= self._intermittent(t)
         self.shower_activity = shower_act if shower_act is not None else 1.0
 
-        self.cox = self.cox_modulation(t, _COX_SIGMA.get(character, 0.22))
+        self.cox = self.cox_modulation(t, _COX_SIGMA.get(character, 0.22), _COX_MIN_OCTAVE.get(character, 10))
         self.envelope = slow
         self.rain_multiplier = slow * self.cox
         self.dm_factor = dm

@@ -328,6 +328,16 @@ class CalmGovernor:
     LOOKAHEAD_S = 0.010
     HOLD_S = 0.060               # limiter hold before release
     FINAL_FADE_S = 10.0          # after the timer: silence over this long
+    # The governor must never audibly ride the level. For the first START_S it settles like a
+    # one-time calibration (the mode's slew); afterwards loudness is followed over LOUD_TAU_S
+    # and the broadband gain / tilt shelf move at most SLOW_GAIN_DB_PER_S / SLOW_TILT_DB_PER_S
+    # (about a dB per minute), so steady rain stays steady and only long-term drift is limited.
+    START_S = 5.0
+    LOUD_TAU_S = 60.0
+    SPEC_TAU_S = 20.0
+    SLOW_GAIN_DB_PER_S = 1.0 / 60.0
+    SLOW_TILT_DB_PER_S = 1.0 / 60.0
+    GAIN_DEADBAND_DB = 0.5
 
     def __init__(self, sr: int = SAMPLE_RATE, mode: str = "calm", settings: Optional[dict] = None,
                  timer_min: Optional[float] = None, descent_min: Optional[float] = None,
@@ -419,7 +429,8 @@ class CalmGovernor:
         bark_e = np.bincount(zb[valid], weights=spec[valid], minlength=24)[:24]
         oct_e = np.bincount(oct_idx[oct_idx >= 0], weights=spec[oct_idx >= 0], minlength=len(octs))[:len(octs)]
         cur = np.concatenate([bark_e, oct_e])
-        alpha = 1.0 - math.exp(-self.HOP_S / 1.0)          # 1 s spectral smoothing
+        settled = self.elapsed / self.sr >= self.START_S
+        alpha = 1.0 - math.exp(-self.HOP_S / (self.SPEC_TAU_S if settled else 1.0))
         if self._bands is None:
             self._bands = cur.copy()
         else:
@@ -440,7 +451,7 @@ class CalmGovernor:
         else:
             tilt = -3.0
         ldb = 10.0 * math.log10(ms + 1e-20) - 0.691
-        a3 = 1.0 - math.exp(-self.HOP_S / 3.0)              # 3 s loudness smoothing
+        a3 = 1.0 - math.exp(-self.HOP_S / (self.LOUD_TAU_S if settled else 3.0))
         self._loud_db = ldb if self._loud_db is None else self._loud_db + a3 * (ldb - self._loud_db)
         self.metrics.update({"sharpness_acum": sharp, "tilt_db_oct": tilt, "loudness_db": self._loud_db})
 
@@ -509,18 +520,24 @@ class CalmGovernor:
         if s["max_sharpness_acum"] is not None and sharp > s["max_sharpness_acum"]:
             target_tilt -= 8.0 * (sharp - s["max_sharpness_acum"])
         target_tilt = float(min(4.0, max(-15.0, strength * target_tilt))) + s["descent_tilt_db"] * u
+        settled = t_end > self.START_S
         step = s["slew_db_per_s"] * self.HOP_S
-        self._tilt_db += float(np.clip(target_tilt - self._tilt_db, -step, step))
+        tstep = min(step, self.SLOW_TILT_DB_PER_S * self.HOP_S) if settled else step
+        self._tilt_db += float(np.clip(target_tilt - self._tilt_db, -tstep, tstep))
         if abs(self._tilt_db - self._shelf_db) >= 0.05:
             self._shelf_sos = _high_shelf_sos(self.sr, 1000.0, self._tilt_db)
             self._shelf_db = self._tilt_db
 
-        # broadband gain: never boost; bring an over-loud stream down to the ceiling, recover slowly
-        target_gain = 0.0
+        # broadband gain: never boost; bring an over-loud stream down to the ceiling. The target
+        # comes from the (pre-gain) input loudness, so there is no feedback limit cycle; a dead
+        # band keeps measurement noise from moving it, and after the start it moves ~1 dB/min
+        target_gain = self._gain_db
         if s["ceiling_lufs"] is not None and self._loud_db is not None:
-            over = (self._loud_db + self._gain_db) - s["ceiling_lufs"]
-            target_gain = min(0.0, self._gain_db - over) if over > 0.5 else min(0.0, self._gain_db + 0.25 * self.HOP_S)
-        self._gain_db += float(np.clip(target_gain - self._gain_db, -step, step))
+            want = min(0.0, s["ceiling_lufs"] - self._loud_db)
+            if abs(want - self._gain_db) > (self.GAIN_DEADBAND_DB if settled else 0.0):
+                target_gain = want
+        gstep = min(step, self.SLOW_GAIN_DB_PER_S * self.HOP_S) if settled else step
+        self._gain_db += float(np.clip(target_gain - self._gain_db, -gstep, gstep))
         self._g0, self._g1 = self._g1, self._gain_db
 
         # event-to-bed cap: tighter while the texture fluctuates, -> 0 through the Descent

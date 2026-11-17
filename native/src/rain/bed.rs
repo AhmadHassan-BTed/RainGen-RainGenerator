@@ -65,7 +65,6 @@ pub struct RainBedVoice {
     olas: Vec<Ola>,
     psd: Vec<f32>,
     wander: (RateModulator, RateModulator),
-    cluster: RateModulator,
     key: u64,
 }
 
@@ -188,7 +187,6 @@ impl RainBedVoice {
                 RateModulator::new(&bc.rngf, "rain/bed/wander_x", 0.6, 1.0, 30.0, sr as f64),
                 RateModulator::new(&bc.rngf, "rain/bed/wander_y", 0.6, 1.0, 30.0, sr as f64),
             ),
-            cluster: super::rain::cluster_modulator(bc),
             key: bc.rngf.key("rain/bed"),
             kb,
         }
@@ -245,7 +243,8 @@ impl RainBedVoice {
         let gate = rain_gate(w.precip_type);
         if gate > 0.0 {
             let mut e_b = self.e_bub;
-            e_b[1] *= 1.0 - smoothstep(w.wind_u10_mps * w.gust.max(0.0), 7.5, 10.0);
+            // mean wind only: the point gust's flicker would switch the bubble band on and off
+            e_b[1] *= 1.0 - smoothstep(w.wind_u10_mps, 7.5, 10.0);
             for c in 0..N_CLASSES {
                 let f = w.class_flux[c].max(0.0);
                 if f <= 0.0 {
@@ -267,8 +266,9 @@ impl RainBedVoice {
                 }
             }
         }
-        let mut env = 0.6 + 0.4 * w.intensity_envelope.clamp(0.0, 2.0);
-        env *= (1.0 + 0.3 * (w.gust - 1.0)).clamp(0.5, 1.6);
+        // slow storm envelope only: gusts reach the bed through the World's rain curtain
+        // (strong wind only, low-passed), never through the raw point gust
+        let env = 0.6 + 0.4 * w.intensity_envelope.clamp(0.0, 2.0);
         for v in p.iter_mut() {
             *v *= self.area_factor * env;
         }
@@ -291,12 +291,8 @@ impl Voice for RainBedVoice {
         if n == 0 || out.len() < N_AMBI * n {
             return Emission::silent(Stem::RainFar);
         }
-        let mut power = self.band_power(w);
-        // the shared clustering, at half the log-depth: the bed averages over 10-300 m
-        let cl = (self.cluster.step(ctx.index, n) as f32).sqrt();
-        for p in power.iter_mut() {
-            *p *= cl;
-        }
+        // the bed averages over 10-300 m of independent impacts: no clustering survives
+        let power = self.band_power(w);
         let v: f32 = power.iter().map(|x| x.max(0.0)).sum();
         // the wanderers advance every block so their state never depends on silence
         let vdir = self.aniso(w, ctx.index, n);
@@ -369,7 +365,6 @@ impl Voice for RainBedVoice {
         self.aniso_prev = [0.0; 3];
         self.wander.0.reset();
         self.wander.1.reset();
-        self.cluster.reset();
         self.band_key = None;
     }
 }

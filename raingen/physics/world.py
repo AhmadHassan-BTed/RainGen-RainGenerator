@@ -16,7 +16,7 @@ Each block the World:
   6. applies a modest convective outflow cooling near active thunder cells.
 
 Rain rate continuity: the rate is a smooth function of time (arc, showers, Cox knots are
-cosine-interpolated) times a gust 'curtain' taken from the gust low-passed over 2 s, so
+cosine-interpolated) times a gust 'curtain' taken from the gust low-passed over 4 s (strong wind only), so
 consecutive blocks never jump.
 
 Gust contract (shared with raingen.synth.wind, so the wind sound's gusts line up with
@@ -63,7 +63,9 @@ _SEASON_DOY = {"spring": 80, "summer": 172, "autumn": 266, "fall": 266, "winter"
 _CHARACTER_MEAN = {"showery": 0.4, "intermittent": 0.7}
 _STABILITY_TI = {"unstable": math.sqrt(2.0), "neutral": 1.0, "stable": math.sqrt(0.5)}
 _STABILITY_TAU_S = 20.0
-_CURTAIN_TAU_S = 2.0          # rain curtains follow the gust smoothed over ~2 s (see step)
+_CURTAIN_TAU_S = 4.0          # rain curtains follow the gust smoothed over ~4 s (see step)
+_CURTAIN_DEPTH = 0.15         # gentle, and only in strong wind (_CURTAIN_WIND_MPS)
+_CURTAIN_WIND_MPS = (8.0, 12.0)
 
 
 def daylight_hours(latitude_deg: float, season: str) -> tuple[float, float]:
@@ -253,12 +255,17 @@ class World:
         # precipitation: arc x showers x Cox x gust curtains. Rain shafts are carried by the
         # gust structure on scales of seconds; the point gust also has the inertial-range
         # flicker of the Kaimal spectrum (~16 % per 21 ms block at TI 0.45), which drops that
-        # fell several metres average out, so the curtain follows the gust low-passed over 2 s
+        # fell several metres average out, so the curtain follows the gust low-passed over 4 s, and only in strong wind
         if self._curtain_gust is None:
             self._curtain_gust = gust
         else:
             self._curtain_gust += (gust - self._curtain_gust) * (1.0 - math.exp(-dt / _CURTAIN_TAU_S))
-        curtain = min(max(1.0 + 0.3 * (self._curtain_gust - 1.0), 0.5), 1.8)
+        # below ~8 m/s the rain does not pump with the gusts at all: steady rain is the sum of
+        # thousands of independent impacts and stays level; the wind sound carries the gusts
+        lo, hi = _CURTAIN_WIND_MPS
+        x = min(max((u10 - lo) / (hi - lo), 0.0), 1.0)
+        depth = _CURTAIN_DEPTH * x * x * (3.0 - 2.0 * x)
+        curtain = min(max(1.0 + depth * (self._curtain_gust - 1.0), 0.7), 1.4)
         rate = base_rate * rain_mult * curtain
         dsd = dsd_from_scene(p, rate)
         dm_factor = self.storms.dm_factor

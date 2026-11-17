@@ -77,18 +77,32 @@ const SPLASH_REPS: f32 = 6.0;
 const BLOCK_REF: f32 = 1024.0;
 const LIVE_EPS: f32 = 1e-12;
 pub const AIR_MIN_DIST_M: f32 = 3.0;
+/// Low-pass of the wind the drops see (s).
+const WIND_LP_TAU_S: f32 = 4.0;
 
-/// Shared drop-arrival clustering of the local rain field (one stream, same key for every patch
-/// and the bed, so the whole near field breathes together instead of averaging out over ~30
-/// independent patches). Rain arrivals are a doubly stochastic Poisson process, clustered on
-/// 0.1-few s scales (Kostinski & Jameson 1997; Jameson & Kostinski 1999-2001; 1-s rain-rate
-/// CV ~0.3-0.5 in steady rain); sigma 0.4 of log-rate over OU time constants 0.1-1.6 s lifts
-/// the envelope modulation in the 0.5-5 Hz band from ~-24 dB to >= -20 dB re 100 % (10 % rms).
-pub const CLUSTER_SIGMA: f64 = 0.4;
+/// Drop-arrival clustering, LOCAL to each patch. Rain arrivals are a doubly stochastic Poisson
+/// process, clustered on 0.1-few s scales (Kostinski & Jameson 1997; Jameson & Kostinski
+/// 1999-2001), but that clustering is decorrelated over metres: the field heard is the sum of
+/// thousands of independent impacts, so its overall loudness is stationary. Every patch has its
+/// own modulator (own key), and its depth shrinks with the patch area as the clusters inside it
+/// average out (sigma * sqrt(A_c / (A_c + A))): a 1 m2 sill keeps most of its local texture, a
+/// 50 m2 roof or a canopy is nearly steady. A shared modulator here made the whole field swell together.
+pub const CLUSTER_SIGMA: f64 = 0.3;
 pub const CLUSTER_TAU_S: (f64, f64) = (0.1, 1.6);
+/// Per-patch slower (Cox) rate wander: depth and longest time constant.
+pub const PATCH_COX_SIGMA: f64 = 0.22;
+pub const PATCH_COX_TAU_S: (f64, f64) = (0.1, 3.2);
+/// Correlation area of the local clustering (m2).
+pub const CLUSTER_AREA_M2: f64 = 1.0;
 
-pub fn cluster_modulator(bc: &super::BuildCtx) -> RateModulator {
-    RateModulator::new(&bc.rngf, "rain/cluster", CLUSTER_SIGMA, CLUSTER_TAU_S.0, CLUSTER_TAU_S.1, bc.sr as f64)
+#[inline]
+pub fn cluster_area_factor(area_m2: f32) -> f64 {
+    (CLUSTER_AREA_M2 / (CLUSTER_AREA_M2 + area_m2.max(0.0) as f64)).sqrt()
+}
+
+pub fn cluster_modulator(bc: &super::BuildCtx, name: &str, area_m2: f32) -> RateModulator {
+    let s = CLUSTER_SIGMA * cluster_area_factor(area_m2);
+    RateModulator::new(&bc.rngf, &format!("{name}/cluster"), s, CLUSTER_TAU_S.0, CLUSTER_TAU_S.1, bc.sr as f64)
 }
 
 #[inline]
@@ -401,6 +415,8 @@ pub struct RainPatchVoice {
     // state
     cox: RateModulator,
     cluster: RateModulator,
+    /// wind seen by the falling drops: (ux, uy, gust), low-passed over WIND_LP_TAU_S
+    wind_lp: Option<(f32, f32, f32)>,
     table: ClassTable,
     table_ver: u64,
     key_ev: u64,
@@ -521,8 +537,16 @@ impl RainPatchVoice {
             color_key: [None; 5],
             dense_key: None,
             lod_prev: None,
-            cox: RateModulator::new(&bc.rngf, &format!("{name}/cox"), 0.22, 0.1, 12.0, sr as f64),
-            cluster: cluster_modulator(bc),
+            cox: RateModulator::new(
+                &bc.rngf,
+                &format!("{name}/cox"),
+                PATCH_COX_SIGMA * cluster_area_factor(patch.area_m2),
+                PATCH_COX_TAU_S.0,
+                PATCH_COX_TAU_S.1,
+                sr as f64,
+            ),
+            cluster: cluster_modulator(bc, &name, patch.area_m2),
+            wind_lp: None,
             table: ClassTable::default(),
             table_ver: 0,
             key_ev: bc.rngf.key(&format!("{name}/events")),
@@ -755,7 +779,19 @@ impl RainPatchVoice {
         let dq = self.table.dq;
         let vtq = self.table.vtq;
         let qw = self.table.wq;
-        let (uhx, uhy) = wind_vector(w);
+        // Drops relax to the air speed over ~0.5-1 s of fall and a patch spans metres of the
+        // gust field, so the tilt / impact geometry follows the wind low-passed over a few
+        // seconds, not the point gust's block-to-block flicker (which made the rain pump)
+        let (ux, uy) = wind_vector(w);
+        let g = w.gust.max(0.0);
+        let (uhx, uhy, glp) = match self.wind_lp {
+            None => (ux, uy, g),
+            Some((x, y, gg)) => {
+                let a = 1.0 - (-(n as f32) / (sr * WIND_LP_TAU_S)).exp();
+                (x + a * (ux - x), y + a * (uy - y), gg + a * (g - gg))
+            }
+        };
+        self.wind_lp = Some((uhx, uhy, glp));
         let wn = self.nx * uhx + self.ny * uhy;
         let mut rate = [0.0f32; 5];
         let mut any = false;
@@ -770,7 +806,7 @@ impl RainPatchVoice {
         }
         let mmean = 0.5 * (m0 + m1) as f32;
         let (wet, cover, depth, glazed) = self.surface_state(w);
-        let wind10 = w.wind_u10_mps * w.gust.max(0.0);
+        let wind10 = w.wind_u10_mps * glp;
         let mut unq = [[0.0f32; QUAD]; 5];
         let mut fq = [[0.0f32; QUAD]; 5];
         for c in 0..N_CLASSES {
@@ -995,6 +1031,7 @@ impl Voice for RainPatchVoice {
         self.direct.clear();
         self.cox.reset();
         self.cluster.reset();
+        self.wind_lp = None;
         self.lod_prev = None;
         self.dense_key = None;
         self.color_key = [None; 5];
