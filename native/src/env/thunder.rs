@@ -444,6 +444,41 @@ fn nwave_integral(nt: usize, nr: usize, win: &mut Vec<f64>, out: &mut Vec<f32>) 
 
 /// Sum of squares of a segment's unit kernel (closed form of thunder._kernel_energy for the
 /// parabolic I(x) = nT x (1 - x): sum I^2 = nT^3 / 30, autocorrelation nT^3 (1-s)^3 (1+3s+s^2) / 30).
+/// Add one N-wave (shock up to +a, linear fall to -a, shock back to 0) of `len` samples at `at`.
+fn add_nwave(y: &mut [f32], at: usize, len: usize, a: f32) {
+    let len = len.max(2);
+    let k = 2.0 / (len - 1) as f32;
+    for i in 0..len {
+        if let Some(v) = y.get_mut(at + i) {
+            *v += a * (1.0 - k * i as f32);
+        }
+    }
+}
+
+/// A frame of Poisson-arriving N-waves (rate `lam` per s, periods lognormal about `t_mean`, mostly
+/// compression first), normalised to unit variance per sample on average.
+fn nwave_train(rng: &mut Rng, frame: &mut [f32], lam: f64, t_mean: f64, sr: f64) {
+    frame.iter_mut().for_each(|v| *v = 0.0);
+    let nf = frame.len();
+    let count = rng.poisson(lam * nf as f64 / sr) as usize;
+    // E[a^2] (lognormal sigma 0.6) * E[T] / 3 per N-wave
+    let e_a2 = (2.0f64 * 0.36).exp();
+    let var = lam / sr * e_a2 * t_mean * sr / 3.0;
+    let g = (1.0 / var.max(1e-12)).sqrt();
+    for _ in 0..count {
+        let at = rng.below(nf as u64) as i64 - (0.5 * t_mean * sr) as i64;
+        let len = ((t_mean * rng.lognormal(0.0, 0.3) * sr) as usize).max(4);
+        let a = g * rng.lognormal(0.0, 0.6) * if rng.uniform() < 0.8 { 1.0 } else { -1.0 };
+        let k = 2.0 / (len - 1) as f64;
+        for i in 0..len {
+            let t = at + i as i64;
+            if t >= 0 && (t as usize) < nf {
+                frame[t as usize] += (a * (1.0 - k * i as f64)) as f32;
+            }
+        }
+    }
+}
+
 fn kernel_energy(nt: u32, m: u32) -> f64 {
     let ntf = nt as f64;
     if m <= 1 {
@@ -861,8 +896,19 @@ impl Event {
             let e0 = e0_base * s.fac * s.e_mult;
             let r0 = (e0 / (PI * P0)).sqrt();
             let t0 = (e0 / P0).sqrt() / c;
-            per[i] = (t0 * (s.r / r0).powf(0.25)).max(t0).min(0.08);
-            let mut a = N_WAVE_K * e0.sqrt() * (s.seg_l / s.r) * (r0 / s.r).powf(0.25);
+            // N-wave period: weak-shock stretching T ~ (r / R0)^(1/4) holds only while the shock is
+            // strong (r < ~10 R0); beyond that the pulse propagates nearly acoustically and Few's
+            // dominant frequency f_m = 0.63 c0 / R0 is almost independent of range (Few 1969, JGR 74,
+            // 6926; Few 1982, Handbook of Atmospherics). Observed thunder spectra peak at 50-250 Hz
+            // (Holmes et al. 1971, JGR 76, 2106). Only a slow spherical weak-shock growth
+            // sqrt(1 + 0.04 ln(r / 10 R0)) remains (period ~ t0 = sqrt(E0 / p0) / c0 ~ 1.8 R0 / c0). The amplitude is rescaled by sqrt(T_old / T)
+            // so each segment's acoustic energy (a^2 T) and hence the calibrated level is unchanged.
+            let rc = 10.0 * r0;
+            let per_old = (t0 * (s.r / r0).powf(0.25)).max(t0).min(0.08);
+            per[i] = (t0 * (1.0 + 0.04 * (s.r / rc).max(1.0).ln()).sqrt())
+                .max(t0)
+                .min(0.08);
+            let mut a = N_WAVE_K * e0.sqrt() * (s.seg_l / s.r) * (r0 / s.r).powf(0.25) * (per_old / per[i]).sqrt();
             dtau[i] = (s.r_far - s.r_near) / c;
             az[i] = s.u[1].atan2(s.u[0]);
             el[i] = s.u[2].clamp(-1.0, 1.0).asin();
@@ -1079,7 +1125,12 @@ impl Event {
             pd[i] = hold;
         }
         self.env_r = pr.iter().map(|v| (RUMBLER_POWER * v.max(0.0)).sqrt() as f32).collect();
-        self.env_d = pd.iter().map(|v| (DEEPENER_POWER * v).sqrt() as f32).collect();
+        // The low afterglow belongs to distant thunder: absorption (ISO 9613-1) and the longer,
+        // more scattered paths leave mostly 30-100 Hz rumble beyond ~5 km, while near and mid-range
+        // thunder peaks higher, ~80-250 Hz (Holmes et al. 1971; Few 1982).
+        let r_km = self.r_min / 1000.0;
+        let deep = DEEPENER_POWER * (0.12 + 0.88 * smoothstep(r_km as f32, 2.5, 8.0) as f64);
+        self.env_d = pd.iter().map(|v| (deep * v).sqrt() as f32).collect();
         // energy-weighted direction track, held through silent stretches
         let wv = hann_inner(51);
         let vx = conv_same(&cums(&dx), &wv);
@@ -1127,15 +1178,39 @@ impl Event {
         }
         let sr = tl.sr;
         let l = (0.6 * sr) as usize;
-        let tau = 0.05 + 0.1 * rmin / CRACK_RANGE_M;
         let nfft = tl.fft_c.n;
         let mut burst = vec![0.0f32; nfft];
-        for (i, b) in burst.iter_mut().take(l).enumerate() {
-            let t = i as f64 / sr as f64;
-            *b = (rng.normal() * (-t / tau).exp() * (1.0 - (-t / 0.0015).exp())) as f32;
+        // The crack is the first, nearly coherent arrivals from the channel segments closest to the
+        // listener: a train of short N-waves with shock fronts (sub-ms rise, energy to several kHz;
+        // Few 1969; Uman 1987 'The Lightning Discharge' ch. 11), each at its own segment's arrival
+        // time and scaled by its own amplitude. The micro-tortuosity (1-10 m kinks) gives the short
+        // 1-4 ms periods; the ISO 9613-1 path absorption is applied below.
+        let mut near: Vec<(f64, f64)> = r_near
+            .iter()
+            .enumerate()
+            .filter(|e| *e.1 - rmin < 0.35 * self.c)
+            .map(|(j, &rn)| ((rn - rmin) / self.c, self.a[j] as f64))
+            .collect();
+        near.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        near.truncate(48);
+        if near.is_empty() {
+            near.push((0.0, 1.0));
         }
-        let mut hp = Biquad::new(hp2(600.0, sr));
-        hp.process_block(&mut burst[..l]);
+        let a_ref = near.iter().fold(0.0f64, |m, v| m.max(v.1)).max(1e-30);
+        // the very first arrival opens the crack at full strength
+        let first = near.iter().fold(f64::INFINITY, |m, v| m.min(v.0));
+        near.push((first, a_ref));
+        for &(dt, a) in &near {
+            // 1-3 sub-pulses per segment from its kinks, each an N-wave of 1-4 ms
+            let subs = ri(rng, 1, 4);
+            for q in 0..subs {
+                let t0 = dt + if q == 0 { 0.0 } else { rng.uniform() * 0.012 };
+                let per = 0.001 + 0.003 * rng.uniform();
+                let amp = (a / a_ref) * rng.lognormal(0.0, 0.35) * if q == 0 { 1.0 } else { 0.5 };
+                let pol = if rng.uniform() < 0.85 { 1.0 } else { -1.0 };
+                add_nwave(&mut burst[..l], (t0 * sr as f64) as usize, (per * sr as f64) as usize, (pol * amp) as f32);
+            }
+        }
         let tear = 3.0 * (1.0 - rmin / TEAR_RANGE_M).max(0.0).powf(1.5);
         if tear > 0.0 {
             let kc = ri(rng, 40, 150) as usize;
@@ -1181,7 +1256,8 @@ impl Event {
         if !found {
             a_peak = self.peak_pa;
         }
-        let g = (0.5 * a_peak * (1.0 - rmin / CRACK_RANGE_M)) as f32 / pk;
+        // a close strike's crack is its loudest moment (peak levels well above the rumble; Uman 1987)
+        let g = (1.6 * a_peak * (1.0 - rmin / CRACK_RANGE_M)) as f32 / pk;
         burst.iter_mut().for_each(|v| *v *= g);
         self.crack = burst;
         self.crack_start = ((self.t_flash + rmin / self.c) * self.sr).round() as i64;
@@ -1302,12 +1378,15 @@ impl Event {
         let mut src = vec![0.0f32; RUMBLE_ROWS * fb];
         for (b, &f) in tl.freqs_r.iter().enumerate() {
             let f = f.max(1e-3) as f64;
-            let x22 = (f / 22.0).powi(4);
-            let hp_r = x22 / (1.0 + x22);
-            let b_r = hp_r / (1.0 + (f / self.f_nwave).powi(2));
-            let x12 = (f / 12.0).powi(4);
-            let hp_d = x12 / (1.0 + x12);
-            let b_d = hp_d / (1.0 + (f / 55.0).powi(8));
+            // rumblers (rows 0, 2) are trains of N-waves (rumble_noise), so their spectrum is the
+            // N-wave spectrum itself; here only the sub-sonic part is removed: thunder's infrasound
+            // (< 20 Hz, Bohannon et al. 1977, JGR 82) is inaudible and only eats headroom.
+            let x25 = (f / 25.0).powi(4);
+            let b_r = x25 / (1.0 + x25);
+            // deepener: the long low rumble of the distant channel, 30-100 Hz (Holmes et al. 1971;
+            // the far-field rumble peak after ISO 9613-1 absorption), 4th-order edges.
+            let x28 = (f / 28.0).powi(4);
+            let b_d = x28 / (1.0 + x28) / (1.0 + (f / 95.0).powi(4));
             src[b] = b_r as f32;
             src[fb + b] = b_d as f32;
         }
@@ -1349,11 +1428,26 @@ impl Event {
                 *g = 10f32.powf(-a * r_m / 20.0);
             }
             let mut rng = Rng::from_key(combine(key_rumble, self.key), ru.k);
+            // Rolling rumble as shaped impulse trains, not noise: every micro-segment of the tortuous
+            // channel sends its own N-wave (Few 1969; Ribner & Roy 1982, JASA 72, 1911), arriving in
+            // a Poisson stream whose density grows with range (more channel within each arrival
+            // window, plus scattering), so close rumble crackles and distant rumble rolls smoothly.
+            let r_km = (r_m as f64 / 1000.0).max(0.2);
+            let lam = (25.0 + 55.0 * r_km).min(700.0);
+            let t_mean = (0.66 / self.f_nwave.max(15.0)).clamp(0.002, 0.04);
             for v in 0..RUMBLE_ROWS {
-                white_spectrum(&mut rng, &mut tl.spec_r);
                 let mag = &ru.src_mag[v * fb..(v + 1) * fb];
-                for b in 0..fb {
-                    tl.spec_r[b] *= mag[b] * tl.gain_r[b] * tl.scale_r[b];
+                if v == 1 {
+                    white_spectrum(&mut rng, &mut tl.spec_r);
+                    for b in 0..fb {
+                        tl.spec_r[b] *= mag[b] * tl.gain_r[b] * tl.scale_r[b];
+                    }
+                } else {
+                    nwave_train(&mut rng, &mut tl.frame_r, lam, t_mean, self.sr);
+                    tl.fft_r.forward(&mut tl.frame_r, &mut tl.spec_r);
+                    for b in 0..fb {
+                        tl.spec_r[b] *= mag[b] * tl.gain_r[b];
+                    }
                 }
                 tl.fft_r.inverse(&mut tl.spec_r, &mut tl.frame_r);
                 let k = 1.0 / nf as f32;
@@ -1649,6 +1743,9 @@ pub struct ThunderVoice {
     key_flash: u64,
     key_rumble: u64,
     key_growl: u64,
+    /// 4th-order high-pass at 22 Hz per SH channel: thunder's sub-sonic content (the infrasonic
+    /// pulse, < 20 Hz; Few 1969, Bohannon et al. 1977) is inaudible and attenuated.
+    infra: Vec<Biquad>,
 }
 
 impl ThunderVoice {
@@ -1669,6 +1766,9 @@ impl ThunderVoice {
             key_flash: cfg.rng.key("thunder.flash"),
             key_rumble: cfg.rng.key("thunder.rumble"),
             key_growl: cfg.rng.key("thunder.growl"),
+            infra: (0..2 * N_AMBI)
+                .map(|i| Biquad::new(BiquadCoefs::highpass(sr, 22.0, if i % 2 == 0 { 0.541_196_1 } else { 1.306_563 })))
+                .collect(),
         }
     }
 
@@ -1899,6 +1999,11 @@ impl Voice for ThunderVoice {
         if !echoed && self.events.is_empty() {
             return Emission::silent(Stem::Thunder);
         }
+        for ch in 0..N_AMBI {
+            let o = &mut out[ch * n..(ch + 1) * n];
+            self.infra[2 * ch].process_block(o);
+            self.infra[2 * ch + 1].process_block(o);
+        }
         for v in out[..N_AMBI * n].iter_mut() {
             if !v.is_finite() || v.abs() < 1e-30 {
                 *v = 0.0;
@@ -1911,6 +2016,7 @@ impl Voice for ThunderVoice {
         self.events.clear();
         self.pending.clear();
         self.echo.reset();
+        self.infra.iter_mut().for_each(|b| b.reset());
     }
 }
 

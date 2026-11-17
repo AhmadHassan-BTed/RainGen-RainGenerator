@@ -250,7 +250,7 @@ fn region_birds(r: &str) -> &'static [Bird] {
 fn region_frogs(r: &str) -> &'static [Frog] {
     use Frog::*;
     match r {
-        "north_america" => &[Peeper, Chorus, ToadTrill, Bull],
+        "north_america" => &[Peeper, Tree, Chorus, Peeper, Bull, ToadTrill],
         "boreal" => &[Common, Chorus],
         "mediterranean" => &[Tree, Common],
         "east_asia" => &[Tree, Chorus, Bull],
@@ -568,6 +568,116 @@ fn pulse_train(
     norm_from(out, s0);
 }
 
+/// One frog note as a train of damped vocal pulses: each pulse a fast (~1 ms) onset and an
+/// exponential decay of a harmonic carrier, the laryngeal burst ringing in the vocal sac, not a
+/// smooth AM envelope (Gerhardt & Huber 2002, 'Acoustic Communication in Insects and Anurans',
+/// ch. 3; Ryan 1985). Notes swell over their first third; pulses jitter a little in period,
+/// amplitude and pitch.
+#[allow(clippy::too_many_arguments)]
+fn frog_pulses(
+    out: &mut Vec<f32>,
+    rng: &mut Rng,
+    sr: f64,
+    n_pulses: usize,
+    period0: f64,
+    period1: f64,
+    carrier: f64,
+    glide: f64,
+    decay_frac: f64,
+    harm: &[f64],
+    ramp_up: f64,
+) {
+    let s0 = out.len();
+    let n_pulses = n_pulses.max(1);
+    let mut times = Vec::with_capacity(n_pulses);
+    let mut t = 0.0;
+    for k in 0..n_pulses {
+        times.push(t);
+        let x = if n_pulses > 1 { k as f64 / (n_pulses - 1) as f64 } else { 0.0 };
+        t += (period0 + (period1 - period0) * x) * rng.lognormal(0.0, 0.04);
+    }
+    let pmax = period0.max(period1);
+    let len = ((t + 5.0 * decay_frac * pmax + 0.002) * sr) as usize + 16;
+    out.extend(std::iter::repeat_n(0.0f32, len));
+    let y = &mut out[s0..];
+    let fmax = 0.45 * sr;
+    for (k, &t0) in times.iter().enumerate() {
+        let x = if n_pulses > 1 { k as f64 / (n_pulses - 1) as f64 } else { 0.0 };
+        let amp = (ramp_up + (1.0 - ramp_up) * (x * 3.0).min(1.0)) * rng.lognormal(0.0, 0.12);
+        let per = period0 + (period1 - period0) * x;
+        let tau = (decay_frac * per).max(4e-4);
+        let fc = carrier * (1.0 + glide * x) * rng.lognormal(0.0, 0.006);
+        let i0 = (t0 * sr) as usize;
+        let att = ((0.0012 * sr) as usize).max(1);
+        let m = att + (5.0 * tau * sr) as usize;
+        let ph0 = rng.range(0.0, 2.0 * PI);
+        let w = 2.0 * PI * fc / sr;
+        let kd = (-1.0 / (tau * sr)).exp();
+        let mut env = 1.0f64;
+        for j in 0..m {
+            let idx = i0 + j;
+            if idx >= y.len() {
+                break;
+            }
+            let e = if j < att {
+                (PI * 0.5 * j as f64 / att as f64).sin().powi(2)
+            } else {
+                env *= kd;
+                env
+            };
+            let ph = ph0 + w * j as f64;
+            let mut v = ph.sin();
+            for (h, a) in harm.iter().enumerate() {
+                if (h as f64 + 2.0) * fc < fmax {
+                    v += a * ((h as f64 + 2.0) * ph).sin();
+                }
+            }
+            y[idx] += (amp * e * v) as f32;
+        }
+    }
+    norm_from(out, s0);
+}
+
+/// A bullfrog-like note: a glottal pulse train at f0 ~ 90-130 Hz (jittered) driving two vocal-
+/// tract / sac resonances, ~200-300 Hz and ~1.2-1.5 kHz (Capranica 1965, 'The evoked vocal
+/// response of the bullfrog'; Bee & Gerhardt 2001), a low harmonic drone with a soft rise and a
+/// slow fall.
+fn bull_note(out: &mut Vec<f32>, rng: &mut Rng, sr: f64, dur: f64, p: f64) {
+    let s0 = out.len();
+    let n = (dur * sr) as usize;
+    let f0 = rng.range(90.0, 130.0) * p;
+    let mut exc = vec![0.0f32; n];
+    let mut t = 0.0f64;
+    while (t * sr) < n as f64 {
+        let i = (t * sr) as usize;
+        if i < n {
+            exc[i] += rng.lognormal(0.0, 0.08) as f32;
+            if i + 1 < n {
+                exc[i + 1] -= 0.6 * exc[i];
+            }
+        }
+        t += rng.lognormal(0.0, 0.015) / f0;
+    }
+    let f1 = rng.range(200.0, 300.0) * p;
+    let f2 = rng.range(1200.0, 1500.0) * p;
+    let mut r1 = Biquad::new(bp(f1 as f32, 3.0, sr as f32));
+    let mut r2 = Biquad::new(bp(f2 as f32, 5.0, sr as f32));
+    let mut lp = Biquad::new(lp2(2500.0, sr as f32));
+    let att = 0.08 * sr;
+    let rel = 0.15 * sr;
+    let am_f = rng.range(4.0, 7.0);
+    for (i, e) in exc.iter().enumerate() {
+        let a = r1.process(*e);
+        let b = r2.process(*e);
+        let x = lp.process(a + 0.35 * b);
+        let fi = i as f64;
+        let env = (fi / att).min(1.0).min(((n as f64 - fi) / rel).max(0.0)).powf(1.5)
+            * (1.0 + 0.12 * (2.0 * PI * am_f * fi / sr).sin());
+        out.push(x * env as f32);
+    }
+    norm_from(out, s0);
+}
+
 // --------------------------------------------------------------------------
 // bird songs and frog calls
 // --------------------------------------------------------------------------
@@ -742,11 +852,14 @@ fn call_frog(fr: Frog, rng: &mut Rng, sr: f64, p: f64, out: &mut Vec<f32>) {
             pulse_train(out, rng, sr, d, r, 0.5, c, true, None, 0.0);
         }
         Frog::Tree => {
-            let car = rng.range(1800.0, 2400.0) * p;
+            // tree frog 'creek' notes (Hyla arborea / Hyla-Pseudacris type): 10-15 pulses at
+            // 150-200 pulses/s on a 1.5-2.5 kHz carrier, notes repeated in a series (Schneider 1967;
+            // Friedl & Klump 2002)
+            let car = rng.range(1700.0, 2400.0) * p;
+            let rate = rng.range(150.0, 200.0);
             for _ in 0..ri(rng, 4, 13) {
-                let d = rng.range(0.05, 0.08);
-                let r = rng.range(150.0, 200.0);
-                pulse_train(out, rng, sr, d, r, 0.5, car, false, None, 0.0);
+                let np = ri(rng, 10, 16) as usize;
+                frog_pulses(out, rng, sr, np, 1.0 / rate, 1.0 / rate, car, 0.03, 0.3, &[0.18, 0.05], 0.45);
                 let g = rng.range(0.09, 0.14);
                 gap(out, sr, g);
             }
@@ -758,33 +871,25 @@ fn call_frog(fr: Frog, rng: &mut Rng, sr: f64, p: f64, out: &mut Vec<f32>) {
             pulse_train(out, rng, sr, d, r, 0.45, c, false, None, 0.0);
         }
         Frog::Peeper => {
-            let f0 = rng.range(2700.0, 2950.0) * p;
-            let d = rng.range(0.1, 0.14);
-            let f1 = f0 * rng.range(1.06, 1.12);
-            tone(out, sr, d, f0, f1, Shape::Exp, 0.0, 0.0, &[], 0.15, 0.3);
+            // spring peeper (Pseudacris crucifer): a single rising whistle, ~2.8-3 kHz, 0.1-0.2 s,
+            // upsweep of a few hundred Hz (Wilczynski et al. 1984; Brenowitz et al. 1984)
+            let f0 = rng.range(2700.0, 2900.0) * p;
+            let d = rng.range(0.11, 0.18);
+            let f1 = f0 * rng.range(1.05, 1.1);
+            tone(out, sr, d, f0, f1, Shape::Hook, 0.0, 0.0, &[0.04], 0.12, 0.25);
         }
         Frog::Chorus => {
-            let r0 = rng.range(12.0, 16.0);
-            let d = rng.range(0.5, 0.9);
+            // chorus frog 'creeek' (Pseudacris triseriata / maculata): 10-18 pulses, the pulse rate
+            // rising through the call, ~2.5-3.2 kHz (like a thumb run along a comb)
+            let r0 = rng.range(14.0, 20.0);
+            let np = ri(rng, 10, 19) as usize;
             let c = rng.range(2500.0, 3200.0) * p;
-            pulse_train(out, rng, sr, d, r0, 0.45, c, false, Some(r0 * 1.6), 0.08);
+            frog_pulses(out, rng, sr, np, 1.0 / r0, 1.0 / (r0 * 1.7), c, 0.08, 0.12, &[0.1], 0.6);
         }
         Frog::Bull => {
             for _ in 0..ri(rng, 2, 6) {
                 let dur = rng.range(0.45, 0.8);
-                let s1 = out.len();
-                let r = rng.range(90.0, 130.0);
-                let c = rng.range(130.0, 180.0) * p;
-                pulse_train(out, rng, sr, dur, r, 0.6, c, false, None, 0.0);
-                let fc = rng.range(300.0, 450.0);
-                let mut f1 = Biquad::new(peak_eq(fc as f32, 9.0, 1.2, sr as f32));
-                let mut f2 = Biquad::new(lp2(900.0, sr as f32));
-                for v in out[s1..].iter_mut() {
-                    *v = v.signum() * v.abs().powf(0.6);
-                }
-                f1.process_block(&mut out[s1..]);
-                f2.process_block(&mut out[s1..]);
-                norm_from(out, s1);
+                bull_note(out, rng, sr, dur, p);
                 let g = rng.range(0.3, 0.7);
                 gap(out, sr, g);
             }
@@ -830,6 +935,13 @@ pub struct CallerVoice {
     /// off the block's critical path). It starts CALL_DELAY_BLOCKS after its trigger, a fixed
     /// delay, so the output stays deterministic however fast the job finishes.
     pending: bool,
+    /// Chorus timing (period s, phase 0..1) for short-call frogs: neighbours call in each other's
+    /// gaps (call alternation / call-and-response; Rosen & Lemon 1974; Gerhardt & Huber 2002 ch. 8),
+    /// on a shared species clock with per-cycle timing jitter and skipped cycles.
+    slot: Option<(f64, f64)>,
+    /// Song type in use: a songbird repeats one song type several times before switching
+    /// (eventual variety; Hartshorne 1956, Catchpole & Slater 2008 'Bird Song' ch. 8).
+    song_type: u64,
     job_tx: crossbeam_channel::Sender<(Vec<f32>, i64)>,
     job_rx: crossbeam_channel::Receiver<(Vec<f32>, i64)>,
 }
@@ -870,6 +982,8 @@ impl CallerVoice {
             air: AirPath::new(dist, sr, AIR_MIN_M),
             name,
             pending: false,
+            slot: None,
+            song_type: 0,
             job_tx,
             job_rx,
         }
@@ -878,6 +992,11 @@ impl CallerVoice {
     fn begin(&mut self, ctx: &BlockCtx, a: f64, start: i64, offset: usize) {
         let sr = self.sr as f64;
         let rng = ctx.rng.stream(self.key_song, ctx.index);
+        let type_rng = Rng::from_key(combine(self.key_song, 0x5017_7E00 + self.song_type), 0);
+        if matches!(self.call, Call::Bird(_)) && crate::rng::uniform_at(self.key_song, ctx.index, 0x7E) < 0.25 {
+            self.song_type += 1;
+        }
+        let slotted = self.slot.is_some();
         let mut song = std::mem::take(&mut self.song);
         song.clear();
         let call = self.call;
@@ -894,7 +1013,10 @@ impl CallerVoice {
             let job = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let mut rng = rng;
                 match call {
-                    Call::Bird(b) => song_bird(b, &mut rng, sr, pitch, &mut song),
+                    Call::Bird(b) => {
+                        let mut trng = type_rng;
+                        song_bird(b, &mut trng, sr, pitch, &mut song)
+                    }
                     Call::Frog(f) => call_frog(f, &mut rng, sr, pitch, &mut song),
                 }
                 let amp = level * rng.lognormal(0.0, 0.15) as f32 * (0.6 + 0.4 * a.min(1.0) as f32) / dist;
@@ -903,7 +1025,7 @@ impl CallerVoice {
                     air.reset();
                     air.process(&mut song, temp, hum);
                 }
-                let rest = (rng.range(0.5, 3.0) * sr) as i64;
+                let rest = if slotted { 0 } else { (rng.range(0.5, 3.0) * sr) as i64 };
                 (song, rest)
             }));
             let _ = tx.send(job.unwrap_or_else(|_| (Vec::new(), 0)));
@@ -940,7 +1062,25 @@ impl Voice for CallerVoice {
         let act = self.act.step(ctx.weather, dt);
         let a = act[self.act_idx];
         let start = (ctx.t0 * ctx.sr as f64).round() as i64;
-        if a > 1e-3 && start >= self.busy_until {
+        if a > 1e-3 && start >= self.busy_until && self.slot.is_some() {
+            let (per, phi) = self.slot.unwrap();
+            let t0 = ctx.t0;
+            let t1 = t0 + dt;
+            let k0 = (t0 / per - phi).floor() as i64 - 1;
+            for k in k0..k0 + 3 {
+                let ku = k as u64;
+                let jit = (crate::rng::uniform_at(self.key_call, ku, 1) - 0.5) * 0.08 * per;
+                let ts = (k as f64 + phi) * per + jit;
+                if ts >= t0 && ts < t1 {
+                    let p_call = (a * self.per_min as f64 * per / 60.0).min(0.92);
+                    if crate::rng::uniform_at(self.key_call, ku, 2) < p_call {
+                        let off = (((ts - t0) * ctx.sr as f64) as usize).min(n - 1);
+                        self.begin(ctx, a, start, off);
+                    }
+                    break;
+                }
+            }
+        } else if a > 1e-3 && start >= self.busy_until {
             let mut crng = ctx.rng.stream(self.key_call, ctx.index);
             let lam = self.per_min as f64 / 60.0 * a * dt;
             let c = crng.poisson(lam);
@@ -975,6 +1115,7 @@ impl Voice for CallerVoice {
         self.collect(true);
         self.act.reset();
         self.busy_until = -1;
+        self.song_type = 0;
         self.song.clear();
         self.song_start = 0;
         self.air.reset();
@@ -983,6 +1124,8 @@ impl Voice for CallerVoice {
 
 struct InsectState {
     sp: Insect,
+    /// syllables (pulses) per chirp for this individual
+    nsy: f64,
     jit: f64,
     cjit: f64,
     chirp_phase: f64,
@@ -1008,7 +1151,7 @@ impl InsectState {
                 let n_syll = (self.sp.syll_rate(t) * self.trill_len).round().max(1.0);
                 (1.0 / period, self.trill_len / period, n_syll, self.sp.carrier(t) * self.cjit)
             }
-            Some(r) => (r.max(0.1) * self.jit, self.sp.duty(), self.sp.syll(), self.sp.carrier(t) * self.cjit),
+            Some(r) => (r.max(0.1) * self.jit, self.sp.duty(), self.nsy, self.sp.carrier(t) * self.cjit),
         }
     }
 }
@@ -1091,17 +1234,33 @@ impl Voice for InsectBankVoice {
                 let ph = s.chirp_phase + rate * (i + 1) as f64 / sr;
                 ph_last = ph;
                 let frac = ph.rem_euclid(1.0);
-                let sf = (frac / duty * n_syll).rem_euclid(1.0);
-                let env = if frac < duty && sf < 0.72 {
-                    (std::f32::consts::PI * (sf / 0.72) as f32).sin().powi(2)
+                let sp_ = frac / duty * n_syll;
+                let sf = sp_.rem_euclid(1.0);
+                // Syllable (pulse) envelope of a stridulating cricket: the file-scraper escapement
+                // drives the harp at its resonance, ~4.5-5 kHz in Gryllus, a nearly pure tone that
+                // builds over the first ~third of the closing stroke and dies away, the pitch
+                // sagging ~1-2 % as the wing slows (Bennet-Clark 1999, J. Exp. Biol. 202; Elliott &
+                // Koch 1985). Pulses take ~0.55 of the syllable period (10-20 ms); the first
+                // syllable of a chirp is weaker.
+                const ON: f64 = 0.55;
+                let env = if frac < duty && sf < ON {
+                    let x = (sf / ON) as f32;
+                    let e = if x < 0.3 {
+                        (std::f32::consts::FRAC_PI_2 * x / 0.3).sin().powi(2)
+                    } else {
+                        (std::f32::consts::FRAC_PI_2 * (x - 0.3) / 0.7).cos().powi(2)
+                    };
+                    let si = sp_.floor() as usize;
+                    e * [0.72f32, 1.0, 0.96, 0.88, 0.8, 0.75, 0.7, 0.66][si.min(7)]
                 } else {
                     0.0
                 };
-                cph += 2.0 * PI / sr * fc * (1.0 - 0.015 * sf);
+                cph += 2.0 * PI / sr * fc * (1.0 - 0.018 * sf);
                 let car = if s.sp.noisy() {
                     s.noise_f.process(rng.normal() as f32) * inv_ng
                 } else {
-                    (cph as f32).sin()
+                    let c = cph as f32;
+                    c.sin() + 0.05 * (2.0 * c).sin()
                 };
                 *y = ramp_at(g0, g1, i, n) * env * car;
             }
@@ -1354,8 +1513,11 @@ pub fn build(scene: &Scene, patches: &[Patch], cfg: &BuildCfg) -> Vec<BoxedVoice
             let trill_len = rng.range(2.0, 6.0);
             let trill_gap = rng.range(0.6, 2.5);
             let level = db_spl(sp.level()) * rng.lognormal(0.0, 0.2) as f32;
+            // field crickets (Gryllus) chirp 3-5 syllables (Alexander 1961; Bennet-Clark 1999)
+            let nsy = if sp == Insect::FieldCricket { (3 + (k * 7 + 1) % 3) as f64 } else { sp.syll() };
             insects.push(InsectState {
                 sp,
+                nsy,
                 jit,
                 cjit,
                 chirp_phase,
@@ -1448,8 +1610,8 @@ pub fn build(scene: &Scene, patches: &[Patch], cfg: &BuildCfg) -> Vec<BoxedVoice
         let n_b = match region {
             "arid" => 3,
             "boreal" => 5,
-            "tropical" => 9,
-            _ => 7,
+            "tropical" => 11,
+            _ => 9,
         };
         for k in 0..n_b {
             let tpl = palette[k % palette.len()];
@@ -1483,6 +1645,25 @@ pub fn build(scene: &Scene, patches: &[Patch], cfg: &BuildCfg) -> Vec<BoxedVoice
             };
             let name = format!("frog{k}.{}", sp.name());
             frogs.push(CallerVoice::new(name, "bio.frog", Call::Frog(sp), pos, &act, A_FROGS, &mut rng, cfg));
+        }
+        // chorus slots: same-species short callers share a clock and spread their phases evenly, so
+        // they alternate and answer each other instead of overlapping at random
+        let mut srng = cfg.rng.get("bio.frog.slots", 0);
+        for &sp in species {
+            if !matches!(sp, Frog::Peeper | Frog::Tree | Frog::Chorus | Frog::Coqui | Frog::Common) {
+                continue;
+            }
+            let idx: Vec<usize> =
+                frogs.iter().enumerate().filter(|(_, f)| matches!(f.call, Call::Frog(x) if x == sp)).map(|(i, _)| i).collect();
+            let m = idx.len();
+            if m == 0 || frogs[idx[0]].slot.is_some() {
+                continue;
+            }
+            let per = 60.0 / sp.spec().1 as f64 * srng.range(0.9, 1.1);
+            for (j, &i) in idx.iter().enumerate() {
+                let phi = ((j as f64 + 0.5 + srng.range(-0.15, 0.15)) / m as f64).rem_euclid(1.0);
+                frogs[i].slot = Some((per, phi));
+            }
         }
     }
 

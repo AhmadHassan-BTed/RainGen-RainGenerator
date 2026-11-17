@@ -46,8 +46,8 @@ pub struct WindVoice {
     y: [[f32; N_AMBI]; N_DIR],
     shape: Vec<Sos>,
     bright: DesignTable,
-    fc: f32,
-    norm: f32,
+    fc: [f32; N_DIR],
+    norm: [f32; N_DIR],
     rumble: Biquad,
     rumble_tab: DesignTable,
     rfc: f32,
@@ -98,8 +98,8 @@ impl WindVoice {
             y,
             shape,
             bright,
-            fc: 500.0,
-            norm,
+            fc: [500.0; N_DIR],
+            norm: [norm; N_DIR],
             rumble: Biquad::new(rc),
             rumble_tab,
             rfc: 60.0,
@@ -122,17 +122,19 @@ impl WindVoice {
         }
     }
 
-    fn set_brightness(&mut self, fc: f32) {
-        if self.fc > 0.0 && (fc - self.fc).abs() / self.fc < 0.03 {
+    /// Brightness of bed direction k. Each direction follows its own local gust speed: the dipole
+    /// spectrum of turbulence scattered by the head and nearby obstacles peaks at f ~ St U / d
+    /// (Curle 1955; Strouhal scaling), so a gust passing one side is a brighter whoosh there.
+    fn set_brightness(&mut self, k: usize, fc: f32) {
+        if self.fc[k] > 0.0 && (fc - self.fc[k]).abs() / self.fc[k] < 0.03 {
             return;
         }
         let (c, norm) = self.bright.get(fc);
-        self.fc = fc;
-        self.norm = norm;
-        for s in &mut self.shape {
-            let last = s.stages.len() - 1;
-            s.stages[last].set(c);
-        }
+        self.fc[k] = fc;
+        self.norm[k] = norm;
+        let s = &mut self.shape[k];
+        let last = s.stages.len() - 1;
+        s.stages[last].set(c);
     }
 
     fn gust_marker(&mut self, ctx: &BlockCtx, u: f32, gust: f32, ti: f32) {
@@ -246,11 +248,12 @@ impl Voice for WindVoice {
             + 0.5 * (BED_EDDY * BED_EXPONENT * ti).powi(2))
         .exp();
         let base = bed_amplitude(u_mean) / normc.sqrt();
-        self.set_brightness((120.0 + 75.0 * u).min(5000.0));
-        let inv_norm = 1.0 / self.norm;
         for k in 0..N_DIR {
             let g_dir = self.field.at(BED_ADVECT_M * rel[k], u_mean)
                 * (BED_FLUTTER * ti * self.turb[k] + BED_EDDY * ti * self.eddy[k]).exp();
+            // local speed u_mean g_dir; the corner rises linearly with it (gust whoosh)
+            self.set_brightness(k, (120.0 + 75.0 * u_mean * g_dir).clamp(100.0, 5000.0));
+            let inv_norm = 1.0 / self.norm[k];
             let amp = base * g_dir.powf(BED_EXPONENT) * weight[k] * wn * inv_norm;
             let (g0, g1) = self.bed_ramp[k].to(amp);
             let sh = &mut self.shaped[k * n..(k + 1) * n];

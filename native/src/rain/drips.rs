@@ -23,6 +23,17 @@ use crate::types::{Emission, MaterialKind, Patch, Stem, Weather};
 use std::sync::Arc;
 
 const TAU_STORE_S: f64 = 180.0;
+
+/// The trapped bubble of a pendant drip landing in water (see the water branch of `synth`):
+/// radius 0.25-0.42 D (Minnaert f = 3.28 m/s / a, ~1.5-3 kHz), pinch-off 10-30 ms after contact,
+/// pitch rising as it nears the surface.
+fn drip_plink(rng: &mut Rng, direct: &mut DirectBus, off: usize, d: f32, fd: f32, sr: f64) {
+    let radius = d as f64 * 1e-3 * rng.range(0.25, 0.42);
+    let eps = rng.range(0.05, 0.12);
+    let xi = rng.range(0.15, 0.35);
+    let delay = (rng.range(0.01, 0.03) * sr) as usize;
+    direct.bubbles.spawn(off + delay, bubble_pa_per_m() as f64 * eps * fd as f64, radius, xi, 0.0);
+}
 const MAX_DRIP_HZ: f64 = 40.0;
 /// Fraction of the pendant volume left on the edge after detachment.
 const RESIDUAL: f64 = 0.04;
@@ -401,6 +412,17 @@ impl DripVoice {
                 } else {
                     let ci = if d >= 3.5 { 4 } else { 3 };
                     water_event(&kb, rng, &mut self.direct, off, d, u, ci, 1.0, &wp);
+                    // A pendant drip (Tate's law, D ~ 3-6 mm) is far above the regular-entrainment
+                    // band, yet its crater collapse still traps one large bubble most of the time
+                    // (Franz 1959; Pumphrey & Elmore 1990, JFM 220; Phillips, Agarwal & Jordan 2018,
+                    // Sci. Rep. 8, 9515, 'the plink of a dripping tap'): radius ~0.25-0.42 D, so
+                    // f = 3.28 m/s / a (Minnaert 1933) lands at ~1.5-3 kHz, pinch-off 10-30 ms after
+                    // contact, and the bubble's rise toward the free surface sweeps the pitch upward
+                    // (the chirp; Pumphrey & Elmore 1990, Longuet-Higgins 1990).
+                    if fd > 0.0 && rng.uniform() < 0.65 {
+                        plinked = true;
+                        drip_plink(rng, &mut self.direct, off, d, fd, sr);
+                    }
                 }
             }
             return plinked;
@@ -418,6 +440,10 @@ impl DripVoice {
                 if rng.uniform() < cover as f64 {
                     let ci = if e.1 >= 3.5 { 4 } else { 3 };
                     water_event(&kb, rng, &mut self.direct, e.0 as usize, e.1, e.2, ci, 1.0, &wp);
+                    let fd = smoothstep(depth, 1.5, 8.0) * self.water_quality;
+                    if fd > 0.0 && rng.uniform() < 0.65 {
+                        drip_plink(rng, &mut self.direct, e.0 as usize, e.1, fd, sr);
+                    }
                 } else {
                     self.events[keep] = e;
                     keep += 1;
@@ -429,7 +455,11 @@ impl DripVoice {
             return false;
         }
         let wet = wetness(w, &self.target).clamp(0.0, 1.0);
-        let splashy = self.target.splash > 0.0 && self.target.hardness >= 0.45 && wet < 0.9;
+        // A pendant drip (D ~ 3-6 mm at 3-7 m/s) is far above the splash threshold
+        // K = We^0.5 Re^0.25 ~ 58 (Mundo, Sommerfeld & Tropea 1995; K ~ 400-600 here), so on any
+        // hard surface it always throws a crown of secondary droplets, film or no film (Yarin 2006,
+        // Annu. Rev. Fluid Mech. 38).
+        let splashy = self.target.hardness >= 0.45;
         let hiss = wet > 0.05 && matches!(self.target_kind, MaterialKind::Solid | MaterialKind::Porous);
         let voice = match self.voice.as_mut() {
             Some(v) => v,
@@ -443,11 +473,27 @@ impl DripVoice {
             let force = fp * (0.15 * rng.normal()).exp() as f32 * (1.0 - 0.35 * wet);
             let tau = d as f64 * 1e-3 / (u as f64).max(0.05) * (1.0 + 0.6 * wet as f64);
             voice.add_force(&kb, off, force, tau, false);
+            // The tick: the impact force of a drop on a rigid surface rises to its peak
+            // F_max ~ 0.8 rho V^2 D^2 within ~0.05-0.12 D/V (tens of us) and only then decays over
+            // ~D/V (Gordillo et al. 2018, JFM 840, 190; Mitchell et al. 2019, JFM 867, 300). That
+            // sharp front is the 'tick' of a drip on stone or metal, energy to several kHz through
+            // the surface's own modes; a water film cushions it.
+            if matches!(self.target_kind, MaterialKind::Solid) {
+                let spike = force * rng.range(0.6, 1.0) as f32 * (1.0 - 0.4 * wet);
+                let ts = (d as f64 * 1e-3 / (u as f64).max(0.5)) * rng.range(0.05, 0.12);
+                voice.add_force(&kb, off, spike, ts, false);
+                // and the airborne contact click of the drop itself (pressure domain, like on water).
+                // On a rigid surface the drop is stopped far more abruptly than on water (impedance
+                // ratio ~ 5-10x higher), so the click is stronger than the water-entry click; the gain
+                // puts the tick level with the slab's thud, as in close recordings of drips on stone.
+                let ck = self.click_pa * d / D_REF_MM * rng.range(7.0, 14.0) as f32 * (1.0 - 0.5 * wet);
+                self.direct.ola.add(off, kb.click(click_bin(u)), ck);
+            }
             if splashy {
                 let reps = rng.int_range(3, 8);
                 for _ in 0..reps {
                     let delay = (rng.range(0.005f64.ln(), 0.05f64.ln()).exp() * sr) as usize;
-                    let amp = force * rng.range(0.005f64.ln(), 0.03f64.ln()).exp() as f32 * (1.0 - wet);
+                    let amp = force * rng.range(0.005f64.ln(), 0.03f64.ln()).exp() as f32 * (1.0 - 0.5 * wet);
                     let ts = rng.range(5e-5f64.ln(), 1.5e-4f64.ln()).exp();
                     voice.add_force(&kb, off + delay, amp, ts, false);
                 }

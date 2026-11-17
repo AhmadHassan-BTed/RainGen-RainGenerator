@@ -181,6 +181,9 @@ pub struct VegVoice {
     tick_spec: Vec<Complex<f32>>,
     carry: Vec<f32>,
     carry_active: bool,
+    /// Leaf contacts already scheduled past this block (absolute sample, amplitude): a fluttering
+    /// leaf knocks its neighbours several times in a row, so contacts come in clusters.
+    pend: Vec<(u64, f32)>,
     creaks: EventRing,
     creak_imp: Vec<f32>,
     creak_y: Vec<f32>,
@@ -284,6 +287,7 @@ impl VegVoice {
             tick_fft,
             carry: vec![0.0; n_tick - n],
             carry_active: false,
+            pend: Vec::with_capacity(8192),
             creaks: EventRing::new(1, creak_len + 2 * n),
             creak_imp: vec![0.0; creak_len],
             creak_y: vec![0.0; creak_len],
@@ -507,8 +511,45 @@ impl Voice for VegVoice {
         // ---- leaf grains: sparse signed impulses x sway, FFT convolution with carried tails ----
         let rate = (self.tick_rate * (u.max(0.1) / 5.0).powf(1.3)).min(15000.0) * on_leaf * if active { 1.0 } else { 0.0 };
         let tick_g = self.tick_w * on_leaf * (1.0 - 0.4 * wet) * a;
-        let lam = rate as f64 * n as f64 / sr as f64;
-        let count = if lam > 0.0 { rng.poisson(lam) as usize } else { 0 };
+        // Leaf rustle is many discrete leaf-on-leaf contacts, not filtered noise. A fluttering leaf
+        // (flutter 5-40 Hz for broad leaves; Vogel 1989, J. Exp. Bot. 40; Niklas 1992 'Plant
+        // Biomechanics') strikes its neighbours on successive cycles: contacts form Neyman-Scott
+        // clusters of ~1-7 knocks spaced 15-60 ms with decaying strength, and the cluster rate
+        // follows the local gust (rate ~ U^1.3 above). Same mean contact rate as a Poisson stream.
+        const M_BAR: f64 = 3.5;
+        const DECAY: f32 = 0.72;
+        let e_a2 = {
+            // mean squared cluster-member weight for m ~ 1 + Poisson(M_BAR - 1)
+            let mut acc = 0.0f64;
+            let mut w = 1.0f64;
+            for j in 0..12 {
+                let p_reach = if j == 0 { 1.0 } else { 1.0 - poisson_cdf(M_BAR - 1.0, j - 1) };
+                acc += p_reach * w;
+                w *= (DECAY * DECAY) as f64;
+            }
+            (acc / M_BAR) as f32
+        };
+        let start_s = (ctx.t0 * ctx.sr as f64).round() as u64;
+        let lam = rate as f64 / M_BAR * n as f64 / sr as f64;
+        let n_clusters = if lam > 0.0 { rng.poisson(lam) as usize } else { 0 };
+        let tick_norm = if rate > 0.0 { tick_g / (rate.max(1.0) / sr * tick_m2() * e_a2).sqrt() } else { 0.0 };
+        for _ in 0..n_clusters.min(8000) {
+            let p = rng.below(n as u64);
+            let m = 1 + rng.poisson(M_BAR - 1.0) as usize;
+            let mut t = start_s + p;
+            let mut wgt = 1.0f32;
+            let a0 = rng.lognormal(0.0, 0.6) as f32 * tick_norm;
+            for _ in 0..m.min(10) {
+                if self.pend.len() < self.pend.capacity() {
+                    let sgn = if rng.bernoulli(0.5) { 1.0 } else { -1.0 };
+                    self.pend.push((t, sgn * a0 * wgt * rng.lognormal(0.0, 0.25) as f32));
+                }
+                t += (rng.range(0.015, 0.06) * sr as f64) as u64;
+                wgt *= DECAY;
+            }
+        }
+        let end_s = start_s + n as u64;
+        let count = self.pend.iter().filter(|e| e.0 < end_s).count();
         if count > 0 || self.carry_active {
             let f_crisp = self.f_crisp0 * (1.0 - 0.35 * wet) * (u.max(0.1) / 5.0).powf(0.3).clamp(0.6, 1.6);
             self.tick_kernel(f_crisp);
@@ -516,13 +557,19 @@ impl Voice for VegVoice {
             let tt = &mut self.tick_time;
             tt.iter_mut().for_each(|v| *v = 0.0);
             if count > 0 {
-                let norm = tick_g / (rate.max(1.0) / sr * tick_m2()).sqrt();
-                for _ in 0..count.min(20000) {
-                    let p = rng.below(n as u64) as usize;
-                    let amp = rng.lognormal(0.0, 0.7) as f32 * if rng.bernoulli(0.5) { 1.0 } else { -1.0 };
-                    let sway_at = sw0 + (sw1 - sw0) * (p + 1) as f32 / n as f32;
-                    tt[p] += amp * sway_at * norm;
+                let mut keep = 0usize;
+                for i in 0..self.pend.len() {
+                    let (t, amp) = self.pend[i];
+                    if t < end_s {
+                        let p = (t.saturating_sub(start_s) as usize).min(n - 1);
+                        let sway_at = sw0 + (sw1 - sw0) * (p + 1) as f32 / n as f32;
+                        tt[p] += amp * sway_at;
+                    } else {
+                        self.pend[keep] = (t, amp);
+                        keep += 1;
+                    }
                 }
+                self.pend.truncate(keep);
                 self.tick_fft.forward(tt, &mut self.tick_spec);
                 for (s, k) in self.tick_spec.iter_mut().zip(&self.kernel) {
                     *s *= *k;
@@ -581,10 +628,22 @@ impl Voice for VegVoice {
         self.noise.reset();
         self.carry.iter_mut().for_each(|v| *v = 0.0);
         self.carry_active = false;
+        self.pend.clear();
         self.creaks.reset();
         self.fc_crisp = 0.0;
         self.air_key = (i32::MIN, i32::MIN);
     }
+}
+
+/// P(X <= k) for X ~ Poisson(lam).
+fn poisson_cdf(lam: f64, k: usize) -> f64 {
+    let mut term = (-lam).exp();
+    let mut acc = term;
+    for i in 1..=k {
+        term *= lam / i as f64;
+        acc += term;
+    }
+    acc
 }
 
 /// Every vegetation voice of the layout, plus a ground grass bed from the surface mix.
