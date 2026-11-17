@@ -82,15 +82,13 @@ jobs:
           path: native/dist
 
   macos:
-    runs-on: ${{ matrix.runner }}
+    # One universal2 wheel (Intel + Apple Silicon) from the current arm64 runner; the
+    # macos-13 Intel image is being retired and can queue indefinitely.
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-13
-            target: x86_64
-          - runner: macos-14
-            target: aarch64
+        target: [universal2-apple-darwin]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -109,7 +107,7 @@ jobs:
           python -c "import raingen_native as n; e = n.Engine(); print(e.render(1024).shape)"
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-${{ matrix.target }}
+          name: wheels-macos-universal2
           path: native/dist
 
   sdist:
