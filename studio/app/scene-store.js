@@ -42,6 +42,7 @@ export function defaultScene() {
         approach_kmh: 0,
         flashes_per_min: 2,
         stroke_intensity: 0.5,
+        rumble: 'auto',
       },
       temperature_c: 12,
       humidity_pct: 90,
@@ -57,6 +58,10 @@ export function defaultScene() {
       window_open: 0,
       wipers: 'off',
       objects: [],
+      biophony: {
+        birds: 'auto', crows: 'auto', owls: 'auto', insects: 'auto', crickets: 'auto', katydids: 'auto',
+        cicadas: 'auto', frogs: 'auto', dogs: 'auto', traffic: 0, stream: 0, chimes: 0,
+      },
     },
     listener: { position: [0, 0, 0], height_m: 1.7, heading_deg: 0, render: 'binaural' },
     mode: 'none',
@@ -100,6 +105,87 @@ export const SURFACE_KEYS = [
 ];
 
 /**
+ * Sounds that come with rain. Each living category is "auto" (the engine's ecology
+ * decides from season, hour, temperature and rain) or a level 0..1 (0 = off).
+ * [key, label, one-line ecology hint, level used when a row is switched On].
+ */
+export const BIOPHONY = [
+  ['birds', 'Songbirds', 'Songbirds sing most at dawn, hush in heavy rain and start again as it clears.', 0.6],
+  ['crows', 'Crows', 'Crows call by day, during and after rain.', 0.5],
+  ['owls', 'Owls', 'Owls call at night, most on calm nights; heavy rain quiets them.', 0.5],
+  ['crickets', 'Crickets', 'Crickets chirp on warm evenings, faster as it warms; heavy rain quiets them.', 0.6],
+  ['katydids', 'Katydids', 'Katydids rasp through warm late-summer nights.', 0.5],
+  ['cicadas', 'Cicadas', 'Cicadas sing on hot summer days and stop when it rains.', 0.5],
+  ['frogs', 'Frogs', 'Frogs call most on warm nights during and after rain.', 0.6],
+  ['dogs', 'Distant dogs', 'Far-off dogs bark now and then, more in the evening; thunder can set them off.', 0.4],
+];
+/** Plain 0..1 levels of the place (0 = off). [key, label, hint, level used when switched On]. */
+export const AMBIENT_LEVELS = [
+  ['traffic', 'Wet-road traffic', 'Tyres hiss and splash on wet roads; the wetter the road, the louder the hiss.', 0.4],
+  ['stream', 'Nearby stream', 'A brook close by swells and grows louder as the rain goes on.', 0.5],
+  ['chimes', 'Wind chimes', 'Chimes ring when gusts pass and fall still in a lull.', 0.4],
+];
+/** Legacy `insects` key: a master over these three rows. */
+export const INSECT_KEYS = ['crickets', 'katydids', 'cicadas'];
+export const RUMBLE_HINT = 'Far-off storms keep grumbling between the nearer strikes.';
+
+const pct = (v) => (v === 'auto' ? 'Auto' : typeof v === 'number' ? (v <= 0 ? 'Off' : `${Math.round(v * 100)} %`) : String(v));
+
+/**
+ * "auto" or a level 0..1. Accepts the older "on" / "off" words (on = full level),
+ * booleans and numeric strings; anything else falls back to `d`.
+ */
+export function autoLevel(v, d = 'auto') {
+  if (v === undefined || v === null) return d;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  if (typeof v === 'number') return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : d;
+  if (typeof v === 'string') {
+    const t = v.trim().toLowerCase();
+    if (t === 'auto') return 'auto';
+    if (t === 'on' || t === 'true' || t === 'yes') return 1;
+    if (t === 'off' || t === 'false' || t === 'no' || t === 'none') return 0;
+    const n = parseFloat(t);
+    if (Number.isFinite(n)) return Math.min(1, Math.max(0, n));
+  }
+  return d;
+}
+
+/** Effective value of one sound row: an Auto insect row follows a non-auto legacy `insects` master. */
+export function soundValue(scene, key) {
+  if (key === 'rumble') return autoLevel(scene?.weather?.thunder?.rumble);
+  const bio = scene?.place?.biophony || {};
+  if (AMBIENT_LEVELS.some((a) => a[0] === key)) {
+    const lv = autoLevel(bio[key], 0);
+    return lv === 'auto' ? 0 : lv;
+  }
+  const v = autoLevel(bio[key]);
+  if (v === 'auto' && INSECT_KEYS.includes(key)) {
+    const m = autoLevel(bio.insects);
+    if (m !== 'auto') return m;
+  }
+  return v;
+}
+
+/** Store path of a sound row key. */
+export function soundPath(key) {
+  return key === 'rumble' ? 'weather.thunder.rumble' : `place.biophony.${key}`;
+}
+
+/**
+ * setMany() patch for one sound row. Editing an insect row while the legacy master
+ * holds them releases the master into the three rows, so nothing is applied twice.
+ */
+export function soundPatch(scene, key, value) {
+  const out = { [soundPath(key)]: value };
+  const bio = scene?.place?.biophony || {};
+  if (INSECT_KEYS.includes(key) && autoLevel(bio.insects) !== 'auto') {
+    for (const k of INSECT_KEYS) if (k !== key) out[soundPath(k)] = soundValue(scene, k);
+    out['place.biophony.insects'] = 'auto';
+  }
+  return out;
+}
+
+/**
  * Parameter manifest. scale: 'linear' | 'log' | 'beaufort'. smoothing group keys
  * into scene.studio.smoothing (seconds to 99.5 %).
  */
@@ -120,6 +206,7 @@ export const PARAMS = [
   { path: 'weather.thunder.approach_kmh', label: 'Approach', kind: 'number', min: -60, max: 60, step: 1, unit: 'km/h', unitSpoken: 'kilometres per hour', group: 'weather', section: 'Thunder' },
   { path: 'weather.thunder.flashes_per_min', label: 'Flashes', kind: 'number', min: 0, max: 20, step: 0.1, unit: '/min', unitSpoken: 'per minute', group: 'weather', section: 'Thunder' },
   { path: 'weather.thunder.stroke_intensity', label: 'Stroke intensity', kind: 'number', min: 0, max: 1, step: 0.01, unit: '', group: 'weather', section: 'Thunder' },
+  { path: 'weather.thunder.rumble', label: 'Cloud rumble', kind: 'autolevel', min: 0, max: 1, step: 0.01, unit: '', default: 'auto', onLevel: 0.5, group: 'weather', section: 'Thunder', help: RUMBLE_HINT, format: pct },
   { path: 'weather.temperature_c', label: 'Temperature', kind: 'number', min: -30, max: 45, step: 0.5, unit: '°C', unitSpoken: 'degrees Celsius', group: 'weather', section: 'Air & time', tag: 'indirect: crickets, sleet/snow, flash-to-bang' },
   { path: 'weather.humidity_pct', label: 'Humidity', kind: 'number', min: 10, max: 100, step: 1, unit: '%', unitSpoken: 'percent', group: 'weather', section: 'Air & time', tag: 'distant brightness only' },
   { path: 'weather.hour', label: 'Time of day', kind: 'hour', min: 0, max: 24, step: 0.25, unit: 'h', group: 'weather', section: 'Air & time' },
@@ -131,6 +218,8 @@ export const PARAMS = [
   { path: 'place.preset', label: 'Place', kind: 'enum', options: PLACE_PRESETS, group: 'place', section: 'Place' },
   { path: 'place.shelter', label: 'Shelter', kind: 'enum', options: SHELTERS, group: 'place', section: 'Place' },
   { path: 'place.window_open', label: 'Window open', kind: 'number', min: 0, max: 1, step: 0.01, unit: '', group: 'place', section: 'Place', format: (v) => `${Math.round(v * 100)} %` },
+  ...BIOPHONY.map(([k, label, help, onLevel]) => ({ path: `place.biophony.${k}`, label, kind: 'autolevel', min: 0, max: 1, step: 0.01, unit: '', default: 'auto', onLevel, group: 'place', section: 'Sounds of the place', help, format: pct })),
+  ...AMBIENT_LEVELS.map(([k, label, help, onLevel]) => ({ path: `place.biophony.${k}`, label, kind: 'level', min: 0, max: 1, step: 0.01, unit: '', default: 0, onLevel, group: 'place', section: 'Sounds of the place', help, format: pct })),
   { path: 'place.wipers', label: 'Wipers', kind: 'enum', options: opts('off', 'slow', 'fast'), group: 'place', section: 'Place', showIf: (s) => s.place.shelter === 'car' || s.place.objects.some((o) => o.type === 'car') },
   { path: 'listener.height_m', label: 'Listener height', kind: 'number', scale: 'log', min: 0.3, max: 30, unit: 'm', unitSpoken: 'metres', group: 'listener', section: 'Listener' },
   { path: 'listener.heading_deg', label: 'Heading', kind: 'compass', min: 0, max: 360, step: 1, unit: '°', group: 'listener', section: 'Listener' },
@@ -299,11 +388,35 @@ function coerceLeaves(def, val) {
     } else if (typeof d === 'boolean') {
       if (typeof v !== 'boolean') val[k] = v === 'true' || v === 1;
     } else if (typeof d === 'string') {
+      if (d === 'auto') continue; // "auto" or a number: normalised by normalizeSounds()
       if (typeof v !== 'string') val[k] = d;
     } else if (isPlainObject(d) && isPlainObject(v) && !REPLACE_KEYS.has(k)) {
       coerceLeaves(d, v);
     }
   }
+}
+
+/**
+ * Sounds of the place and the cloud rumble: every row becomes "auto" or 0..1. A legacy
+ * `insects` master (Python presets, older files) is expanded into the crickets / katydids /
+ * cicadas rows when the file sets none of them, then released to "auto".
+ */
+function normalizeSounds(s, src) {
+  const bio = s.place.biophony;
+  const srcBio = isPlainObject(src?.place?.biophony) ? src.place.biophony : {};
+  for (const [k] of BIOPHONY) bio[k] = autoLevel(bio[k]);
+  for (const [k] of AMBIENT_LEVELS) {
+    const v = autoLevel(bio[k], 0);
+    bio[k] = v === 'auto' ? 0 : v;
+  }
+  const master = autoLevel(bio.insects);
+  if (master !== 'auto' && INSECT_KEYS.every((k) => srcBio[k] === undefined)) {
+    for (const k of INSECT_KEYS) bio[k] = master;
+    bio.insects = 'auto';
+  } else {
+    bio.insects = master;
+  }
+  s.weather.thunder.rumble = autoLevel(s.weather.thunder.rumble);
 }
 
 /** Normalise any rainscene-like object (accepts Python `version` key too). */
@@ -322,6 +435,7 @@ export function normalizeScene(input) {
   w.speed_mps = Math.min(40, Math.max(0, num(w.speed_mps, 4.4)));
   w.from_deg = ((num(w.from_deg, 270) % 360) + 360) % 360;
   if (w.gust_factor === null || w.gust_factor === undefined || w.gust_factor === 'auto') w.gust_factor = 1.4;
+  normalizeSounds(s, src);
   const seen = new Set();
   s.place.objects = (Array.isArray(s.place.objects) ? s.place.objects : []).filter(isPlainObject).map((o) => {
     const n = normalizeObject(o);

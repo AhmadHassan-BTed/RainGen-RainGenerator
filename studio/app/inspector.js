@@ -6,7 +6,9 @@
  * Every control carries an Auto / Offset / Pinned provenance badge (shape + text),
  * Alt-click re-links, right-click (or Shift+F10) offers "Animate".
  */
-import { PARAMS, paramSpec, SURFACE_KEYS } from './scene-store.js';
+import {
+  PARAMS, paramSpec, SURFACE_KEYS, BIOPHONY, AMBIENT_LEVELS, INSECT_KEYS, soundValue, soundPatch, autoLevel,
+} from './scene-store.js';
 import {
   valueText, enhanceRange, makeSliderRole, bftFromMps, mpsFromBft, bftInfo, speeds, flashBang, kmFromFlashBang,
   fmtNum, compassWord, compassAbbr, relativeDirection, fmtHour, hourWord, rainWord, announce, clamp, wrapDeg,
@@ -160,6 +162,7 @@ export class Inspector {
 
     const thunder = sec('Thunder');
     thunder.append(this._row(paramSpec('weather.thunder.enabled')));
+    thunder.append(this._soundRow(paramSpec('weather.thunder.rumble')));
     const tbody = h('div', { class: 'thunder-body' });
     tbody.append(
       this._row(paramSpec('weather.thunder.distance_km')),
@@ -180,6 +183,11 @@ export class Inspector {
     for (const p of ['place.preset', 'place.shelter']) place.append(this._row(paramSpec(p)));
     place.append(this._surfaceMix());
     for (const p of ['place.window_open', 'place.wipers', 'listener.height_m', 'listener.heading_deg', 'listener.render', 'mode']) place.append(this._row(paramSpec(p)));
+
+    const sounds = sec('Sounds of the place', true, 'tier-2 insp-sounds');
+    sounds.append(h('p', { class: 'tier-note', text: 'Life, water and wind around you. Auto lets the ecology decide from season, hour, temperature and rain.' }));
+    sounds.append(this._insectMasterNote());
+    for (const [k] of [...BIOPHONY, ...AMBIENT_LEVELS]) sounds.append(this._soundRow(paramSpec(`place.biophony.${k}`)));
 
     const eng = sec('Engineer', false, 'tier-3');
     eng.append(h('p', { class: 'tier-note', text: 'Physics, randomness and smoothing' }));
@@ -631,6 +639,78 @@ export class Inspector {
       h('p', { class: 'row-help', text: 'The seed fixes the random detail: the same scene and seed give the same render.' }));
     this.controls.set('seed', { update: (v) => { if (document.activeElement !== inp) inp.value = (v >>> 0 === v ? v.toString(16) : Math.floor(v).toString(16)).toUpperCase(); }, row });
     return row;
+  }
+
+  /**
+   * Compact sound row: Auto checkbox (living sounds and cloud rumble) plus a 0..1 level
+   * slider where 0 is off. Writes go through soundPatch() so a legacy insects master is released.
+   */
+  _soundRow(spec) {
+    const path = spec.path;
+    const key = path === 'weather.thunder.rumble' ? 'rumble' : path.split('.').pop();
+    const id = idFor(path);
+    const helpId = `${id}-help`;
+    const hasAuto = spec.kind === 'autolevel';
+    const row = h('div', { class: 'row row-sound', 'data-path': path });
+    const head = h('div', { class: 'row-head' }, h('label', { for: id, class: 'row-label', text: spec.label }));
+    const set = (v, coalesce = path) => this.store.setMany(soundPatch(this.store.scene, key, v), { coalesce });
+    let auto = null;
+    if (hasAuto) {
+      auto = h('input', { type: 'checkbox', id: `${id}-auto`, 'aria-describedby': helpId });
+      auto.addEventListener('change', () => {
+        set(auto.checked ? 'auto' : spec.onLevel ?? 0.5, null);
+        announce(`${spec.label}: ${auto.checked ? 'automatic' : 'set by hand'}`);
+      });
+      head.append(h('label', { for: auto.id, class: 'auto-toggle', title: 'Let the ecology decide' }, auto, ' Auto'));
+    }
+    const range = h('input', { type: 'range', id, class: 'slider', min: 0, max: 1, step: 0.01, 'aria-describedby': helpId });
+    const out = h('output', { class: 'sound-read', for: id, 'aria-hidden': 'true' });
+    const words = (v) => (v === 'auto' ? 'automatic' : v <= 0 ? 'off' : `${Math.round(v * 100)} percent`);
+    enhanceRange(range, { coarse: 0.1, valueTextFn: (x) => words(x) });
+    this._gestureOn(range, path);
+    range.addEventListener('input', () => set(Math.round(parseFloat(range.value) * 100) / 100));
+    row.append(head, h('div', { class: 'row-ctl' }, h('div', { class: 'ctl-line' }, range, out)));
+    if (spec.help) row.append(h('p', { class: 'row-help', id: helpId, text: spec.help }));
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      this._openMenu(spec, e.clientX, e.clientY, row);
+    });
+    row.addEventListener('keydown', (e) => {
+      if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') {
+        e.preventDefault();
+        const r = row.getBoundingClientRect();
+        this._openMenu(spec, r.left + 20, r.top + 20, row);
+      }
+    });
+    row.addEventListener('focusin', () => { this.lastFocusedPath = path; });
+    this.controls.set(path, {
+      update: (_v, s) => {
+        const v = soundValue(s, key);
+        const isAuto = v === 'auto';
+        if (auto) auto.checked = isAuto;
+        row.classList.toggle('is-auto', isAuto);
+        range.disabled = isAuto;
+        if (!(this._dragging && document.activeElement === range)) range.value = String(isAuto ? spec.onLevel ?? 0.5 : v);
+        range.setAttribute('aria-valuetext', words(v));
+        out.textContent = isAuto ? 'Auto' : v <= 0 ? 'Off' : `${Math.round(v * 100)} %`;
+      },
+      row,
+    });
+    return row;
+  }
+
+  /** Shown only while an older scene's `insects` master holds crickets, katydids and cicadas. */
+  _insectMasterNote() {
+    const note = h('p', { class: 'row-help insect-master', hidden: true });
+    this.controls.set('place.biophony.insects', {
+      update: (v) => {
+        const m = autoLevel(v);
+        note.hidden = m === 'auto';
+        if (m !== 'auto') note.textContent = `This scene sets all insects to ${m <= 0 ? 'off' : `${Math.round(m * 100)} %`}. Changing ${INSECT_KEYS.join(', ')} takes over from it.`;
+      },
+      row: note,
+    });
+    return note;
   }
 
   _nullableRow(spec, fallback) {

@@ -8,10 +8,13 @@
  * rate), scene cards with the user's own presets first, "Describe your
  * weather" (the deterministic parser in describe.js), the Weather Orb
  * (radius = intensity, angle = character, with inertia), a sleep timer with
- * "Fade out as I fall asleep" and the Visuals Full / Calm / Off switch.
+ * "Fade out as I fall asleep", the Visuals Full / Calm / Off switch and
+ * "Sounds around you" (birds, insects, frogs, dogs, cloud rumble, stream,
+ * chimes and wet-road traffic: Auto / On / Off with a level when On).
  */
 import { PRESETS, presetScene, inferVibe, VIBE_DEFAULT } from './presets.js';
 import { parseDescription } from './describe.js';
+import { BIOPHONY, INSECT_KEYS, paramSpec, soundValue, soundPatch, soundPath } from './scene-store.js';
 import {
   rainWord, bftFromMps, bftInfo, fmtNum, flashBang, compassWord, announce, clamp, enhanceRange,
   prefersReducedMotion, speeds,
@@ -161,7 +164,7 @@ export class ListenerMode {
     });
     this.sleepChip = h('p', { class: 'lm-sleep-chip', hidden: true });
     const bar = h('div', { class: 'lm-bar', role: 'toolbar', 'aria-label': 'Listening options' },
-      sheetBtn('scenes', 'Scenes'), sheetBtn('orb', 'Weather Orb'), sheetBtn('options', 'Sleep & display'),
+      sheetBtn('scenes', 'Scenes'), sheetBtn('orb', 'Weather Orb'), sheetBtn('options', 'Sleep & display'), sheetBtn('sounds', 'Sounds around you'),
       h('label', { class: 'lm-switch', for: 'lm-3d' }, this.threeD, h('span', {}, '3-D sound (headphones)')),
     );
 
@@ -171,6 +174,7 @@ export class ListenerMode {
       scenes: this._buildScenesSheet(),
       orb: this._buildOrbSheet(),
       options: this._buildOptionsSheet(),
+      sounds: this._buildSoundsSheet(),
     };
     root.append(this.panel, ...Object.values(this.sheets));
     root.addEventListener('keydown', (e) => {
@@ -350,6 +354,107 @@ export class ListenerMode {
       h('p', { class: 'hint' }, 'Calm softens animation and turns lightning into a gentle glow. Off stops the 3-D view (audio keeps playing). Flashes never exceed 3 per second.'));
   }
 
+  /* ------------------------------------------------------------------ sounds around you */
+  _buildSoundsSheet() {
+    this.soundRows = {};
+    this.soundMem = {};
+    const groups = [
+      ['birds', 'Birds & animals', ['birds', 'crows', 'owls', 'frogs', 'dogs']],
+      ['insects', 'Insects', INSECT_KEYS],
+      ['place', 'Sky, water & town', ['rumble', 'stream', 'chimes', 'traffic']],
+    ];
+    const body = [h('p', { class: 'hint' }, 'Auto lets nature decide from the season, the hour, the temperature and the rain. On sets a level by hand; Off silences it.')];
+    for (const [gid, title, keys] of groups) {
+      const hid = `lm-snd-g-${gid}`;
+      const list = h('div', { class: 'lm-snd-list', role: 'group', 'aria-labelledby': hid });
+      for (const k of keys) list.append(this._soundRow(k));
+      body.push(h('h4', { class: 'lm-sub', id: hid }, title), list);
+    }
+    body.push(h('div', { class: 'lm-snd-foot' },
+      h('button', { type: 'button', class: 'btn btn-small', onclick: () => this._allSoundsAuto() }, 'Set living sounds to Auto')));
+    return this._sheet('sounds', 'Sounds around you', ...body);
+  }
+
+  _soundRow(key) {
+    const spec = paramSpec(soundPath(key));
+    const id = `lm-snd-${key}`;
+    const nameId = `${id}-name`;
+    const hintId = `${id}-hint`;
+    const states = spec.kind === 'autolevel' ? [['auto', 'Auto'], ['on', 'On'], ['off', 'Off']] : [['on', 'On'], ['off', 'Off']];
+    const seg = h('div', { class: 'segmented lm-snd-seg', role: 'radiogroup', 'aria-labelledby': nameId, 'aria-describedby': hintId });
+    const radios = {};
+    for (const [st, lab] of states) {
+      const rid = `${id}-${st}`;
+      const inp = h('input', { type: 'radio', name: id, id: rid, value: st });
+      inp.addEventListener('change', () => {
+        if (inp.checked) this._setSoundState(key, st);
+      });
+      seg.append(inp, h('label', { for: rid }, lab));
+      radios[st] = inp;
+    }
+    const range = h('input', { type: 'range', id: `${id}-level`, class: 'lm-range lm-snd-range', min: 0.05, max: 1, step: 0.01, 'aria-label': `${spec.label} level` });
+    const cap = h('output', { class: 'lm-cap', for: range.id, 'aria-hidden': 'true' });
+    enhanceRange(range, { coarse: 0.1, valueTextFn: (x) => `${Math.round(x * 100)} percent` });
+    range.addEventListener('pointerdown', () => {
+      this.store.beginGesture(soundPath(key));
+      const end = () => {
+        this.store.endGesture();
+        window.removeEventListener('pointerup', end);
+        window.removeEventListener('pointercancel', end);
+      };
+      window.addEventListener('pointerup', end);
+      window.addEventListener('pointercancel', end);
+    });
+    range.addEventListener('input', () => {
+      const v = Math.round(parseFloat(range.value) * 100) / 100;
+      this.soundMem[key] = v;
+      cap.textContent = `${Math.round(v * 100)} %`;
+      this.store.setMany(soundPatch(this.store.scene, key, v), { coalesce: soundPath(key) });
+    });
+    const level = h('div', { class: 'lm-snd-level', hidden: true }, range, cap);
+    const row = h('div', { class: 'lm-snd-row', 'data-key': key },
+      h('div', { class: 'lm-snd-head' }, h('span', { class: 'lm-snd-name', id: nameId }, spec.label), seg),
+      h('p', { class: 'lm-snd-hint', id: hintId }, spec.help || ''),
+      level);
+    this.soundRows[key] = { spec, radios, range, cap, level, row };
+    return row;
+  }
+
+  _setSoundState(key, st) {
+    const spec = this.soundRows[key].spec;
+    const cur = soundValue(this.store.scene, key);
+    if (typeof cur === 'number' && cur > 0) this.soundMem[key] = cur;
+    const v = st === 'auto' ? 'auto' : st === 'off' ? 0 : this.soundMem[key] ?? spec.onLevel ?? 0.5;
+    this.store.setMany(soundPatch(this.store.scene, key, v), { coalesce: null });
+    this._syncSounds();
+    announce(`${spec.label}: ${st === 'auto' ? 'automatic' : st === 'off' ? 'off' : `on, ${Math.round(v * 100)} percent`}`);
+  }
+
+  _allSoundsAuto() {
+    const map = { 'place.biophony.insects': 'auto', 'weather.thunder.rumble': 'auto' };
+    for (const [k] of BIOPHONY) map[soundPath(k)] = 'auto';
+    this.store.setMany(map, { coalesce: null });
+    this._syncSounds();
+    announce('Birds, animals, insects and the cloud rumble are on Auto');
+  }
+
+  _syncSounds() {
+    if (!this.soundRows) return;
+    const sc = this.store.scene;
+    for (const [key, r] of Object.entries(this.soundRows)) {
+      const v = soundValue(sc, key);
+      const st = v === 'auto' ? 'auto' : v > 0 ? 'on' : 'off';
+      for (const [k, inp] of Object.entries(r.radios)) inp.checked = k === st;
+      r.row.dataset.state = st;
+      r.level.hidden = st !== 'on';
+      if (st === 'on') {
+        if (document.activeElement !== r.range) r.range.value = String(v);
+        r.range.setAttribute('aria-valuetext', `${Math.round(v * 100)} percent`);
+        r.cap.textContent = `${Math.round(v * 100)} %`;
+      }
+    }
+  }
+
   /* ------------------------------------------------------------------ sheets */
   toggleSheet(key, force) {
     const open = force === undefined ? this.sheet !== key : !!force;
@@ -363,8 +468,10 @@ export class ListenerMode {
     if (open) {
       if (key === 'orb') this._orbFromVibe();
       if (key === 'scenes') this._renderCards();
+      if (key === 'sounds') this._syncSounds();
       requestAnimationFrame(() => {
-        const first = key === 'scenes' ? this.describeInput : key === 'orb' ? this.orb.puck : this.sleepSel;
+        const first = key === 'scenes' ? this.describeInput : key === 'orb' ? this.orb.puck
+          : key === 'sounds' ? this.sheets.sounds.querySelector('.lm-snd-seg input:checked') : this.sleepSel;
         first?.focus({ preventScroll: true });
       });
     }
@@ -389,6 +496,7 @@ export class ListenerMode {
       this.nameEl.textContent = this.store.scene.name;
       this.threeD.checked = this.store.scene.listener.render === 'binaural';
       if (document.activeElement !== this.modeSel) this.modeSel.value = this.store.scene.mode || 'none';
+      if (this.sheet === 'sounds') this._syncSounds();
     });
   }
 
@@ -416,6 +524,7 @@ export class ListenerMode {
     this._refreshCaptions();
     this._orbFromVibe();
     this._renderCards();
+    this._syncSounds();
   }
 
   _refreshCaptions() {
