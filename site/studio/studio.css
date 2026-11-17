@@ -799,6 +799,25 @@ html.no-webgl[data-visuals="off"] .stage::before { display: none; }
   align-content: start;
 }
 .lm-sheet-orb, .lm-sheet-options { width: min(380px, 100%); }
+.lm-sheet-sounds { width: min(460px, 100%); }
+
+/* Sounds around you: one calm row per sound, Auto / On / Off, a level only when On */
+.lm-snd-list { display: grid; }
+.lm-snd-row { display: grid; gap: 4px; padding: 10px 0; border-top: 1px solid var(--line); }
+.lm-snd-row:first-child { border-top: 0; padding-top: 2px; }
+.lm-snd-head { display: flex; justify-content: space-between; align-items: center; gap: 8px 12px; flex-wrap: wrap; }
+.lm-snd-name { font-weight: 500; font-size: 13.5px; letter-spacing: -0.005em; }
+.lm-snd-row[data-state="off"] .lm-snd-name { color: var(--text-2); }
+.lm-snd-hint { font-size: 12px; line-height: 1.45; color: var(--muted); }
+.lm-snd-seg { flex: none; }
+.lm-snd-seg label { min-width: 46px; min-height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px; }
+.lm-snd-level { display: flex; align-items: center; gap: 10px; }
+.lm-snd-range { flex: 1; min-width: 0; height: 30px; }
+.lm-snd-level .lm-cap { min-width: 3.4em; }
+.lm-snd-foot { display: flex; justify-content: flex-end; padding-top: 4px; border-top: 1px solid var(--line); }
+@media (pointer: coarse) {
+  .lm-snd-seg label { min-height: 40px; min-width: 52px; }
+}
 .lm-sheet-head { display: flex; justify-content: space-between; align-items: center; position: sticky; top: -14px; padding-top: 2px; background: inherit; z-index: 1; }
 .lm-sub { margin-top: 6px; }
 .lm-describe { display: grid; gap: 6px; }
@@ -988,6 +1007,11 @@ html.no-webgl[data-visuals="off"] .stage::before { display: none; }
 }
 .row.is-auto .row-ctl { opacity: 0.55; }
 .auto-toggle { display: inline-flex; gap: 4px; align-items: center; font-size: 11.5px; color: var(--text-2); }
+.row-sound.is-auto .row-ctl { opacity: 1; }
+.row-sound.is-auto .slider { opacity: 0.4; }
+.sound-read { flex: none; min-width: 3.2em; text-align: right; font-size: 11.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.row-sound.is-auto .sound-read { color: var(--accent); }
+.insect-master { padding: 6px 8px; border: 1px solid var(--line-2); border-radius: var(--radius-s); color: var(--text-2); }
 
 .badge {
   display: inline-flex;
