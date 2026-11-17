@@ -33,7 +33,7 @@ import {
 } from './a11y.js';
 
 const ENGINE_URL = '../../engine/weather-engine.js?v=20261117a';
-const BRIDGE_URL = '../../engine/native-bridge.js?v=20261117a';
+const BRIDGE_URL = '../../engine/native-bridge.js?v=20261117b';
 const LS = 'raingen.studio';
 const DEG = Math.PI / 180;
 
@@ -277,6 +277,7 @@ function nativeChipText(state) {
 
 /** Called once the /native/hello probe has answered (or failed). */
 function onNativeDetected() {
+  viewport?.setLite(native.on);
   if (!native.on) {
     if (ENGINE_FLAG === 'native') {
       toast('The raingen studio server is not answering, so the browser audio engine is used instead.');
@@ -526,6 +527,7 @@ async function startNativeAudio() {
   pushWholeScene();
   safe(() => e.setVisualSafety({ maxFlashesPerSec: 3 }));
   safe(() => e.setTime(transport.t));
+  if (transport.t > 0) safe(() => e.seek(transport.t));
   fadeIn(3);
   setAudioState('live');
   return true;
@@ -700,10 +702,35 @@ function rampFor(path, source) {
   const sm = store.scene.studio.smoothing || {};
   const spec = paramSpec(path);
   const g = spec.smoothing || 'other';
-  return Math.max(0.02, Number(sm[g] ?? 0.25));
+  // Live edits must be heard at once: cap the glide at 0.4 s (still click-free).
+  return Math.min(0.4, Math.max(0.02, Number(sm[g] ?? 0.25)));
 }
 
 const SCENE_SYNC_PATHS = /^(timeline|overrides|vibe|name|seed|presetId|studio)(\.|$)/;
+/*
+ * Native mode: the live server drops the timeline, overrides, vibe macros and studio settings
+ * (the Composer plays them as parameters), so editing those must not rebuild the engine.
+ */
+const NATIVE_NO_SYNC_PATHS = /^(timeline|overrides|vibe|name|presetId|studio)(\.|$)/;
+const drag = { objects: false };
+
+function nativeEngine() {
+  return audio.started && audio.engine && audio.engine.native ? audio.engine : null;
+}
+
+/* End of a drag (gizmo, storm track, ...): the moved objects reach the native engine as one scene. */
+store.on('gesture', ({ active }) => {
+  if (active) {
+    drag.objects = false;
+    return;
+  }
+  const e = nativeEngine();
+  if (!e || !drag.objects) return;
+  drag.objects = false;
+  clearTimeout(audio.sceneTimer);
+  safe(() => e.setScene(clone(store.scene)));
+  safe(() => e.commit());
+});
 
 store.on('change', (e) => {
   if (e.paths.includes('name') || e.kind === 'load' || e.kind === 'restore') {
@@ -734,7 +761,7 @@ store.on('change', (e) => {
       continue;
     }
     if (SCENE_SYNC_PATHS.test(p)) {
-      scheduleSceneSync();
+      if (!(eng.native && NATIVE_NO_SYNC_PATHS.test(p))) scheduleSceneSync();
       continue;
     }
     const v = store.get(p);
@@ -744,6 +771,7 @@ store.on('change', (e) => {
     }
     safe(() => eng.setParam(p, clone(v), rampFor(p, e.source)));
   }
+  if (objIds.size && store.gestureActive) drag.objects = true;
   for (const id of objIds) {
     const o = store.getObject(id);
     if (o) safe(() => eng.upsertObject(clone(o)));
@@ -830,7 +858,9 @@ function seek(t) {
   transport.anchorPerf = nowS();
   timeline.setTime(transport.t, { apply: true, force: true });
   viewport?.setTime(transport.t);
-  engineSetTime(transport.t);
+  const ne = nativeEngine();
+  if (ne && typeof ne.seek === 'function') safe(() => ne.seek(transport.t));
+  else engineSetTime(transport.t);
   updateClock();
 }
 
@@ -1000,10 +1030,6 @@ async function strike() {
   } else {
     args.distanceKm = s.weather.thunder.distance_km;
     args.bearingDeg = s.weather.thunder.bearing_deg;
-  }
-  if (native.on) {
-    toast('Manual strikes are synthesized by the browser engine; the Rust engine plays the storm in the scene (turn Thunder on, or add a storm).');
-    return;
   }
   if (!transport.playing) await play();
   if (audio.started) {
@@ -1303,6 +1329,7 @@ async function initViewport() {
       const cb = document.querySelector(`[data-layer="${name}"]`);
       if (cb) cb.checked = !!on;
     }
+    viewport.setLite(native.on);
     viewport.setVisualsMode(ui.visuals);
     viewport.setReducedMotion(prefersReducedMotion());
     viewport.setTime(transport.t);

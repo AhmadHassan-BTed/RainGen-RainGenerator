@@ -15,7 +15,7 @@ pub use allpass::{allpass_bank, design_allpass_firs};
 pub use conv::PartitionedConv;
 pub use decoder::{Decoder, DecoderKind, Lfe};
 pub use encoder::{design_decorrelators, Encoder, SourceState, DECOR_CH, DECORRELATOR_SEED};
-pub use sh::{cap_weights, maxre_weights, sh_real, sh_real_f32, spread_gains, yaw_rotation, ACN_DEGREE};
+pub use sh::{cap_weights, listener_rotation, maxre_weights, sh_real, sh_real_f32, spread_gains, yaw_rotation, ACN_DEGREE};
 pub use stems::StemBuses;
 
 use crate::types::N_AMBI;

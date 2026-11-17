@@ -25,7 +25,7 @@ pub mod spatial;
 pub mod stream;
 pub mod types;
 
-use crate::engine::{build_graph, make_pool, BuildCfg, Command, Core};
+use crate::engine::{build_graph, make_pool, BuildCfg, Command, Core, ListenerPose, Strike};
 use crate::rng::RngFactory;
 use crate::spatial::{Decoder, Lfe};
 use crate::stream::LiveStream;
@@ -93,6 +93,8 @@ pub struct PyEngine {
     layout: String,
     live: Option<LiveStream>,
     progress: Arc<AtomicU64>,
+    pose: Arc<ListenerPose>,
+    strikes: AtomicU64,
 }
 
 impl PyEngine {
@@ -124,6 +126,7 @@ impl PyEngine {
         let core = Core::new(sample_rate, block, seed, pool, rx);
         let channels = core.channels();
         let progress = core.progress.clone();
+        let pose = core.pose.clone();
         Ok(PyEngine {
             core: Arc::new(Mutex::new(core)),
             tx,
@@ -136,6 +139,8 @@ impl PyEngine {
             layout: "stereo".into(),
             live: None,
             progress,
+            pose,
+            strikes: AtomicU64::new(0),
         })
     }
 
@@ -147,8 +152,11 @@ impl PyEngine {
     }
 
     /// Build the voice graph from Scene.to_json() and the SourcePatch list (JSON list of dicts).
-    /// Takes effect at the next block boundary (crossfaded over one block while playing).
-    fn set_scene(&mut self, py: Python<'_>, scene_json: &str, patches_json: &str) -> PyResult<()> {
+    /// Takes effect at the next block boundary. While playing it is an incremental update:
+    /// voices whose patch / settings did not change keep running (moved patches only move),
+    /// added and removed voices crossfade over 150 ms, the place / shelter processors
+    /// crossfade only when they change. Safe to call from any thread while rendering.
+    fn set_scene(&self, py: Python<'_>, scene_json: &str, patches_json: &str) -> PyResult<()> {
         let scene = Scene::from_json(scene_json).map_err(verr)?;
         let patches = Patch::list_from_json(patches_json).map_err(verr)?;
         let seed = scene.seed ^ self.seed;
@@ -156,6 +164,41 @@ impl PyEngine {
         let mats = self.materials.clone();
         let graph = py.detach(move || build_graph(scene, patches, &mats, &cfg));
         self.send(Command::Graph(Box::new(graph)))
+    }
+
+    /// The live listener pose: feet position (world metres, as Scene.listener.position),
+    /// heading (deg true) and pitch (deg, up positive). Lock-free, any thread, any rate: it never
+    /// rebuilds voices. The engine glides to it (~50 ms): world-fixed voices move, turning
+    /// rotates the sound field. clear=True returns to the scene's listener.
+    #[pyo3(signature = (x = 0.0, y = 0.0, z = 0.0, heading_deg = 0.0, pitch_deg = 0.0, clear = false))]
+    fn set_listener(&self, x: f32, y: f32, z: f32, heading_deg: f32, pitch_deg: f32, clear: bool) -> PyResult<()> {
+        if clear {
+            self.pose.clear();
+            return Ok(());
+        }
+        if ![x, y, z, heading_deg, pitch_deg].iter().all(|v| v.is_finite()) {
+            return Err(verr("listener pose must be finite"));
+        }
+        self.pose.set([x, y, z, heading_deg.rem_euclid(360.0), pitch_deg.clamp(-90.0, 90.0)]);
+        Ok(())
+    }
+
+    /// A manual lightning strike now: the flash marker at the next block and the thunder at
+    /// distance / c(T) through the storm model's channel and propagation. Returns its id.
+    #[pyo3(signature = (distance_km = 3.0, bearing_deg = 0.0, intensity = 0.7))]
+    fn strike(&self, distance_km: f32, bearing_deg: f32, intensity: f32) -> PyResult<String> {
+        let id = self.strikes.fetch_add(1, Ordering::Relaxed) + 1;
+        self.send(Command::Strike(Strike { id, distance_km, bearing_deg, intensity }))?;
+        Ok(format!("strike.{id}"))
+    }
+
+    /// Move the scene clock to `t` seconds (marker times and stats follow) without resetting
+    /// any voice or restarting the audio.
+    fn seek(&self, t: f64) -> PyResult<()> {
+        if !t.is_finite() {
+            return Err(verr("t must be finite"));
+        }
+        self.send(Command::Seek(t))
     }
 
     /// One WeatherState per control block: json.dumps(dataclasses.asdict(weather)).
@@ -344,7 +387,7 @@ impl PyEngine {
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let core = self.core.clone();
-        let (st, underruns, latency, block_index, last_ms, max_ms, slow) = py
+        let (st, underruns, latency, block_index, last_ms, max_ms, slow, scene_t, pose) = py
             .detach(move || {
                 let c = core.lock().map_err(|_| "engine lock poisoned".to_string())?;
                 Ok::<_, String>((
@@ -355,6 +398,8 @@ impl PyEngine {
                     c.last_cpu_ms(),
                     c.max_cpu_ms,
                     c.slow_blocks,
+                    c.scene_time(),
+                    c.listener_now(),
                 ))
             })
             .map_err(rerr)?;
@@ -372,6 +417,12 @@ impl PyEngine {
         d.set_item("latency_samples", latency)?;
         d.set_item("gain_reduction_db", st.gain_reduction_db)?;
         d.set_item("max_gain_reduction_db", st.max_gain_reduction_db)?;
+        d.set_item("voice_rebuilds", st.voice_rebuilds)?;
+        d.set_item("voices_kept", st.voices_kept)?;
+        d.set_item("graph_updates", st.graph_updates)?;
+        d.set_item("processor_swaps", st.processor_swaps)?;
+        d.set_item("scene_t", scene_t)?;
+        d.set_item("listener", pose.to_vec())?;
         d.set_item("threads", if self.threads == 0 { std::thread::available_parallelism().map(|v| v.get()).unwrap_or(0) } else { self.threads })?;
         let live = self.live.as_ref().filter(|l| l.is_running());
         d.set_item("live", live.is_some())?;

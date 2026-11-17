@@ -16,7 +16,13 @@ with the manifest (strings may carry units: "30 km/h", "force 6", "8 mm/h"), the
   time), e.g. rain 3 s and wind 1 s, so physics never sees a step;
 * structural changes (place, shelter, surfaces, listener, precipitation type, mode) build a
   new pipeline on a worker thread and crossfade to it with an equal-power fade, so the old
-  scene keeps playing while the new one is prepared;
+  scene keeps playing while the new one is prepared. With the native core they are an
+  incremental update of the one running pipeline instead: the new voice graph is diffed in
+  Rust (unchanged voices keep playing, added / removed ones crossfade over 150 ms) and the
+  World keeps its weather state; only an output layout change builds a new pipeline;
+* the listener pose (`set_listener`: position, heading, pitch) is live on the native core:
+  a lock-free pose the voices follow per block, never a rebuild;
+* `strike()` fires a lightning strike now, `seek(t)` moves the scene clock without a restart;
 * Tier-0 macros (vibe.intensity / closeness / wildness) go through apply_vibe and then
   through the same diff, `mode` through apply_mode, `vibe.volume_db` ramps the output gain.
 
@@ -38,6 +44,7 @@ voices, encoding, shelter transfer and decoding run in Rust on every core. `nati
 from __future__ import annotations
 
 import collections
+import dataclasses
 import json
 import logging
 import math
@@ -104,14 +111,22 @@ def _safe_get(scene: Scene, path: str, default: Any = None) -> Any:
         return default
 
 
-def _structure_key(scene: Scene) -> str:
-    """Everything that needs a new pipeline when it changes (geometry, generators, master)."""
+_LIVE_LISTENER = ("position", "heading_deg", "pitch_deg")
+
+
+def _structure_key(scene: Scene, live_listener: bool = False) -> str:
+    """Everything that needs a new pipeline when it changes (geometry, generators, master).
+
+    live_listener: the pipeline follows the listener pose live (native core), so position and
+    heading are not structure.
+    """
     d = scene.to_dict()
     vibe = d.get("vibe") or {}
+    skip = ("render",) + (_LIVE_LISTENER if live_listener else ())
     key = {
         "type": d["weather"]["precipitation"]["type"],
         "place": {k: v for k, v in d["place"].items() if k not in _LIVE_PLACE},
-        "listener": {k: v for k, v in d["listener"].items() if k != "render"},
+        "listener": {k: v for k, v in d["listener"].items() if k not in skip},
         "mode": d.get("mode"),
         "seed": d.get("seed"),
         "quality": (d.get("render") or {}).get("quality"),
@@ -310,10 +325,17 @@ class Engine:
         self.underruns = 0
         self.xruns = 0
         self.cpu_load = 0.0
-        self._markers: list = []
+        self._markers: list = []             # (render-clock time it is heard, marker on the scene clock)
         self._marker_lock = threading.Lock()
         self.markers_delivered = 0
         self.last_weather = None
+        self._pose: Optional[tuple] = None   # (position, heading_deg, pitch_deg) from set_listener
+        self._pose_sent: Optional[tuple] = None
+        self._pitch = 0.0
+        self._t_offset = 0.0                 # scene time - render time (seek)
+        self._full_pending = False
+        self.pipeline_rebuilds = 0           # new pipelines built after start (layout changes, Python core)
+        self.scene_updates = 0               # incremental structural updates (native core)
 
     # ------------------------------------------------------------------ public state
     @property
@@ -333,6 +355,16 @@ class Engine:
         Counted from the rendered frames actually played, so an underrun (silence the device
         played while the producer was late) does not move the scene clock or the markers.
         """
+        dev = 0.0
+        if self._stream is not None:
+            try:
+                lat = self._stream.latency
+                dev = float(lat if not isinstance(lat, (tuple, list)) else lat[-1])
+            except Exception:
+                dev = 0.0
+        return self._render_time() + self._t_offset
+
+    def _render_time(self) -> float:
         dev = 0.0
         if self._stream is not None:
             try:
@@ -400,19 +432,90 @@ class Engine:
 
     load_scene = set_scene
 
+    def set_listener(self, position=None, heading_deg: Optional[float] = None, pitch_deg: Optional[float] = None,
+                     height_m: Optional[float] = None) -> tuple:
+        """Move / turn the listener (world metres, deg true, deg up); thread-safe, any rate.
+
+        On the native core this is a live pose (the voices follow it within ~50 ms, nothing is
+        rebuilt); a height change, or the Python core, rebuilds like any structural change.
+        """
+        struct = False
+        with self._lock:
+            L = self._target.listener
+            if position is not None:
+                p = [float(v) for v in tuple(position)[:3]]
+                if len(p) < 2 or not all(math.isfinite(v) for v in p):
+                    raise ValueError("position must be [x, y] or [x, y, z] in metres")
+                if len(p) == 2:
+                    p.append(float((tuple(L.position) + (0.0, 0.0, 0.0))[2]))
+                L.position = tuple(p)
+            if heading_deg is not None:
+                h = float(heading_deg)
+                if not math.isfinite(h):
+                    raise ValueError("heading_deg must be finite")
+                L.heading_deg = h % 360.0
+            if pitch_deg is not None and math.isfinite(float(pitch_deg)):
+                self._pitch = max(-90.0, min(90.0, float(pitch_deg)))
+            if height_m is not None and math.isfinite(float(height_m)) and abs(float(height_m) - float(L.height_m)) > 0.005:
+                L.height_m = float(height_m)
+                struct = True
+            pose = (tuple(L.position), float(L.heading_deg), float(self._pitch))
+            self._pose = pose
+        if not self._send_pose() or struct:
+            self._cmd.put(("retarget", 0.5))
+        return pose
+
+    def _send_pose(self, eff: Optional[Scene] = None) -> bool:
+        """Hand the live pose to the native pipeline(s); False when the pipeline cannot follow it."""
+        pipe = self._pipe
+        if not self.native or pipe is None or not hasattr(pipe, "set_listener"):
+            return False
+        pose = self._pose
+        if pose is None:
+            if eff is None:
+                return True
+            pose = (tuple(eff.listener.position), float(eff.listener.heading_deg), float(self._pitch))
+        if pose != self._pose_sent:
+            pos, h, p = pose
+            pipe.set_listener(position=pos, heading_deg=h, pitch_deg=p)
+            xf = self._xf
+            if xf is not None and hasattr(xf.get("pipe"), "set_listener"):
+                try:
+                    xf["pipe"].set_listener(position=pos, heading_deg=h, pitch_deg=p)
+                except Exception:
+                    pass
+            self._pose_sent = pose
+        return True
+
+    def strike(self, distance_km: Optional[float] = None, bearing_deg: Optional[float] = None,
+               intensity: Optional[float] = None) -> dict:
+        """A lightning strike now (native core): flash marker, then thunder at distance / c(T)."""
+        pipe = self._pipe
+        if pipe is None or not hasattr(pipe, "strike"):
+            raise RuntimeError("manual strikes need the native core")
+        return pipe.strike(distance_km, bearing_deg, intensity)
+
+    def seek(self, t: float) -> None:
+        """Jump the scene clock / timeline to `t` seconds without restarting the audio."""
+        t = float(t)
+        if not math.isfinite(t):
+            raise ValueError("t must be finite")
+        self._cmd.put(("seek", max(0.0, t)))
+
     def poll(self) -> list:
         """Deliver due markers to on_marker on the calling thread; returns them."""
         if self.error is not None:
             err, self.error = self.error, None
             raise RuntimeError(f"raingen engine stopped: {err!r}") from err
-        now = self.time
+        now = self._render_time()
         due = []
         with self._marker_lock:
             if self._markers:
                 keep = []
-                for m in self._markers:
-                    (due if float(m.t) <= now else keep).append(m)
+                for item in self._markers:
+                    (due if item[0] <= now else keep).append(item)
                 self._markers = keep
+        due = [m for _, m in due]
         due.sort(key=lambda m: float(m.t))
         if self.on_marker is not None:
             for m in due:
@@ -588,7 +691,11 @@ class Engine:
         self._pipe = self._make_pipeline(eff)
         self._eff = eff
         self._current = eff.copy()
-        self._struct_key = _structure_key(eff)
+        self._struct_key = self._skey(eff)
+        self._pose_sent = None
+        self._t_offset = 0.0
+        self._full_pending = False
+        self._send_pose(eff)
         self.channels = int(self._pipe.channels)
         self._governor = self._make_governor(eff)
         self._gov_slot = _GovernorSlot(self._governor, self.channels, self._governor_latency())
@@ -608,29 +715,51 @@ class Engine:
         with self._marker_lock:
             self._markers = []
 
+    def _skey(self, scene: Scene) -> str:
+        return _structure_key(scene, live_listener=self.native)
+
+    def _can_update(self) -> bool:
+        """True when a structural change can update the running native pipeline in place."""
+        pipe = self._pipe
+        if not self.native or self._full_pending or pipe is None or not hasattr(pipe, "prepare_update"):
+            return False
+        from .spatial.decoders import normalize_layout
+        try:
+            return normalize_layout(self.layout) == pipe.layout
+        except Exception:
+            return False
+
     def _request_rebuild(self, eff: Scene) -> None:
         self._build_gen += 1
         gen = self._build_gen
         scene = self._prepare(eff)
+        if self._can_update():
+            pipe = self._pipe
+
+            def update():
+                try:
+                    prep = pipe.prepare_update(scene, wanted=lambda: gen == self._build_gen)
+                    if prep is not None:
+                        self._built = (gen, "update", (pipe, prep), scene)
+                except Exception as exc:
+                    log.exception("raingen engine: scene update failed; keeping the current scene")
+                    self.error = exc
+
+            threading.Thread(target=update, name="raingen-update", daemon=True).start()
+            return
+        self._full_pending = True
 
         def build():
             try:
                 pipe = self._make_pipeline(scene)
-                self._built = (gen, pipe, scene)
+                self._built = (gen, "pipe", pipe, scene)
             except Exception as exc:
                 log.exception("raingen engine: rebuild failed; keeping the current scene")
                 self.error = exc
 
         threading.Thread(target=build, name="raingen-rebuild", daemon=True).start()
 
-    def _swap_if_built(self) -> None:
-        b = self._built
-        if b is None or self._xf is not None:
-            return                      # a crossfade in progress finishes first (dropping its old side clicks)
-        self._built = None
-        gen, pipe, scene = b
-        if gen != self._build_gen or pipe.channels != self.channels:
-            return
+    def _carry_live(self, scene: Scene) -> Scene:
         old_current = self._current
         cur = scene.copy()
         for p in self._live_numeric + self._live_discrete:
@@ -640,17 +769,56 @@ class Engine:
             except (AttributeError, KeyError, TypeError):
                 pass
         cur.timeline = list(scene.timeline)
-        if self.xfade_s > 0.0:
-            self._xf = {"pipe": self._pipe, "scene": old_current, "pos": 0,
-                        "len": max(1, int(self.xfade_s * SAMPLE_RATE))}
-        self._pipe = pipe
-        self._current = cur
+        return cur
+
+    def _new_governor_if_needed(self, scene: Scene) -> None:
         key = self._governor_key(scene)
         if key != self._gov_key:
             # a new mode / timer: a fresh governor, crossfaded in at the same total latency
             self._governor = self._make_governor(scene)
             self._gov_slot.replace(self._governor, max(1, int(self.xfade_s * SAMPLE_RATE)))
             self._gov_key = key
+
+    def _swap_if_built(self) -> None:
+        b = self._built
+        if b is None:
+            return
+        gen, kind, obj, scene = b
+        if kind == "update":
+            self._built = None
+            pipe, prep = obj
+            if gen != self._build_gen or pipe is not self._pipe:
+                return
+            played = pipe.commit_update(prep)          # World state carried; voices diffed in Rust
+            cur = self._carry_live(played)
+            cur.timeline = list(scene.timeline)
+            self._current = cur
+            self._new_governor_if_needed(scene)
+            self._update_latency()
+            self.scene_updates += 1
+            return
+        if self._xf is not None:
+            return                      # a crossfade in progress finishes first (dropping its old side clicks)
+        self._built = None
+        pipe = obj
+        if gen != self._build_gen or pipe.channels != self.channels:
+            return
+        self._full_pending = False
+        old_current = self._current
+        cur = self._carry_live(scene)
+        if hasattr(pipe, "start_at"):
+            # continue the running timeline (a native pipeline would otherwise re-render every
+            # block from t = 0 to catch up) with the old World's weather state
+            pipe.start_at(self._index, self._index * BLOCK / SAMPLE_RATE + self._t_offset, carry_from=self._pipe)
+        if self.xfade_s > 0.0:
+            self._xf = {"pipe": self._pipe, "scene": old_current, "pos": 0,
+                        "len": max(1, int(self.xfade_s * SAMPLE_RATE))}
+        self._pipe = pipe
+        self._current = cur
+        self._pose_sent = None
+        self._send_pose(scene)
+        self.pipeline_rebuilds += 1
+        self._new_governor_if_needed(scene)
         self._update_latency()
 
     # ------------------------------------------------------------------ commands
@@ -699,10 +867,24 @@ class Engine:
                     ramp = float(xfade)
             elif kind == "retarget":
                 ramp = float(cmd[1])
+            elif kind == "seek":
+                self._seek_now(float(cmd[1]))
+                return
             else:
                 raise ValueError(f"unknown engine command {kind!r}")
         if not initial and self._pipe is not None:
             self._retarget(ramp, immediate)
+
+    def _seek_now(self, t: float) -> None:
+        """(producer thread) the scene clock jumps to t; voices, ramps and the stream keep going."""
+        render_t = self._index * BLOCK / SAMPLE_RATE
+        self._t_offset = t - render_t
+        for pipe in (self._pipe, (self._xf or {}).get("pipe")):
+            if pipe is not None and hasattr(pipe, "seek"):
+                try:
+                    pipe.seek(t)
+                except Exception as exc:
+                    log.warning("raingen engine: seek failed: %s", exc)
 
     def _set_volume(self, db: float, ramp: float, immediate: bool) -> None:
         self._vol_from = self._vol_db
@@ -714,10 +896,11 @@ class Engine:
         with self._lock:
             eff = self._graph.apply(self._target)
         eff = self._prepare(eff)
-        key = _structure_key(eff)
+        key = self._skey(eff)
         if key != self._struct_key:
             self._struct_key = key
             self._request_rebuild(eff)
+        self._send_pose(eff)
         old = self._eff
         for p in self._live_numeric:
             a, b = _safe_get(old, p), _safe_get(eff, p)
@@ -741,7 +924,7 @@ class Engine:
         cur = _safe_get(self._current, path)
         numeric = (spec is not None and spec.is_numeric and isinstance(cur, (int, float))
                    and isinstance(value, (int, float)) and not isinstance(cur, bool) and not isinstance(value, bool))
-        dur = max(float(ramp or 0.0), spec.smoothing_s if spec is not None else 0.0)
+        dur = max(float(ramp), 0.05) if ramp is not None else (spec.smoothing_s if spec is not None else 0.0)
         if immediate or not numeric or dur <= 0.0:
             self._ramps.pop(path, None)
             self._current.set(path, value)
@@ -780,13 +963,14 @@ class Engine:
         self._advance_ramps()
         idx = self._index
         t0 = idx * BLOCK / SAMPLE_RATE
+        off = self._t_offset
         sc = self._current
         if sc.timeline:
             from .scene.timeline import evaluate
-            sc = evaluate(sc, t0)
+            sc = evaluate(sc, t0 + off)
         out = self._pipe.render_block(idx, scene_at_t=sc)
         y = out.mix
-        markers = list(out.markers)
+        markers = self._clocked(self._pipe, out.markers, off)
         xf = self._xf
         if xf is not None:
             old_sc = xf["scene"]
@@ -796,7 +980,7 @@ class Engine:
             a, b = np.cos(0.5 * math.pi * w), np.sin(0.5 * math.pi * w)
             k = self._xf_compensation(old.mix, y, a, b, xf, done=bool(w[-1] >= 1.0))
             y = (old.mix * a[None, :] + y * b[None, :]) * k[None, :]
-            markers.extend(old.markers)
+            markers.extend(self._clocked(xf["pipe"], old.markers, off))
             xf["pos"] += n
             if xf["pos"] >= xf["len"]:
                 self._xf = None
@@ -809,6 +993,25 @@ class Engine:
         dt = time.perf_counter() - t_start
         self.cpu_load = 0.9 * self.cpu_load + 0.1 * dt / (BLOCK / SAMPLE_RATE)
         return y
+
+    @staticmethod
+    def _clocked(pipe, markers, off: float) -> list:
+        """(render-clock time heard, marker on the scene clock): the native core already stamps
+        scene time (Rust seek), the Python pipeline render time."""
+        if not markers:
+            return []
+        if not off:
+            return [(float(m.t), m) for m in markers]
+        if hasattr(pipe, "seek"):
+            return [(float(m.t) - off, m) for m in markers]
+        out = []
+        for m in markers:
+            try:
+                m2 = dataclasses.replace(m, t=float(m.t) + off)
+            except TypeError:
+                m2 = m
+            out.append((float(m.t), m2))
+        return out
 
     @staticmethod
     def _xf_compensation(x_old: np.ndarray, x_new: np.ndarray, a: np.ndarray, b: np.ndarray, xf: dict,

@@ -10,21 +10,37 @@
 //! Voices come from `rain::build_voices` and `env::build_voices`; bus processors from
 //! `env::build_bus_processors`. A voice that panics is disabled (like a Python generator that
 //! raises) and the rest of the graph keeps playing.
+//!
+//! Live listener: every voice tied to a world patch keeps that patch's WORLD position; the
+//! pose set by `ListenerPose::set` (lock-free, any thread) is smoothed per block (~50 ms) and
+//! moves those voices (direction, 1/r gain, air-absorption shelf, all ramped per sample),
+//! while turning the head rotates the whole SH field once after the bus processors. Ground
+//! rings, the listener's own shelter and listener-relative beds move with the listener.
+//! A new graph (`Command::Graph`) is diffed against the running one by a stable per-voice key:
+//! unchanged voices keep running with their state, only added / removed ones crossfade.
 
 use crate::dsp::enable_ftz;
 use crate::limiter::Limiter;
 use crate::rng::RngFactory;
-use crate::spatial::{Decoder, Encoder, SourceState, StemBuses};
+use crate::rng::{combine, hash_str};
+use crate::spatial::{listener_rotation, Decoder, Encoder, SourceState, StemBuses};
 use crate::types::{
     Emission, Marker, MaterialTable, Patch, Scene, Shelter, Weather, N_AMBI, N_STEMS,
 };
 use crossbeam_channel::Receiver;
 use crossbeam_queue::ArrayQueue;
 use rayon::prelude::*;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Crossfade of voices added / removed by an incremental scene update (s).
+pub const VOICE_FADE_S: f32 = 0.15;
+/// Smoothing time constant of the live listener pose (s).
+pub const POSE_TAU_S: f64 = 0.05;
 
 // ---------------------------------------------------------------------------
 // contracts for the porting agents
@@ -61,6 +77,116 @@ impl MarkerSink {
     }
 }
 
+/// A manual lightning strike requested with `Engine.strike()` (delivered to the thunder voice
+/// through `BlockCtx::strikes` on the next block).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Strike {
+    pub id: u64,
+    pub distance_km: f32,
+    /// Compass bearing (deg true) from the listener.
+    pub bearing_deg: f32,
+    /// Stroke intensity 0..1.
+    pub intensity: f32,
+}
+
+/// The live listener pose: feet position (world metres, as Scene.listener.position), heading
+/// (deg true) and pitch (deg, up positive). Written by control threads without locks; the
+/// renderer reads it once per block (a torn read is harmless: the pose is smoothed).
+pub struct ListenerPose {
+    vals: [AtomicU32; 5],
+    seq: AtomicU64,
+}
+
+impl Default for ListenerPose {
+    fn default() -> Self {
+        ListenerPose { vals: Default::default(), seq: AtomicU64::new(0) }
+    }
+}
+
+impl ListenerPose {
+    pub fn set(&self, v: [f32; 5]) {
+        for (a, x) in self.vals.iter().zip(v) {
+            a.store(x.to_bits(), Ordering::Relaxed);
+        }
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// The last pose set, or None while nobody has set one.
+    pub fn get(&self) -> Option<[f32; 5]> {
+        if self.seq.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut v = [0.0f32; 5];
+        for (x, a) in v.iter_mut().zip(&self.vals) {
+            *x = f32::from_bits(a.load(Ordering::Relaxed));
+        }
+        Some(v)
+    }
+
+    /// Forget the pose (the scene's listener is used again).
+    pub fn clear(&self) {
+        self.seq.store(0, Ordering::Release);
+    }
+}
+
+/// The listener pose a graph was built for (Scene.listener): the frame of its voices.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RefPose {
+    pub pos: [f32; 3],
+    pub heading_deg: f32,
+    pub height_m: f32,
+}
+
+impl Default for RefPose {
+    fn default() -> Self {
+        RefPose { pos: [0.0; 3], heading_deg: 0.0, height_m: 1.7 }
+    }
+}
+
+impl RefPose {
+    pub fn of(scene: &Scene) -> RefPose {
+        let l = &scene.listener;
+        RefPose { pos: l.position, heading_deg: l.heading_deg, height_m: l.height_m }
+    }
+
+    pub fn ears(&self) -> [f32; 3] {
+        [self.pos[0], self.pos[1], self.pos[2] + self.height_m]
+    }
+
+    /// World (x east, y north, z up) offset -> this frame (+x forward, +y left, +z up).
+    pub fn to_frame(&self, d: [f32; 3]) -> [f32; 3] {
+        let (s, c) = self.heading_deg.to_radians().sin_cos();
+        [d[0] * s + d[1] * c, -d[0] * c + d[1] * s, d[2]]
+    }
+
+    /// Inverse of `to_frame`.
+    pub fn to_world(&self, p: [f32; 3]) -> [f32; 3] {
+        let (s, c) = self.heading_deg.to_radians().sin_cos();
+        [p[0] * s - p[1] * c, p[0] * c + p[1] * s, p[2]]
+    }
+
+    fn hash(&self) -> u64 {
+        let mut h = hash_str("refpose");
+        for v in [self.pos[0], self.pos[1], self.pos[2], self.heading_deg, self.height_m] {
+            h = combine(h, v.to_bits() as u64);
+        }
+        h
+    }
+}
+
+/// Per-block listener motion shared by every voice: the smoothed pose relative to the graph's
+/// reference pose.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoseCtx {
+    /// Ears displacement in the reference frame (m).
+    pub delta: [f32; 3],
+    /// Air absorption at 8 kHz (dB/m) for the distance changes.
+    pub air_db_per_m: f32,
+    /// Head turn (rad, clockwise positive) and pitch (rad) relative to the reference pose.
+    pub dheading: f32,
+    pub pitch: f32,
+}
+
 /// Per-block context handed to every voice (the Rust BlockContext).
 pub struct BlockCtx<'a> {
     pub sr: u32,
@@ -82,6 +208,8 @@ pub struct BlockCtx<'a> {
     pub scene: &'a Scene,
     pub materials: &'a MaterialTable,
     pub markers: &'a MarkerSink,
+    /// Manual strikes to start in this block (thunder voice).
+    pub strikes: &'a [Strike],
 }
 
 impl<'a> BlockCtx<'a> {
@@ -169,6 +297,39 @@ pub fn background<F: FnOnce() + Send + 'static>(job: F) {
 // ---------------------------------------------------------------------------
 // voice graph
 // ---------------------------------------------------------------------------
+/// Where a world-fixed voice sits: its patch's world position in the graph's reference frame
+/// and the geometry its level and air absorption were built for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    /// Patch position now, reference frame (moved objects update it in place).
+    pub w_ref: [f32; 3],
+    /// Patch position the voice was built for, reference frame.
+    pub p_build: [f32; 3],
+    pub d_ref: f32,
+    /// Patch radius sqrt(area / pi) (near-field limit of the 1/r law).
+    pub rad: f32,
+    /// sqrt(area * exposure) when built, and the gain toward the current patch's value.
+    pub amp_build: f32,
+    pub gain_mul: f32,
+}
+
+impl Anchor {
+    fn r_eff(&self, d: f32) -> f32 {
+        (d * d + 0.5 * self.rad * self.rad).sqrt().max(0.3)
+    }
+}
+
+#[inline]
+fn fade_gain(u: f32) -> f32 {
+    if u >= 1.0 {
+        1.0
+    } else if u <= 0.0 {
+        0.0
+    } else {
+        (std::f32::consts::FRAC_PI_2 * u).sin()
+    }
+}
+
 pub struct Slot {
     pub voice: BoxedVoice,
     channels: usize,
@@ -176,7 +337,17 @@ pub struct Slot {
     meta: Emission,
     enc: SourceState,
     dead: bool,
-    fade: (f32, f32),
+    /// Crossfade position 0..1 (gain sin(pi/2 u)) and direction (+1 in, -1 out, 0 steady).
+    fade_u: f32,
+    fade_dir: i8,
+    /// Stable identity for incremental scene updates.
+    pub key: u64,
+    pub anchor: Option<Anchor>,
+    /// Listener-motion gain and air-absorption shelf gain at the end of the last block, and
+    /// the shelf's low-pass state.
+    pose_g: f32,
+    hf_g: f32,
+    lp: f32,
     /// Smoothed render time of this voice (ms per block).
     pub cpu_ms: f64,
     /// Slowest block of this voice (ms).
@@ -186,6 +357,7 @@ pub struct Slot {
 impl Slot {
     fn new(voice: BoxedVoice, n: usize) -> Slot {
         let ch = if voice.channels() >= N_AMBI { N_AMBI } else { 1 };
+        let key = hash_str(voice.name());
         Slot {
             voice,
             channels: ch,
@@ -193,15 +365,22 @@ impl Slot {
             meta: Emission::SILENT,
             enc: SourceState::default(),
             dead: false,
-            fade: (1.0, 1.0),
+            fade_u: 1.0,
+            fade_dir: 0,
+            key,
+            anchor: None,
+            pose_g: 1.0,
+            hf_g: 1.0,
+            lp: 0.0,
             cpu_ms: 0.0,
             max_ms: 0.0,
         }
     }
 
-    fn render(&mut self, ctx: &BlockCtx) {
+    fn render(&mut self, ctx: &BlockCtx, pose: &PoseCtx) {
         let t = Instant::now();
         self.render_inner(ctx);
+        self.apply_pose(pose, ctx.sr_f);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         self.cpu_ms = if self.cpu_ms == 0.0 { ms } else { 0.95 * self.cpu_ms + 0.05 * ms };
         self.max_ms = self.max_ms.max(ms);
@@ -230,6 +409,67 @@ impl Slot {
             }
         }
     }
+
+    /// Move a world-fixed mono voice to where it is heard from the live listener position:
+    /// direction from its world position, 1/r gain and the air-absorption difference against
+    /// the distance it was built for (gains ramped per sample, so walking never zippers).
+    fn apply_pose(&mut self, pose: &PoseCtx, sr: f32) {
+        let a = match self.anchor {
+            Some(a) if self.channels == 1 && self.meta.active => a,
+            _ => return,
+        };
+        let o = [
+            a.w_ref[0] - pose.delta[0] - a.p_build[0],
+            a.w_ref[1] - pose.delta[1] - a.p_build[1],
+            a.w_ref[2] - pose.delta[2] - a.p_build[2],
+        ];
+        let still = o[0].abs() < 1e-4 && o[1].abs() < 1e-4 && o[2].abs() < 1e-4 && a.gain_mul == 1.0;
+        if still && self.pose_g == 1.0 && self.hf_g == 1.0 {
+            return; // bit-exact at the reference pose
+        }
+        let m = &mut self.meta;
+        let (se, ce) = m.elevation.sin_cos();
+        let (sa, ca) = m.azimuth.sin_cos();
+        let p = [a.d_ref * ce * ca + o[0], a.d_ref * ce * sa + o[1], a.d_ref * se + o[2]];
+        let pn = [a.p_build[0] + o[0], a.p_build[1] + o[1], a.p_build[2] + o[2]];
+        let d_new = (pn[0] * pn[0] + pn[1] * pn[1] + pn[2] * pn[2]).sqrt().max(0.05);
+        if p[0].abs() + p[1].abs() + p[2].abs() > 1e-6 {
+            m.azimuth = p[1].atan2(p[0]);
+            m.elevation = p[2].atan2(p[0].hypot(p[1]));
+        }
+        let ratio = a.r_eff(a.d_ref) / a.r_eff(d_new);
+        m.spread = (m.spread * ratio.min(4.0)).clamp(0.0, 1.0);
+        m.distance = d_new;
+        let g1 = if still { 1.0 } else { (ratio * a.gain_mul).clamp(0.0, 4.0) };
+        let hf_db = (-pose.air_db_per_m * (d_new - a.d_ref)).clamp(-30.0, 4.0);
+        let h1 = if still { 1.0 } else { 10f32.powf(hf_db / 20.0) };
+        let (g0, h0) = (self.pose_g, self.hf_g);
+        let k = 1.0 - (-std::f32::consts::TAU * 4000.0 / sr).exp();
+        let n = self.buf.len();
+        let inv = 1.0 / n.max(1) as f32;
+        let mut lp = self.lp;
+        for (i, v) in self.buf.iter_mut().enumerate() {
+            let t = (i + 1) as f32 * inv;
+            let x = *v;
+            lp += k * (x - lp);
+            let h = h0 + (h1 - h0) * t;
+            let g = g0 + (g1 - g0) * t;
+            *v = g * (lp + h * (x - lp));
+        }
+        self.lp = if lp.is_finite() && lp.abs() > 1e-30 { lp } else { 0.0 };
+        self.pose_g = g1;
+        self.hf_g = h1;
+    }
+
+    fn reset_live(&mut self) {
+        self.enc = SourceState::default();
+        self.dead = false;
+        self.fade_u = 1.0;
+        self.fade_dir = 0;
+        self.pose_g = 1.0;
+        self.hf_g = 1.0;
+        self.lp = 0.0;
+    }
 }
 
 pub struct Graph {
@@ -238,12 +478,145 @@ pub struct Graph {
     pub patches: Arc<Vec<Patch>>,
     pub slots: Vec<Slot>,
     pub procs: Vec<BoxedProcessor>,
+    /// Identity of the bus processors (place / shelter / room): kept when unchanged.
+    pub procs_key: u64,
+    pub ref_pose: RefPose,
 }
 
 impl Graph {
     pub fn empty() -> Graph {
-        Graph { rng: RngFactory::new(0), scene: Arc::new(Scene::default()), patches: Arc::new(Vec::new()), slots: Vec::new(), procs: Vec::new() }
+        Graph {
+            rng: RngFactory::new(0),
+            scene: Arc::new(Scene::default()),
+            patches: Arc::new(Vec::new()),
+            slots: Vec::new(),
+            procs: Vec::new(),
+            procs_key: 0,
+            ref_pose: RefPose::default(),
+        }
     }
+}
+
+fn discard_procs(p: Vec<BoxedProcessor>) {
+    if !p.is_empty() {
+        drop_later(p);
+    }
+}
+
+/// Drop `x` on a background worker (voices can own large buffers; never free them on the
+/// render thread).
+fn drop_later<T: Send + 'static>(x: T) {
+    background(move || drop(x));
+}
+
+/// Numbers of the scene's weather are live parameters (they glide through `Weather`), so they
+/// are not part of a voice's identity; strings and flags are.
+fn strip_numbers(v: &mut Value) {
+    match v {
+        Value::Number(_) => *v = Value::Null,
+        Value::Array(a) => a.iter_mut().for_each(strip_numbers),
+        Value::Object(m) => m.values_mut().for_each(strip_numbers),
+        _ => {}
+    }
+}
+
+/// Hash of everything in the scene that shapes voices besides the patches: precipitation
+/// kind and texture settings, place (without its objects and live fields), listener height,
+/// mode, seed, quality. Weather numbers and the objects are not in it.
+pub fn scene_struct_hash(scene: &Scene) -> u64 {
+    let mut v = scene.raw.clone();
+    if let Value::Object(m) = &mut v {
+        m.remove("name");
+        m.remove("overrides");
+        if let Some(w) = m.get_mut("weather") {
+            strip_numbers(w);
+        }
+        if let Some(Value::Object(p)) = m.get_mut("place") {
+            for k in ["objects", "window_open", "aftermath_tau_min"] {
+                p.remove(k);
+            }
+        }
+        if let Some(l) = m.get_mut("listener") {
+            let h = l.get("height_m").cloned().unwrap_or(Value::Null);
+            *l = Value::Object([("height_m".to_string(), h)].into_iter().collect());
+        }
+        if let Some(r) = m.get_mut("render") {
+            let q = r.get("quality").cloned().unwrap_or(Value::Null);
+            *r = Value::Object([("quality".to_string(), q)].into_iter().collect());
+        }
+        if let Some(Value::Object(vb)) = m.get_mut("vibe") {
+            for k in ["intensity", "closeness", "wildness", "volume_db"] {
+                vb.remove(k);
+            }
+        }
+    }
+    hash_str(&serde_json::to_string(&v).unwrap_or_default())
+}
+
+/// Identity of a patch for its voices: everything but where it is (moving keeps the voice).
+fn patch_hash(p: &Patch) -> u64 {
+    let mut params = p.params.clone();
+    if let Value::Object(m) = &mut params {
+        m.remove("world_position");
+        m.remove("upwind_m");
+    }
+    let mut h = combine(hash_str(&p.id), hash_str(p.kind.name()));
+    h = combine(h, hash_str(&p.material));
+    h = combine(h, p.interior as u64);
+    combine(h, hash_str(&serde_json::to_string(&params).unwrap_or_default()))
+}
+
+/// The patch a voice renders, from the voice naming convention (rain/<id>, drip/<id>/<k>,
+/// gutter/<id>, hail/<id>, snow/<id>, vegetation.<id>, aeolian.<id>).
+fn patch_of<'p>(name: &str, by_id: &HashMap<&str, &'p Patch>) -> Option<&'p Patch> {
+    for pre in ["rain/", "hail/", "snow/", "gutter/", "vegetation.", "aeolian."] {
+        if let Some(id) = name.strip_prefix(pre) {
+            return by_id.get(id).copied();
+        }
+    }
+    if let Some(rest) = name.strip_prefix("drip/") {
+        if let Some(p) = by_id.get(rest) {
+            return Some(p);
+        }
+        if let Some(i) = rest.rfind('/') {
+            return by_id.get(&rest[..i]).copied();
+        }
+    }
+    None
+}
+
+/// Ground rings, the listener's own shelter and interior surfaces travel with the listener.
+pub fn listener_attached(p: &Patch) -> bool {
+    p.interior
+        || p.param_bool("ground", false)
+        || p.param_bool("listener_attached", false)
+        || p.id.starts_with("shelter.")
+}
+
+fn anchor_for(p: &Patch, rp: &RefPose) -> Option<Anchor> {
+    if listener_attached(p) {
+        return None;
+    }
+    let world = match p.params.get("world_position") {
+        Some(Value::Array(a)) if a.len() >= 3 && a.iter().all(|x| x.as_f64().map(|v| v.is_finite()).unwrap_or(false)) => {
+            [a[0].as_f64().unwrap() as f32, a[1].as_f64().unwrap() as f32, a[2].as_f64().unwrap() as f32]
+        }
+        _ => {
+            let w = rp.to_world(p.position);
+            let e = rp.ears();
+            [w[0] + e[0], w[1] + e[1], w[2] + e[2]]
+        }
+    };
+    let e = rp.ears();
+    let w_ref = rp.to_frame([world[0] - e[0], world[1] - e[1], world[2] - e[2]]);
+    Some(Anchor {
+        w_ref,
+        p_build: p.position,
+        d_ref: p.distance(),
+        rad: (p.area_m2.max(0.0) / std::f32::consts::PI).sqrt().min(20.0),
+        amp_build: (p.area_m2.max(0.0) * p.exposure.max(0.0)).sqrt(),
+        gain_mul: 1.0,
+    })
 }
 
 /// Build the voice graph of a scene: rain voices first, then environment voices (fixed order).
@@ -258,8 +631,28 @@ pub fn build_graph(scene: Scene, patches: Vec<Patch>, materials: &MaterialTable,
         procs.push(Box::new(space));
     }
     procs.extend(crate::env::build_bus_processors(&scene, &patches, materials, cfg));
-    let slots = voices.into_iter().map(|v| Slot::new(v, cfg.block)).collect();
-    Graph { rng: cfg.rng, scene: Arc::new(scene), patches: Arc::new(patches), slots, procs }
+    let rp = RefPose::of(&scene);
+    let base = combine(scene_struct_hash(&scene), rp.hash());
+    let base = combine(base, cfg.seed);
+    let by_id: HashMap<&str, &Patch> = patches.iter().map(|p| (p.id.as_str(), p)).collect();
+    let mut seen: HashMap<String, u64> = HashMap::new();
+    let slots = voices
+        .into_iter()
+        .map(|v| {
+            let mut s = Slot::new(v, cfg.block);
+            let name = s.voice.name().to_string();
+            let occ = seen.entry(name.clone()).or_insert(0);
+            *occ += 1;
+            let mut key = combine(combine(hash_str(&name), *occ), base);
+            if let Some(p) = patch_of(&name, &by_id) {
+                key = combine(key, patch_hash(p));
+                s.anchor = anchor_for(p, &rp);
+            }
+            s.key = key;
+            s
+        })
+        .collect();
+    Graph { rng: cfg.rng, scene: Arc::new(scene), patches: Arc::new(patches), slots, procs, procs_key: base, ref_pose: rp }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +758,10 @@ pub enum Command {
     Materials(Arc<MaterialTable>),
     Decorrelators(Vec<Vec<f32>>),
     AddVoice(BoxedVoice),
+    /// Manual lightning strike (flash now, thunder at distance / c).
+    Strike(Strike),
+    /// Move the scene clock to t (s) without touching the voices.
+    Seek(f64),
     Reset,
 }
 
@@ -435,6 +832,14 @@ pub struct Stats {
     pub dead_voices: usize,
     pub gain_reduction_db: f32,
     pub max_gain_reduction_db: f32,
+    /// Voices built and faded in by scene updates after the first graph (0 = nothing rebuilt).
+    pub voice_rebuilds: u64,
+    /// Voices kept running across scene updates.
+    pub voices_kept: u64,
+    /// Scene updates applied after the first graph.
+    pub graph_updates: u64,
+    /// Bus processor (place / shelter) crossfades.
+    pub processor_swaps: u64,
 }
 
 pub struct Core {
@@ -480,6 +885,34 @@ pub struct Core {
     /// Slowest block since the last reset (ms) and blocks slower than 75 % of real time.
     pub max_cpu_ms: f64,
     pub slow_blocks: u64,
+    /// Live listener pose (set from any thread) and its smoothed value (x, y, z, heading, pitch).
+    pub pose: Arc<ListenerPose>,
+    smooth: Option<[f64; 5]>,
+    ref_pose: RefPose,
+    pose_ctx: PoseCtx,
+    rot_prev: [[f32; N_AMBI]; N_AMBI],
+    rot_identity: bool,
+    rot_scratch: Vec<f32>,
+    ramp: Vec<f32>,
+    procs_key: u64,
+    procs_old: Vec<BoxedProcessor>,
+    procs_u: f32,
+    buses_alt: StemBuses,
+    strikes: Vec<Strike>,
+    /// Scene time minus render time (s), moved by `Seek`.
+    pub time_offset: f64,
+    voice_rebuilds: u64,
+    voices_kept: u64,
+    graph_updates: u64,
+    processor_swaps: u64,
+}
+
+fn identity16() -> [[f32; N_AMBI]; N_AMBI] {
+    let mut r = [[0.0f32; N_AMBI]; N_AMBI];
+    for (k, row) in r.iter_mut().enumerate() {
+        row[k] = 1.0;
+    }
+    r
 }
 
 pub const STAGES: [&str; 5] = ["voices", "encode", "finish", "processors", "decode_limit"];
@@ -548,6 +981,24 @@ impl Core {
             stage_ms: [0.0; 5],
             max_cpu_ms: 0.0,
             slow_blocks: 0,
+            pose: Arc::new(ListenerPose::default()),
+            smooth: None,
+            ref_pose: RefPose::default(),
+            pose_ctx: PoseCtx::default(),
+            rot_prev: identity16(),
+            rot_identity: true,
+            rot_scratch: vec![0.0; N_AMBI * n],
+            ramp: (1..=n).map(|i| i as f32 / n as f32).collect(),
+            procs_key: 0,
+            procs_old: Vec::new(),
+            procs_u: 1.0,
+            buses_alt: StemBuses::new(n),
+            strikes: Vec::with_capacity(8),
+            time_offset: 0.0,
+            voice_rebuilds: 0,
+            voices_kept: 0,
+            graph_updates: 0,
+            processor_swaps: 0,
         }
     }
 
@@ -577,27 +1028,7 @@ impl Core {
                 self.weather = w;
                 self.weather_changed = true;
             }
-            Command::Graph(g) => {
-                let g = *g;
-                let crossfade = !self.slots.is_empty() && self.block_index > 0;
-                let mut old = std::mem::take(&mut self.slots);
-                self.fading.clear();
-                if crossfade {
-                    for s in &mut old {
-                        s.fade = (1.0, 0.0);
-                    }
-                    self.fading = old;
-                }
-                self.slots = g.slots;
-                for s in &mut self.slots {
-                    s.fade = if crossfade { (0.0, 1.0) } else { (1.0, 1.0) };
-                }
-                self.procs = g.procs;
-                self.rngf = g.rng;
-                self.seed = g.rng.root_seed;
-                self.scene = g.scene;
-                self.patches = g.patches;
-            }
+            Command::Graph(g) => self.apply_graph(*g),
             Command::Output { decoder } => {
                 let ch_changed = decoder.channels() != self.decoder.channels();
                 let new_lat = decoder.latency();
@@ -631,9 +1062,105 @@ impl Core {
                 self.weather.resolve(&self.materials);
             }
             Command::Decorrelators(firs) => self.encoder.set_decorrelators(firs),
-            Command::AddVoice(v) => self.slots.push(Slot::new(v, self.n)),
+            Command::AddVoice(v) => {
+                let mut s = Slot::new(v, self.n);
+                s.key = combine(s.key, self.block_index ^ 0xADD5);
+                self.slots.push(s)
+            }
+            Command::Strike(st) => self.strikes.push(st),
+            Command::Seek(t) => {
+                if t.is_finite() {
+                    self.time_offset = t - self.block_index as f64 * self.n as f64 / self.sr as f64;
+                }
+            }
             Command::Reset => self.reset(),
         }
+    }
+
+    /// Install a new graph. Before the first block it simply replaces the old one; while
+    /// playing it is diffed against the running graph by voice key: matching voices keep
+    /// running (state, phase, tails) and only take the new anchor (moved objects) and gain,
+    /// added voices fade in and removed ones fade out over VOICE_FADE_S. Bus processors are
+    /// kept when their key is unchanged, else crossfaded.
+    fn apply_graph(&mut self, g: Graph) {
+        let Graph { rng, scene, patches, slots: new_slots, procs, procs_key, ref_pose } = g;
+        self.rngf = rng;
+        self.seed = rng.root_seed;
+        self.scene = scene;
+        self.patches = patches;
+        self.ref_pose = ref_pose;
+        let live = self.block_index > 0 && !(self.slots.is_empty() && self.fading.is_empty() && self.procs.is_empty());
+        if !live {
+            let old = std::mem::replace(&mut self.slots, new_slots);
+            let old_fading = std::mem::take(&mut self.fading);
+            let old_procs = std::mem::replace(&mut self.procs, procs);
+            let old_po = std::mem::take(&mut self.procs_old);
+            drop_later((old, old_fading, old_procs, old_po));
+            self.procs_key = procs_key;
+            self.procs_u = 1.0;
+            for s in &mut self.slots {
+                s.fade_u = 1.0;
+                s.fade_dir = 0;
+            }
+            return;
+        }
+        self.graph_updates += 1;
+        let mut old: HashMap<u64, Slot> = HashMap::with_capacity(self.slots.len() + self.fading.len());
+        let mut extra: Vec<Slot> = Vec::new();
+        for s in std::mem::take(&mut self.slots).into_iter().chain(std::mem::take(&mut self.fading)) {
+            if let Some(prev) = old.insert(s.key, s) {
+                extra.push(prev);
+            }
+        }
+        let mut slots = Vec::with_capacity(new_slots.len());
+        let mut discard = Vec::new();
+        let mut kept = 0u64;
+        for ns in new_slots {
+            match old.remove(&ns.key) {
+                Some(mut os) => {
+                    if let (Some(oa), Some(na)) = (os.anchor.as_mut(), ns.anchor.as_ref()) {
+                        oa.w_ref = na.w_ref;
+                        oa.gain_mul = if oa.amp_build > 1e-9 { (na.amp_build / oa.amp_build).clamp(0.0, 4.0) } else { 1.0 };
+                    }
+                    if os.fade_dir < 0 || os.fade_u < 1.0 {
+                        os.fade_dir = 1;
+                    }
+                    kept += 1;
+                    slots.push(os);
+                    discard.push(ns);
+                }
+                None => {
+                    let mut ns = ns;
+                    ns.fade_u = 0.0;
+                    ns.fade_dir = 1;
+                    self.voice_rebuilds += 1;
+                    slots.push(ns);
+                }
+            }
+        }
+        self.voices_kept = kept;
+        self.slots = slots;
+        let mut fading: Vec<Slot> = old.into_values().collect();
+        fading.sort_by_key(|s| s.key);
+        for s in &mut fading {
+            s.fade_dir = -1;
+        }
+        fading.extend(extra.into_iter().map(|mut s| {
+            s.fade_dir = -1;
+            s
+        }));
+        self.fading = fading;
+        if procs_key == self.procs_key {
+            discard_procs(procs);
+        } else {
+            self.processor_swaps += 1;
+            let prev = std::mem::replace(&mut self.procs, procs);
+            let older = std::mem::replace(&mut self.procs_old, prev);
+            discard_procs(older);
+            self.procs_key = procs_key;
+            self.procs_u = 0.0;
+        }
+        drop_later(discard);
     }
 
     /// Back to t = 0: block index, every voice, the encoder, decoder, limiter and FIFOs.
@@ -643,16 +1170,23 @@ impl Core {
         self.max_cpu_ms = 0.0;
         self.slow_blocks = 0;
         self.frames_out = 0;
-        self.fading.clear();
+        let f = std::mem::take(&mut self.fading);
+        drop_later(f);
         for s in &mut self.slots {
             s.voice.reset();
-            s.enc = SourceState::default();
-            s.dead = false;
-            s.fade = (1.0, 1.0);
+            s.reset_live();
         }
         for p in &mut self.procs {
             p.reset();
         }
+        discard_procs(std::mem::take(&mut self.procs_old));
+        self.procs_u = 1.0;
+        self.smooth = None;
+        self.pose_ctx = PoseCtx::default();
+        self.rot_prev = identity16();
+        self.rot_identity = true;
+        self.strikes.clear();
+        self.time_offset = 0.0;
         self.encoder.reset();
         self.decoder.reset();
         self.limiter.reset();
@@ -664,14 +1198,98 @@ impl Core {
         self.weather_changed = true;
     }
 
+    /// Smooth the live pose toward its target (~50 ms one-pole, shortest arc for the heading)
+    /// and express it relative to the graph's reference pose.
+    fn update_pose(&mut self) {
+        let rp = self.ref_pose;
+        let target = match self.pose.get() {
+            Some(v) if v.iter().all(|x| x.is_finite()) => v,
+            _ => {
+                // no live pose: the scene's listener, exactly (offline renders stay bit-exact)
+                self.smooth = None;
+                self.pose_ctx = PoseCtx::default();
+                return;
+            }
+        };
+        let t = [target[0] as f64, target[1] as f64, target[2] as f64, target[3] as f64, target[4].clamp(-90.0, 90.0) as f64];
+        let sm = match self.smooth.as_mut() {
+            None => {
+                self.smooth = Some(t);
+                self.smooth.as_mut().unwrap()
+            }
+            Some(sm) => {
+                let a = 1.0 - (-(self.n as f64 / self.sr as f64) / POSE_TAU_S).exp();
+                for k in [0, 1, 2, 4] {
+                    sm[k] += a * (t[k] - sm[k]);
+                }
+                let dh = (t[3] - sm[3] + 540.0).rem_euclid(360.0) - 180.0;
+                sm[3] = (sm[3] + a * dh).rem_euclid(360.0);
+                sm
+            }
+        };
+        let e = rp.ears();
+        let d = [sm[0] as f32 - rp.pos[0], sm[1] as f32 - rp.pos[1], (sm[2] as f32 + rp.height_m) - e[2]];
+        let delta = rp.to_frame(d);
+        let dheading = (((sm[3] - rp.heading_deg as f64 + 540.0).rem_euclid(360.0)) - 180.0).to_radians() as f32;
+        let pitch = sm[4].to_radians() as f32;
+        let moved = delta.iter().any(|v| v.abs() > 1e-4);
+        let air = if moved {
+            let w = &self.weather;
+            crate::rain::air::iso9613_alpha_db_per_m(8000.0, w.temperature_c as f64, w.humidity_pct as f64, w.pressure_hpa as f64)
+                as f32
+        } else {
+            0.0
+        };
+        self.pose_ctx = PoseCtx { delta, air_db_per_m: air, dheading, pitch };
+    }
+
+    /// Rotate the summed SH field for the listener's head turn / pitch (matrix interpolated
+    /// across the block; yaw-only matrices are sparse, so only their non-zero terms run).
+    fn rotate_mix(&mut self) {
+        let (yaw, pitch) = (self.pose_ctx.dheading, self.pose_ctx.pitch);
+        let still = yaw.abs() < 1e-6 && pitch.abs() < 1e-6;
+        if still && self.rot_identity {
+            return;
+        }
+        let r1 = if still { identity16() } else { listener_rotation(yaw, pitch) };
+        let n = self.n;
+        self.rot_scratch.copy_from_slice(&self.mix_bus[..N_AMBI * n]);
+        let r0 = self.rot_prev;
+        for i in 0..N_AMBI {
+            let out = &mut self.mix_bus[i * n..(i + 1) * n];
+            out.iter_mut().for_each(|v| *v = 0.0);
+            for j in 0..N_AMBI {
+                let a = r0[i][j];
+                let d = r1[i][j] - a;
+                if a == 0.0 && d == 0.0 {
+                    continue;
+                }
+                let x = &self.rot_scratch[j * n..(j + 1) * n];
+                if d == 0.0 {
+                    for (o, v) in out.iter_mut().zip(x) {
+                        *o += a * *v;
+                    }
+                } else {
+                    for ((o, v), r) in out.iter_mut().zip(x).zip(&self.ramp) {
+                        *o += (a + d * *r) * *v;
+                    }
+                }
+            }
+        }
+        self.rot_prev = r1;
+        self.rot_identity = still;
+    }
+
     /// Render one block into `out_block` (channels x n) and, if `stems`, leave the per-stem SH
     /// buses in `self.buses`.
     pub fn render_block(&mut self) {
         let started = Instant::now();
         self.drain_commands();
+        self.update_pose();
         let n = self.n;
         let sr = self.sr;
         let t0 = self.block_index as f64 * n as f64 / sr as f64;
+        let fade_step = (n as f32 / sr as f32) / VOICE_FADE_S;
 
         // split borrows: the context reads these fields while the slots are rendered
         let Core {
@@ -685,10 +1303,16 @@ impl Core {
             slots,
             fading,
             procs,
+            procs_old,
+            procs_u,
+            buses_alt,
             encoder,
             buses,
             stem_gain,
             block_index,
+            strikes,
+            pose_ctx,
+            ramp,
             ..
         } = self;
         let ctx = BlockCtx {
@@ -706,11 +1330,13 @@ impl Core {
             scene: &**scene,
             materials: &**materials,
             markers: &*sink,
+            strikes: &strikes[..],
         };
+        let pose = *pose_ctx;
 
         let mut marks = [Instant::now(); 6];
         pool.install(|| {
-            slots.par_iter_mut().chain(fading.par_iter_mut()).for_each(|s| s.render(&ctx));
+            slots.par_iter_mut().chain(fading.par_iter_mut()).for_each(|s| s.render(&ctx, &pose));
         });
         marks[1] = Instant::now();
 
@@ -718,10 +1344,13 @@ impl Core {
         buses.clear();
         encoder.begin_block();
         for s in slots.iter_mut().chain(fading.iter_mut()) {
+            let u0 = s.fade_u;
+            let u1 = (u0 + s.fade_dir as f32 * fade_step).clamp(0.0, 1.0);
+            s.fade_u = u1;
             if !s.meta.active {
                 continue;
             }
-            let (g0, g1) = s.fade;
+            let (g0, g1) = (fade_gain(u0), fade_gain(u1));
             let bus = buses.bus_mut(s.meta.stem);
             if s.channels == N_AMBI {
                 encoder.add_ambisonic(bus, &s.buf, g0, g1);
@@ -730,9 +1359,15 @@ impl Core {
             }
         }
         for s in slots.iter_mut() {
-            s.fade = (1.0, 1.0);
+            if s.fade_dir > 0 && s.fade_u >= 1.0 {
+                s.fade_dir = 0;
+            }
         }
-        fading.clear();
+        if fading.iter().any(|s| s.fade_u <= 0.0) {
+            let (done, keep): (Vec<Slot>, Vec<Slot>) = std::mem::take(fading).into_iter().partition(|s| s.fade_u <= 0.0);
+            *fading = keep;
+            drop_later(done);
+        }
         marks[2] = Instant::now();
         pool.install(|| encoder.finish_block(buses));
         marks[3] = Instant::now();
@@ -742,7 +1377,16 @@ impl Core {
                 buses.scale_stem(crate::types::Stem::from_index(i), *g);
             }
         }
+        let xfade = *procs_u < 1.0;
+        if xfade {
+            buses_alt.data.copy_from_slice(&buses.data);
+        }
         pool.install(|| {
+            if xfade {
+                for p in procs_old.iter_mut() {
+                    let _ = catch_unwind(AssertUnwindSafe(|| p.process(&ctx, buses_alt)));
+                }
+            }
             for p in procs.iter_mut() {
                 let r = catch_unwind(AssertUnwindSafe(|| p.process(&ctx, buses)));
                 if r.is_err() {
@@ -750,11 +1394,29 @@ impl Core {
                 }
             }
         });
+        if xfade {
+            // equal-power crossfade from the old place / shelter processors to the new ones
+            let u0 = *procs_u;
+            let u1 = (u0 + fade_step).min(1.0);
+            let (n0, n1) = (fade_gain(u0), fade_gain(u1));
+            let (o0, o1) = (fade_gain(1.0 - u0), fade_gain(1.0 - u1));
+            for (nb, ob) in buses.data.chunks_mut(n).zip(buses_alt.data.chunks(n)) {
+                for ((v, w), r) in nb.iter_mut().zip(ob).zip(ramp.iter()) {
+                    *v = *v * (n0 + (n1 - n0) * *r) + *w * (o0 + (o1 - o0) * *r);
+                }
+            }
+            *procs_u = u1;
+            if u1 >= 1.0 {
+                discard_procs(std::mem::take(procs_old));
+            }
+        }
         drop(ctx);
+        strikes.clear();
         marks[4] = Instant::now();
 
-        // mix, decode, gain, limiter
+        // mix, rotate for the head, decode, gain, limiter
         self.buses.sum_into(&mut self.mix_bus);
+        self.rotate_mix();
         self.decoder.process(&self.mix_bus, &mut self.out_block);
         let ch = self.decoder.channels();
         let (g0, g1) = (self.gain, self.gain_target);
@@ -778,7 +1440,7 @@ impl Core {
             *v = if *v == 0.0 { ms } else { 0.95 * *v + 0.05 * ms };
         }
 
-        // markers (sorted for determinism)
+        // markers (sorted for determinism), on the scene clock
         self.block_markers.clear();
         self.sink.drain_into(&mut self.block_markers);
         if !self.block_markers.is_empty() {
@@ -788,6 +1450,11 @@ impl Core {
                     .then(a.kind.cmp(b.kind))
                     .then(a.data.cmp(&b.data))
             });
+            if self.time_offset != 0.0 {
+                for m in &mut self.block_markers {
+                    m.t += self.time_offset;
+                }
+            }
             let room = MAX_MARKERS.saturating_sub(self.markers.len());
             if room < self.block_markers.len() {
                 let excess = self.block_markers.len() - room;
@@ -891,6 +1558,26 @@ impl Core {
             dead_voices: dead,
             gain_reduction_db: self.limiter.gain_reduction_db,
             max_gain_reduction_db: self.limiter.max_gain_reduction_db,
+            voice_rebuilds: self.voice_rebuilds,
+            voices_kept: self.voices_kept,
+            graph_updates: self.graph_updates,
+            processor_swaps: self.processor_swaps,
+        }
+    }
+
+    /// Scene time (s) at the start of the next block.
+    pub fn scene_time(&self) -> f64 {
+        self.block_index as f64 * self.n as f64 / self.sr as f64 + self.time_offset
+    }
+
+    /// The smoothed live pose (x, y, z, heading, pitch), or the scene listener's.
+    pub fn listener_now(&self) -> [f64; 5] {
+        match self.smooth {
+            Some(v) => v,
+            None => {
+                let r = self.ref_pose;
+                [r.pos[0] as f64, r.pos[1] as f64, r.pos[2] as f64, r.heading_deg as f64, 0.0]
+            }
         }
     }
 

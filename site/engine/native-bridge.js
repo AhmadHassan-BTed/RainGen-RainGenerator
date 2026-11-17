@@ -7,15 +7,34 @@
  * 'caption', 'meter', 'state', ...). The sound comes from the Python process, so no AudioContext,
  * no worklets and no autoplay unlock are involved.
  *
- * Live calls (params, listener, objects, volume) are coalesced per path and sent at most every
- * 50 ms (20 Hz) in one ordered batch; requests are serialized so a scene never overtakes a later
- * parameter.
+ * Traffic is shaped so live use never stalls the engine:
+ * - parameters, volume and render mode are coalesced per path and sent at most every 50 ms
+ *   (20 Hz) in one ordered batch; batches are serialized so a scene never overtakes a later
+ *   parameter;
+ * - object edits (each one is a structural change on the server) go at most 5 times a second,
+ *   latest state per object wins; `commit()` sends them at once (end of a drag);
+ * - the listener pose has its own lane, /native/listener at most 30 times a second, latest pose
+ *   wins, one request in flight; it never rides with a scene or an object;
+ * - seeks have their own lane too (/native/seek, latest time wins), so scrubbing stays smooth.
  */
 
 const FLUSH_MS = 50;
+const OBJECT_MS = 200;
+const LISTENER_MS = 34;                    // <= 30 Hz even with timer jitter
+const SEEK_MS = 80;
+const STRIKE_FLASH_WAIT_MS = 600;
 
 function clone(v) {
   return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+}
+
+function finite(...vals) {
+  for (const v of vals) {
+    if (v === null || v === undefined || v === '') continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
 }
 
 function setPath(obj, path, value) {
@@ -38,6 +57,75 @@ function setPath(obj, path, value) {
   return true;
 }
 
+function emptyQueue(objects = new Map()) {
+  return { scene: null, params: new Map(), objects, volume: null, renderMode: null };
+}
+
+/**
+ * One latest-wins request lane: at most one request in flight, at most one every `minMs`; the
+ * body is built when it is sent, so a burst of pushes costs one request with the newest state.
+ */
+class Lane {
+  constructor(bridge, path, minMs) {
+    this.bridge = bridge;
+    this.path = path;
+    this.minMs = minMs;
+    this.build = null;
+    this.timer = 0;
+    this.busy = false;
+    this.last = -Infinity;
+    this.warned = false;
+  }
+
+  push(build) {
+    this.build = build;
+    this._kick();
+  }
+
+  _kick() {
+    if (this.timer || this.busy || !this.build || !this.bridge._started) return;
+    const wait = Math.max(0, this.minMs - (performance.now() - this.last));
+    this.timer = setTimeout(() => {
+      this.timer = 0;
+      this._send();
+    }, wait);
+  }
+
+  _send() {
+    const build = this.build;
+    if (!build || !this.bridge._started) return;
+    this.build = null;
+    this.busy = true;
+    this.last = performance.now();
+    let body;
+    try {
+      body = build();
+    } catch (_) {
+      body = null;
+    }
+    if (!body) {
+      this.busy = false;
+      return;
+    }
+    this.bridge._post(this.path, body)
+      .then(() => { this.warned = false; })
+      .catch((err) => {
+        if (!this.warned) console.warn(`[NativeBridge] ${this.path} failed:`, err && err.message ? err.message : err);
+        this.warned = true;
+      })
+      .finally(() => {
+        this.busy = false;
+        this._kick();
+      });
+  }
+
+  cancel() {
+    clearTimeout(this.timer);
+    this.timer = 0;
+    this.build = null;
+  }
+}
+
 export class NativeBridge {
   /** opts: { base: '' (same origin), hello: the /native/hello reply if already fetched } */
   constructor(opts = {}) {
@@ -54,11 +142,20 @@ export class NativeBridge {
     this._t = 0;
     this._safety = { maxFlashesPerSec: 3 };
     this._flashTimes = [];
-    this._pending = { scene: null, params: new Map(), objects: new Map(), listener: null, volume: null, renderMode: null };
+    this._lastFlashAt = -Infinity;
+    this._pending = emptyQueue();
     this._flushTimer = 0;
+    this._flushAt = 0;
     this._lastFlush = 0;
+    this._lastObjects = -Infinity;
+    this._objectsNow = false;
     this._chain = Promise.resolve();
     this._stats = null;
+    // the live listener pose (its own 30 Hz lane) and a counter that says it moved
+    this._pose = null;
+    this._poseSeq = 0;
+    this._listenerLane = new Lane(this, '/native/listener', LISTENER_MS);
+    this._seekLane = new Lane(this, '/native/seek', SEEK_MS);
   }
 
   /** GET /native/hello: the server's reply, or null when the page is not served by raingen studio. */
@@ -134,6 +231,22 @@ export class NativeBridge {
     }
   }
 
+  /** Photosensitive safety (WCAG 2.3.1): at most maxFlashesPerSec full flashes per second. */
+  _onFlash(d) {
+    const now = performance.now();
+    this._lastFlashAt = now;
+    this._flashTimes = this._flashTimes.filter((t) => now - t < 1000);
+    const cap = this._safety.maxFlashesPerSec;
+    const ev = { ...d, limited: false };
+    if (this._flashTimes.length >= cap) {
+      ev.limited = true;
+      ev.brightness = Math.min(Number(ev.brightness) || 1, 0.35);
+    } else {
+      this._flashTimes.push(now);
+    }
+    this._emit('flash', ev);
+  }
+
   _openEvents() {
     if (this._es || typeof EventSource !== 'function') return;
     const es = new EventSource(`${this.base}/native/events`);
@@ -163,20 +276,7 @@ export class NativeBridge {
     es.addEventListener('marker', json((d) => this._emit('marker', d)));
     es.addEventListener('render', json((d) => this._emit('render', d)));
     es.addEventListener('engine-error', json((d) => this._emit('error', d)));
-    es.addEventListener('flash', json((d) => {
-      // photosensitive safety (WCAG 2.3.1): at most maxFlashesPerSec full flashes per second
-      const now = performance.now();
-      this._flashTimes = this._flashTimes.filter((t) => now - t < 1000);
-      const cap = this._safety.maxFlashesPerSec;
-      const ev = { ...d, limited: false };
-      if (this._flashTimes.length >= cap) {
-        ev.limited = true;
-        ev.brightness = Math.min(Number(ev.brightness) || 1, 0.35);
-      } else {
-        this._flashTimes.push(now);
-      }
-      this._emit('flash', ev);
-    }));
+    es.addEventListener('flash', json((d) => this._onFlash(d)));
     es.addEventListener('state', json((d) => {
       if (d.state === 'stopped' && this._started) {
         this._started = false;
@@ -236,32 +336,76 @@ export class NativeBridge {
 
   _hasPending() {
     const q = this._pending;
-    return !!(q.scene || q.params.size || q.objects.size || q.listener || q.volume || q.renderMode);
+    return !!(q.scene || q.params.size || q.objects.size || q.volume || q.renderMode);
   }
 
-  _scheduleFlush() {
-    if (!this._started || this._flushTimer) return;
-    const wait = Math.max(0, FLUSH_MS - (performance.now() - this._lastFlush));
+  /** Flush after `wait` ms (default: the 20 Hz batch rate); an earlier request moves the timer up. */
+  _scheduleFlush(wait = Math.max(0, FLUSH_MS - (performance.now() - this._lastFlush))) {
+    if (!this._started) return;
+    const at = performance.now() + Math.max(0, wait);
+    if (this._flushTimer) {
+      if (at >= this._flushAt - 1) return;
+      clearTimeout(this._flushTimer);
+    }
+    this._flushAt = at;
     this._flushTimer = setTimeout(() => {
       this._flushTimer = 0;
       this._flush();
-    }, wait);
+    }, Math.max(0, wait));
   }
 
   _flush() {
     if (!this._started || !this._hasPending()) return this._chain;
     const q = this._pending;
+    const now = performance.now();
+    // object edits rebuild voices on the server: at most every OBJECT_MS, unless a scene goes too
+    const objectsDue = q.objects.size > 0 && (!!q.scene || this._objectsNow || now - this._lastObjects >= OBJECT_MS);
     const body = {};
-    if (q.scene) body.scene = q.scene;
+    if (q.scene) {
+      body.scene = q.scene;
+      this._poseIntoScene(body.scene);
+    }
     if (q.renderMode) body.renderMode = q.renderMode;
-    if (q.objects.size) body.objects = [...q.objects.values()];
+    if (objectsDue) {
+      body.objects = [...q.objects.values()];
+      this._lastObjects = now;
+    }
     if (q.params.size) body.params = [...q.params.entries()].map(([path, v]) => ({ path, value: v.value, ramp: v.ramp }));
-    if (q.listener) body.listener = q.listener;
     if (q.volume) body.volume = q.volume;
+    const held = objectsDue ? new Map() : q.objects;
+    this._pending = emptyQueue(held);
+    this._objectsNow = false;
+    if (held.size) this._scheduleFlush(OBJECT_MS - (now - this._lastObjects));
+    if (!Object.keys(body).length) return this._chain;
     body.t = this._t;
-    this._pending = { scene: null, params: new Map(), objects: new Map(), listener: null, volume: null, renderMode: null };
-    this._lastFlush = performance.now();
-    return this._enqueue('/native/batch', body);
+    this._lastFlush = now;
+    const p = this._enqueue('/native/batch', body);
+    if (body.scene) {
+      // the scene carried the pose of this moment; a pose that moved on since goes again after it
+      const seq = this._poseSeq;
+      p.then(() => {
+        if (this._poseSeq !== seq) this._pushPose();
+      }, () => {});
+    }
+    return p;
+  }
+
+  /** A scene sent to the server carries the live listener pose, not the store's last copy. */
+  _poseIntoScene(scene) {
+    const P = this._pose;
+    if (!P || !scene || typeof scene !== 'object') return;
+    const L = scene.listener && typeof scene.listener === 'object' ? scene.listener : (scene.listener = {});
+    if (P.position) L.position = P.position.slice();
+    if (P.headingDeg !== undefined) L.heading_deg = P.headingDeg;
+  }
+
+  /** Send the queued edits now (objects included), e.g. at the end of a drag. */
+  commit() {
+    if (!this._started) return this._chain;
+    clearTimeout(this._flushTimer);
+    this._flushTimer = 0;
+    this._objectsNow = true;
+    return this._flush();
   }
 
   /* ---------------- lifecycle */
@@ -283,13 +427,15 @@ export class NativeBridge {
     this._suspended = false;
     this._dead = false;
     // anything queued before start is already in the scene the server started with
-    this._pending = { scene: null, params: new Map(), objects: new Map(), listener: null, volume: null, renderMode: null };
+    this._pending = emptyQueue();
     this._emit('state', { state: 'running' });
   }
 
   stop() {
     clearTimeout(this._flushTimer);
     this._flushTimer = 0;
+    this._listenerLane.cancel();
+    this._seekLane.cancel();
     this._started = false;
     this._suspended = false;
     this._enqueue('/native/stop', {});
@@ -299,7 +445,7 @@ export class NativeBridge {
   async suspend() {
     if (!this._started || this._suspended) return;
     this._suspended = true;
-    await this._flush();
+    await this.commit();
     await this._enqueue('/native/suspend', {}).catch(() => {});
   }
 
@@ -335,20 +481,58 @@ export class NativeBridge {
     return true;
   }
 
+  /**
+   * The live listener pose: its own lane to /native/listener (at most 30 Hz, latest pose wins).
+   * It never goes through a scene or a batch, so moving and turning never rebuild voices.
+   */
   setListener(l = {}) {
     const o = l && typeof l === 'object' ? l : {};
-    const L = this._pending.listener || {};
-    if (Array.isArray(o.position)) L.position = o.position.slice(0, 3).map(Number);
-    if (o.headingDeg !== undefined && Number.isFinite(Number(o.headingDeg))) L.headingDeg = Number(o.headingDeg);
-    if (o.pitchDeg !== undefined && Number.isFinite(Number(o.pitchDeg))) L.pitchDeg = Number(o.pitchDeg);
-    if (o.heightM !== undefined && Number.isFinite(Number(o.heightM))) L.heightM = Number(o.heightM);
+    const P = this._pose ? { ...this._pose } : {};
+    if (Array.isArray(o.position)) {
+      const pos = o.position.slice(0, 3).map(Number);
+      if (pos.length >= 2 && pos.every(Number.isFinite)) {
+        if (pos.length < 3) pos.push(P.position ? P.position[2] : 0);
+        P.position = pos;
+      }
+    }
+    const h = finite(o.headingDeg, o.heading_deg);
+    if (h !== undefined) P.headingDeg = ((h % 360) + 360) % 360;
+    const p = finite(o.pitchDeg, o.pitch_deg);
+    if (p !== undefined) P.pitchDeg = Math.max(-90, Math.min(90, p));
+    const hm = finite(o.heightM, o.height_m);
+    if (hm !== undefined) P.heightM = hm;
+    this._pose = P;
+    this._poseSeq++;
     if (this.scene && this.scene.listener) {
-      if (L.position) this.scene.listener.position = L.position.slice();
-      if (L.headingDeg !== undefined) this.scene.listener.heading_deg = L.headingDeg;
+      if (P.position) this.scene.listener.position = P.position.slice();
+      if (P.headingDeg !== undefined) this.scene.listener.heading_deg = P.headingDeg;
+      if (P.heightM !== undefined) this.scene.listener.height_m = P.heightM;
     }
     if (!this._started) return;
-    this._pending.listener = L;
-    this._scheduleFlush();
+    this._pushPose();
+  }
+
+  _pushPose() {
+    if (!this._pose) return;
+    this._listenerLane.push(() => {
+      const P = this._pose;
+      if (!P) return null;
+      const body = {};
+      if (P.position) body.position = P.position.slice();
+      if (P.headingDeg !== undefined) {
+        body.heading_deg = P.headingDeg;
+        body.headingDeg = P.headingDeg;
+      }
+      if (P.pitchDeg !== undefined) {
+        body.pitch_deg = P.pitchDeg;
+        body.pitchDeg = P.pitchDeg;
+      }
+      if (P.heightM !== undefined) {
+        body.height_m = P.heightM;
+        body.heightM = P.heightM;
+      }
+      return body;
+    });
   }
 
   upsertObject(object) {
@@ -384,6 +568,13 @@ export class NativeBridge {
     this._t = Number.isFinite(t) && t > 0 ? t : 0;
   }
 
+  /** Jump the scene clock to `tSec` without restarting the sound (/native/seek, latest time wins). */
+  seek(tSec) {
+    this.setTime(tSec);
+    if (!this._started) return;
+    this._seekLane.push(() => ({ t: this._t }));
+  }
+
   setMasterGainDb(db) {
     const v = Number(db);
     this._masterDb = Number.isFinite(v) ? Math.max(-120, Math.min(12, v)) : 0;
@@ -404,9 +595,44 @@ export class NativeBridge {
     this._safety.maxFlashesPerSec = Number.isFinite(n) ? Math.max(0, Math.min(3, n)) : 3;
   }
 
-  /** Manual strikes are synthesized by the browser engine only; the native core plays the scene's own storm. */
-  strikeLightning() {
-    return null;
+  /**
+   * A manual strike now (/native/strike): the server plays the crack and the thunder at the right
+   * delay and sends 'flash' and 'thunder' events like any other strike. Resolves to null (the flash
+   * arrives as an event); a server that sends no flash event gets one drawn from its reply.
+   * args: { distanceKm?, bearingDeg?, intensity? }
+   */
+  strikeLightning(args = {}) {
+    if (!this._started) return null;
+    const a = args && typeof args === 'object' ? args : {};
+    const body = {};
+    const km = finite(a.distanceKm, a.distance_km);
+    if (km !== undefined && km > 0) body.distance_km = km;
+    const b = finite(a.bearingDeg, a.bearing_deg);
+    if (b !== undefined) body.bearing_deg = ((b % 360) + 360) % 360;
+    const k = finite(a.intensity);
+    if (k !== undefined) body.intensity = Math.max(0, Math.min(1, k));
+    const sent = performance.now();
+    return this._post('/native/strike', body).then((r) => {
+      setTimeout(() => {
+        if (this._lastFlashAt >= sent || !this._started) return;
+        const f = (r && typeof r.flash === 'object' && r.flash) || r || {};
+        this._onFlash({
+          id: f.id !== undefined && f.id !== null ? String(f.id) : `strike-${Math.round(sent)}`,
+          t: this._t,
+          distanceKm: finite(f.distanceKm, f.distance_km, body.distance_km),
+          bearingDeg: finite(f.bearingDeg, f.bearing_deg, body.bearing_deg),
+          delaySec: finite(f.delaySec, f.flash_to_bang_s, f.delay_s),
+          brightness: 1,
+          channel: null,
+          source: 'native',
+        });
+      }, Math.max(0, STRIKE_FLASH_WAIT_MS - (performance.now() - sent)));
+      return null;
+    }, (err) => {
+      console.warn('[NativeBridge] /native/strike failed:', err && err.message ? err.message : err);
+      this._emit('error', { where: 'strike', message: err && err.message ? err.message : String(err) });
+      return null;
+    });
   }
 
   /* ---------------- offline */

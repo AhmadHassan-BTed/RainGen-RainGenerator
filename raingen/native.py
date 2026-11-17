@@ -9,6 +9,12 @@ limiter and the live cpal stream. Python keeps what is cheap or design-time:
     raingen.spatial.decoders design  -> set_output(matrix | MagLS FIRs)        (once)
     World.step() per control block   -> update(WeatherState JSON)              (every block)
 
+Live listener: the voices keep their patches' world positions, so moving and turning the
+listener (`set_listener`, any rate) is a lock-free pose update in Rust, never a rebuild. Every
+later structural change is laid out around the session's reference pose (the listener the
+session was built for) and applied with `prepare_update` / `commit_update` (or `set_scene`
+while streaming): an incremental voice diff in Rust, with the World's state carried over.
+
 NativeSession is the one object that owns that wiring. It is used three ways:
 
 * as a drop-in BlockRenderer (`render_block`, `channels`, `latency`, `decoder`, `stem_names`,
@@ -143,6 +149,35 @@ def materials_json() -> str:
     return _MATERIALS_JSON
 
 
+_LISTENER_LIVE = ("listener.position", "listener.heading_deg")
+
+
+def _carry_world(old, new, copy_state: bool = False) -> None:
+    """Hand the running weather state (storm cells, gusts, wetness, puddles, canopy, roof flow)
+    from `old` to a World rebuilt for a changed layout, so a structural edit never resets it.
+    copy_state: deep-copy the stateful processes (both Worlds keep stepping, e.g. a crossfade)."""
+    import copy as _copy
+
+    for attr in ("storms", "gusts", "gust_integral_time_s", "gust_ti", "_stab_factor", "_curtain_gust",
+                 "_primed", "state", "dsd"):
+        if hasattr(old, attr):
+            v = getattr(old, attr)
+            setattr(new, attr, _copy.deepcopy(v) if copy_state and attr in ("storms", "gusts") else v)
+    ow, nw = getattr(old, "wetness", None), getattr(new, "wetness", None)
+    if ow is None or nw is None:
+        return
+    for name in ("_film", "_puddle", "runoff_mm_h"):
+        src, dst = getattr(ow, name, None), getattr(nw, name, None)
+        if isinstance(src, dict) and isinstance(dst, dict):
+            for m in dst:
+                if m in src:
+                    dst[m] = src[m]
+    for attr in ("canopy_mm", "canopy_drip_mm_h", "canopy_evap_mm_h", "canopy_catch_mm_h", "throughfall_fraction",
+                 "_roof_film_l", "_gutter_l", "roof_flow_l_s"):
+        if hasattr(ow, attr):
+            setattr(nw, attr, getattr(ow, attr))
+
+
 def _marker(t: float, kind: str, data: str) -> EventMarker:
     try:
         d = json.loads(data) if data else {}
@@ -244,6 +279,13 @@ class NativeSession:
             g = float(self.stem_gain.get(s, 1.0))
             gains.append(20.0 * math.log10(g) if g > 0.0 else float("-inf"))
         self.engine.set_stem_gains(gains)
+        L = self.scene.listener
+        self._ref_listener = (tuple(float(v) for v in (tuple(L.position) + (0.0, 0.0, 0.0))[:3]),
+                              float(L.heading_deg))
+        self._pose = self._ref_listener[0] + (self._ref_listener[1], 0.0)
+        self._t_off = 0.0
+        self._update_lock = threading.Lock()
+        self.scene_updates = 0
         self._build(self.scene)
 
         # live state
@@ -299,6 +341,113 @@ class NativeSession:
     def voices(self) -> list:
         return list(self.engine.voice_names())
 
+    # -- live listener / strike / seek ---------------------------------------------
+    def _pin(self, scene: Scene) -> Scene:
+        """`scene` laid out around the session's reference pose (the live pose moves the voices)."""
+        sc = scene.copy()
+        pos, heading = self._ref_listener
+        sc.listener.position = tuple(pos)
+        sc.listener.heading_deg = float(heading)
+        return sc
+
+    def set_listener(self, position=None, heading_deg: Optional[float] = None,
+                     pitch_deg: Optional[float] = None) -> tuple:
+        """Move / turn the listener (world metres, deg true, deg up); lock-free, never rebuilds."""
+        x, y, z, h, p = self._pose
+        if position is not None:
+            pos = [float(v) for v in tuple(position)[:3]] + [z] * max(0, 3 - len(tuple(position)[:3]))
+            x, y, z = pos[0], pos[1], pos[2]
+        if heading_deg is not None:
+            h = float(heading_deg) % 360.0
+        if pitch_deg is not None:
+            p = max(-90.0, min(90.0, float(pitch_deg)))
+        pose = (x, y, z, h, p)
+        if not all(math.isfinite(v) for v in pose):
+            raise ValueError("listener pose must be finite")
+        self._pose = pose
+        self.engine.set_listener(*pose)
+        return pose
+
+    @property
+    def listener_pose(self) -> tuple:
+        """(x, y, z, heading_deg, pitch_deg) last sent with set_listener (or the scene's listener)."""
+        return self._pose
+
+    def strike(self, distance_km: Optional[float] = None, bearing_deg: Optional[float] = None,
+               intensity: Optional[float] = None) -> dict:
+        """A lightning strike now: flash marker on the next block, thunder at distance / c(T)."""
+        th = self.scene.weather.thunder
+        d = float(distance_km) if distance_km is not None else float(getattr(th, "distance_km", 3.0) or 3.0)
+        b = float(bearing_deg) if bearing_deg is not None else float(getattr(th, "bearing_deg", 0.0) or 0.0)
+        k = float(intensity) if intensity is not None else 0.7
+        d = max(0.25, min(40.0, d)) if math.isfinite(d) else 3.0
+        b = b % 360.0 if math.isfinite(b) else 0.0
+        k = max(0.02, min(1.0, k)) if math.isfinite(k) else 0.7
+        sid = self.engine.strike(d, b, k)
+        w = self.last_weather
+        temp = float(getattr(w, "temperature_c", self.scene.weather.temperature_c))
+        c = 331.3 * math.sqrt(max(1.0 + temp / 273.15, 0.1))
+        return {"id": sid, "distance_km": d, "bearing_deg": b, "intensity": k, "delay_s": d * 1000.0 / c}
+
+    def seek(self, t: float) -> None:
+        """Move the scene clock (World, timeline, marker times) to `t` s; no voice is reset."""
+        t = float(t)
+        if not math.isfinite(t):
+            raise ValueError("t must be finite")
+        k = self._k if self._live else self._next
+        self._t_off = t - k * self.block / self.sr
+        self.engine.seek(t)
+
+    def start_at(self, index: int, scene_t: Optional[float] = None, carry_from=None) -> None:
+        """Continue a running timeline from block `index` (a pipeline built mid-stream): the next
+        render_block(index) renders at once instead of catching up from block 0. Marker times
+        follow `scene_t` (default index * block / sr); `carry_from` (a session) hands over its
+        World's weather state."""
+        index = int(index)
+        t = index * self.block / self.sr if scene_t is None else float(scene_t)
+        self._next = index
+        self._t_off = t - index * self.block / self.sr
+        self.engine.seek(t)
+        w = getattr(carry_from, "world", None)
+        if w is not None:
+            try:
+                _carry_world(w, self.world, copy_state=True)
+            except Exception as exc:                  # pragma: no cover - best effort
+                log.warning("raingen native: weather state not carried over: %s", exc)
+
+    # -- incremental structure ------------------------------------------------------
+    def prepare_update(self, scene: Scene, wanted: Optional[Callable[[], bool]] = None):
+        """Lay `scene` out around the reference pose, build its World and send the voice graph
+        (Rust diffs it against the running one: unchanged voices keep playing). Any thread; the
+        World is swapped in by `commit_update` on the rendering thread. None when no longer wanted."""
+        from .core.rng import RngFactory
+        from .physics.layout import build_layout
+        from .physics.world import World
+
+        sc = self._pin(scene)
+        with self._update_lock:
+            if wanted is not None and not wanted():
+                return None
+            rngf = RngFactory(int(sc.seed))
+            patches = build_layout(sc)
+            world = World(sc, rngf, sr=self.sr, block=self.block)
+            if wanted is not None and not wanted():
+                return None
+            self.engine.set_scene(scene_json(sc, self.precip_types), patches_json(patches))
+        return (sc, rngf, patches, world)
+
+    def commit_update(self, prep) -> Scene:
+        """Swap in a prepared update (call between blocks); returns the scene now playing."""
+        sc, rngf, patches, world = prep
+        _carry_world(self.world, world)
+        self.world = world
+        self.rngf = rngf
+        self.patches = patches
+        self.scene = sc.copy()
+        self.base_scene = sc.copy()
+        self.scene_updates += 1
+        return sc
+
     # -- offline ----------------------------------------------------------------
     def reset(self) -> None:
         """Back to t = 0 (fresh World, every voice, encoder, decoder and limiter state)."""
@@ -306,6 +455,7 @@ class NativeSession:
 
         self.engine.reset()
         self.engine.poll_markers()
+        self._t_off = 0.0
         self.world = World(self.scene, self.rngf, sr=self.sr, block=self.block)
         for d in self.stem_decoders.values():
             d.reset()
@@ -328,8 +478,10 @@ class NativeSession:
             self._seek(index)
         n = self.block
         t0 = index * n / self.sr
-        sc = scene_at_t if scene_at_t is not None else self.scene_at(t0)
-        weather = self.world.step(index, t0, n, sc)
+        off = self._t_off
+        k_off = int(round(off * self.sr / n)) if off else 0
+        sc = scene_at_t if scene_at_t is not None else self.scene_at(t0 + off)
+        weather = self.world.step(max(0, index + k_off), t0 + off, n, sc)
         self.last_weather = weather
         self.engine.update(weather_json(weather))
         stems = None
@@ -370,7 +522,7 @@ class NativeSession:
     def time(self) -> float:
         """Approximate scene time being heard (rendered blocks minus the ring latency)."""
         k = int(self.engine.blocks_rendered())
-        return max(0.0, k * self.block / self.sr - self.latency_ms / 1000.0 - self.block / self.sr)
+        return max(0.0, k * self.block / self.sr - self.latency_ms / 1000.0 - self.block / self.sr) + self._t_off
 
     def calibrate(self, target_lufs: float, prime_s: float = 1.5) -> float:
         """Render `prime_s` offline, measure BS.1770-5 loudness, return the gain toward `target_lufs`."""
@@ -472,6 +624,7 @@ class NativeSession:
         s = dict(self.engine.stats())
         s["control_ms_per_block"] = self.control_ms
         s["calibration_db"] = self.cal_db
+        s["scene_updates"] = self.scene_updates
         return s
 
     # -- live control -------------------------------------------------------------
@@ -481,6 +634,14 @@ class NativeSession:
         from .scene import manifest as mf
 
         path = PATH_ALIASES.get(path, path)
+        if path in _LISTENER_LIVE:
+            with self._lock:
+                self._target.set(path, tuple(value) if path == "listener.position" else float(value))
+            if path == "listener.position":
+                self.set_listener(position=value)
+            else:
+                self.set_listener(heading_deg=value)
+            return value
         spec = mf.find_param(path)
         with self._lock:
             if spec is not None:
@@ -490,7 +651,7 @@ class NativeSession:
                     self._target.get(path)
                 except (AttributeError, KeyError, TypeError):
                     raise KeyError(f"unknown parameter {path!r}") from None
-            old_key = _structure_key(self._target)
+            old_key = _structure_key(self._target, live_listener=True)
             if path.startswith("vibe."):
                 name = path.split(".", 1)[1]
                 if name in _MACROS:
@@ -509,7 +670,7 @@ class NativeSession:
                 self._target = apply_mode(self._target, str(value))
             else:
                 self._target.set(path, value)
-            if _structure_key(self._target) != old_key or path in ("place.window_open",):
+            if _structure_key(self._target, live_listener=True) != old_key or path in ("place.window_open",):
                 self._rebuild(self._target.copy())
                 return value
             self._retarget(float(ramp or 0.0), bool(immediate))
@@ -532,10 +693,16 @@ class NativeSession:
         from .physics.world import World
 
         if self._live:
+            L = scene.listener
+            self.set_listener(position=tuple(L.position), heading_deg=float(L.heading_deg))
+            scene = self._pin(scene)
             self.rngf = RngFactory(int(scene.seed))
             self.patches = build_layout(scene)
-            self.world = World(scene, self.rngf, sr=self.sr, block=self.block)
+            world = World(scene, self.rngf, sr=self.sr, block=self.block)
+            _carry_world(self.world, world)
+            self.world = world
             self.engine.set_scene(scene_json(scene, self.precip_types), patches_json(self.patches))
+            self.scene_updates += 1
             self.scene = scene.copy()
             self.base_scene = scene.copy()
             self._current = scene.copy()
@@ -543,6 +710,11 @@ class NativeSession:
         else:
             self.base_scene = scene.copy()
             self.scene = self.scene_at(0.0)
+            L = self.scene.listener
+            self._ref_listener = (tuple(float(v) for v in (tuple(L.position) + (0.0, 0.0, 0.0))[:3]),
+                                  float(L.heading_deg))
+            self._pose = self._ref_listener[0] + (self._ref_listener[1], 0.0)
+            self.engine.set_listener(clear=True)
             self._build(self.scene)
             self._current = self.scene.copy()
 
@@ -558,7 +730,7 @@ class NativeSession:
             spec = mf.find_param(p)
             isnum = (spec is not None and spec.is_numeric and isinstance(a, (int, float)) and isinstance(b, (int, float))
                      and not isinstance(a, bool) and not isinstance(b, bool))
-            dur = max(ramp, spec.smoothing_s if spec is not None else 0.0)
+            dur = max(float(ramp), 0.05) if ramp is not None else (spec.smoothing_s if spec is not None else 0.0)
             if immediate or not isnum or dur <= 0.0 or not self._live:
                 self._ramps.pop(p, None)
                 self._current.set(p, b)
@@ -599,11 +771,13 @@ class NativeSession:
         with self._lock:
             self._advance_ramps(k)
             sc = self._current
-            t0 = k * self.block / self.sr
+            off = self._t_off
+            k_off = int(round(off * self.sr / self.block)) if off else 0
+            t0 = k * self.block / self.sr + off
             if sc.timeline:
                 from .scene.timeline import evaluate
                 sc = evaluate(sc, t0)
-            w = self.world.step(k, t0, self.block, sc)
+            w = self.world.step(max(0, k + k_off), t0, self.block, sc)
         self.last_weather = w
         if send:
             self.engine.update(weather_json(w))

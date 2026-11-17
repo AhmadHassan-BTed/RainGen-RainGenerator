@@ -478,6 +478,7 @@ export class SceneStore {
       return;
     }
     this._gesture = { label, depth: 1, pre: this._snapshot(), changed: false };
+    this._emit('gesture', { active: true, label });
   }
 
   endGesture() {
@@ -489,6 +490,12 @@ export class SceneStore {
     if (g.changed && g.pre !== this._snapshot()) this._pushUndo(g.pre);
     this._last = { key: null, t: 0 };
     this._scheduleSave();
+    this._emit('gesture', { active: false, label: g.label, changed: g.changed });
+  }
+
+  /** True while a drag (or another multi-step gesture) is in progress. */
+  get gestureActive() {
+    return !!this._gesture;
   }
 
   get canUndo() {

@@ -173,3 +173,88 @@ pub fn yaw_rotation(yaw: f32) -> [[f32; N_AMBI]; N_AMBI] {
     }
     r
 }
+
+/// Least-squares projector onto the order-3 SH span from a fixed Fibonacci point set:
+/// (points, P = (A^T A)^-1 A^T as N_AMBI rows of Q values). Exact for any order-3 field.
+fn rotation_projector() -> &'static (Vec<[f64; 3]>, Vec<[f64; N_AMBI]>, Vec<Vec<f64>>) {
+    static P: OnceLock<(Vec<[f64; 3]>, Vec<[f64; N_AMBI]>, Vec<Vec<f64>>)> = OnceLock::new();
+    P.get_or_init(|| {
+        const Q: usize = 64;
+        let ga = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+        let mut pts = Vec::with_capacity(Q);
+        let mut a = Vec::with_capacity(Q);
+        for q in 0..Q {
+            let z = 1.0 - 2.0 * (q as f64 + 0.5) / Q as f64;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let phi = ga * q as f64;
+            let v = [r * phi.cos(), r * phi.sin(), z];
+            pts.push(v);
+            a.push(sh_real(v[1].atan2(v[0]), v[2].atan2(v[0].hypot(v[1]))));
+        }
+        // normal matrix and its inverse (Gauss-Jordan, partial pivoting)
+        let mut m = [[0.0f64; 2 * N_AMBI]; N_AMBI];
+        for i in 0..N_AMBI {
+            for j in 0..N_AMBI {
+                m[i][j] = a.iter().map(|row| row[i] * row[j]).sum();
+            }
+            m[i][N_AMBI + i] = 1.0;
+        }
+        for c in 0..N_AMBI {
+            let piv = (c..N_AMBI).max_by(|x, y| m[*x][c].abs().partial_cmp(&m[*y][c].abs()).unwrap()).unwrap();
+            m.swap(c, piv);
+            let d = m[c][c];
+            for v in m[c].iter_mut() {
+                *v /= d;
+            }
+            for r in 0..N_AMBI {
+                if r != c {
+                    let f = m[r][c];
+                    if f != 0.0 {
+                        for k in 0..2 * N_AMBI {
+                            m[r][k] -= f * m[c][k];
+                        }
+                    }
+                }
+            }
+        }
+        let p: Vec<Vec<f64>> = (0..N_AMBI)
+            .map(|i| (0..Q).map(|q| (0..N_AMBI).map(|j| m[i][N_AMBI + j] * a[q][j]).sum()).collect())
+            .collect();
+        (pts, a, p)
+    })
+}
+
+/// SH-domain rotation of the whole sound field for a listener who turned by `dheading`
+/// (rad, compass sense: clockwise = turning right) and pitched up by `pitch` (rad): c = R b,
+/// row-major. A source straight ahead moves to the left (+azimuth) when the listener turns right.
+pub fn listener_rotation(dheading: f32, pitch: f32) -> [[f32; N_AMBI]; N_AMBI] {
+    let mut r = [[0.0f32; N_AMBI]; N_AMBI];
+    if dheading == 0.0 && pitch == 0.0 {
+        for (k, row) in r.iter_mut().enumerate() {
+            row[k] = 1.0;
+        }
+        return r;
+    }
+    let (pts, _, p) = rotation_projector();
+    // H = Rz(-dheading) Ry(-pitch): head-frame direction -> reference-frame direction
+    let (sy, cy) = (-(dheading as f64)).sin_cos();
+    let (sp, cp) = (-(pitch as f64)).sin_cos();
+    let b: Vec<[f64; N_AMBI]> = pts
+        .iter()
+        .map(|u| {
+            let x1 = u[0] * cp + u[2] * sp;
+            let z1 = -u[0] * sp + u[2] * cp;
+            let y1 = u[1];
+            let x2 = x1 * cy - y1 * sy;
+            let y2 = x1 * sy + y1 * cy;
+            sh_real(y2.atan2(x2), z1.atan2(x2.hypot(y2)))
+        })
+        .collect();
+    for i in 0..N_AMBI {
+        for j in 0..N_AMBI {
+            let v: f64 = p[i].iter().zip(&b).map(|(pq, bq)| pq * bq[j]).sum();
+            r[i][j] = if v.abs() < 1e-7 { 0.0 } else { v as f32 };
+        }
+    }
+    r
+}

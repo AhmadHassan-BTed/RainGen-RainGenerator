@@ -1731,6 +1731,20 @@ impl ThunderVoice {
         self.launch(ctx, ekey, &eid, &cell_id, tf, sx, sy, cg, si, &mut rng);
     }
 
+    /// A strike asked for with Engine.strike(): flash at the block start, the same lightning
+    /// tree, N-wave synthesis and Ribner-Roy propagation as a storm-cell flash, so the thunder
+    /// arrives at distance / c(T) from the nearest channel point.
+    fn manual_strike(&mut self, ctx: &BlockCtx, st: &crate::engine::Strike) {
+        let ekey = hash3(self.key_flash, hash_str("manual"), st.id);
+        let mut rng = Rng::from_key(ekey, st.id);
+        let d = if st.distance_km.is_finite() { st.distance_km.clamp(0.25, 40.0) } else { 3.0 };
+        let b = if st.bearing_deg.is_finite() { st.bearing_deg } else { 0.0 };
+        let (sx, sy) = strike_xy(d, b, self.heading);
+        let si = if st.intensity.is_finite() { (st.intensity as f64).clamp(0.02, 1.0) } else { 0.7 };
+        let eid = format!("strike.{}", st.id);
+        self.launch(ctx, ekey, &eid, "manual", ctx.t0, sx, sy, true, si, &mut rng);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
@@ -1864,6 +1878,9 @@ impl Voice for ThunderVoice {
         self.collect_flashes(ctx);
         for i in 0..self.flashes.len() {
             self.spawn(ctx, i);
+        }
+        for st in ctx.strikes {
+            self.manual_strike(ctx, st);
         }
         let t1 = ctx.t0 + n as f64 / ctx.sr as f64;
         let due = self.pending.partition_point(|(t, _)| *t < t1);

@@ -115,6 +115,9 @@ function heatColor(x) {
   return HEAT_RAMP[i].clone().lerp(HEAT_RAMP[i + 1], t - i);
 }
 
+const LITE_MAX_PIXEL_RATIO = 1.25;
+const LITE_FRAME_MS = 1000 / 30;
+
 export class Viewport {
   /**
    * @param {HTMLElement} container
@@ -173,7 +176,52 @@ export class Viewport {
     this._resizeObserver = new ResizeObserver(() => this.resize());
     this._resizeObserver.observe(container);
     this.resize();
-    this.renderer.setAnimationLoop(() => this._frame());
+    this._lite = false;
+    this._looping = false;
+    this._lastTick = -Infinity;
+    this._onVisibility = () => this._syncLoop();
+    document.addEventListener('visibilitychange', this._onVisibility);
+    this._syncLoop();
+  }
+
+  /**
+   * Lighter drawing while the sound comes from the native engine (the browser makes no audio):
+   * pixel ratio at most 1.25, at most 30 frames a second, and no drawing while the window is
+   * hidden or minimised. Everything drawn looks the same.
+   */
+  setLite(on) {
+    const lite = !!on;
+    if (lite === this._lite) return;
+    this._lite = lite;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, lite ? LITE_MAX_PIXEL_RATIO : 2));
+    this.resize();
+    this._syncLoop();
+  }
+
+  get lite() {
+    return this._lite;
+  }
+
+  _syncLoop() {
+    const run = !(this._lite && document.hidden);
+    if (run === this._looping) return;
+    this._looping = run;
+    if (run) {
+      this.clock.getDelta();                        // no catch-up jump after a pause
+      this._lastTick = -Infinity;
+      this.renderer.setAnimationLoop((time) => this._tick(time));
+    } else {
+      this.renderer.setAnimationLoop(null);
+    }
+  }
+
+  _tick(time) {
+    if (this._lite) {
+      const now = Number.isFinite(time) ? time : performance.now();
+      if (now - this._lastTick < LITE_FRAME_MS - 4) return;
+      this._lastTick = now;
+    }
+    this._frame();
   }
 
   /* ------------------------------------------------------------------ setup */
@@ -1262,7 +1310,7 @@ export class Viewport {
     const pitch = Math.asin(clamp(fwd.y, -1, 1)) / DEG;
     const z = this.store.scene.listener.position[2];
     const pos = [round(this.camera.position.x, 2), round(-this.camera.position.z, 2), z];
-    const sig = `${pos[0]},${pos[1]},${Math.round(heading)}`;
+    const sig = `${pos[0]},${pos[1]},${Math.round(heading)},${Math.round(pitch)}`;
     if (sig !== this._lastLiveSig) {
       this._lastLiveSig = sig;
       this.onListenerLive({ position: pos, headingDeg: heading, pitchDeg: pitch });
@@ -1671,6 +1719,8 @@ export class Viewport {
 
   dispose() {
     this.renderer.setAnimationLoop(null);
+    this._looping = false;
+    document.removeEventListener('visibilitychange', this._onVisibility);
     this._resizeObserver.disconnect();
     window.removeEventListener('keydown', this._keyDown, true);
     window.removeEventListener('keyup', this._keyUp, true);

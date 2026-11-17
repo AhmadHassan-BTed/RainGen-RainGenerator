@@ -18,7 +18,10 @@ World, mastering (calibration, governor, true-peak limiter) and the sound card i
     POST /native/stop | /native/suspend | /native/resume
     POST /native/scene      {scene}               structure crossfades, weather glides
     POST /native/param      {path, value, ramp} or {params: [{path, value, ramp}, ...]}
-    POST /native/listener   {position?, headingDeg?, pitchDeg?}
+    POST /native/listener   {position?: [x, y, z], heading_deg?, pitch_deg?, height_m?}  (camelCase too)
+                            live pose, up to 30/s, latest wins: never rebuilds a voice
+    POST /native/strike     {distance_km?, bearing_deg?, intensity?}  a lightning strike now
+    POST /native/seek       {t}                   jump the scene clock, the sound keeps playing
     POST /native/object     {object}    POST /native/object/remove {id}
     POST /native/volume     {db, ramp?}
     POST /native/render-mode {mode}     binaural | stereo (ignored when --layout is given)
@@ -143,6 +146,19 @@ def _dict_set(d: dict, path: str, value: Any) -> bool:
     return False
 
 
+def _first(d: dict, *keys) -> Any:
+    for k in keys:
+        if d.get(k) is not None:
+            return d[k]
+    return None
+
+
+def _pose_args(d: dict) -> tuple:
+    """(position, heading_deg, pitch_deg, height_m) from a pose body (snake_case or camelCase)."""
+    return (d.get("position"), _first(d, "heading_deg", "headingDeg"), _first(d, "pitch_deg", "pitchDeg"),
+            _first(d, "height_m", "heightM"))
+
+
 def _canonical_layout(name: Optional[str]) -> Optional[str]:
     if not name:
         return None
@@ -218,6 +234,7 @@ class Studio:
         self._clients_lock = threading.Lock()
         self.had_client = False
         self.last_client = time.monotonic()
+        self._live_pose: Optional[dict] = None          # latest /native/listener pose (wins over scenes)
         self._flash_bearing: "collections.OrderedDict" = collections.OrderedDict()
         self._last_caption: dict = {}
         self.last_error: Optional[str] = None
@@ -288,6 +305,7 @@ class Studio:
             with self.lock:
                 if isinstance(scene, dict):
                     self.scene = copy.deepcopy(scene)
+                    self._live_pose = None
                 if render_mode in _GUI_LAYOUTS:
                     self.render_mode = render_mode
                 if volume_db is not None:
@@ -372,6 +390,9 @@ class Studio:
         Scene.from_dict(scene)                           # reject garbage early (400)
         with self.lock:
             self.scene = copy.deepcopy(scene)
+            if self._live_pose:
+                # the pose lane is newer than the copy of the pose a scene carries
+                self.scene.setdefault("listener", {}).update(copy.deepcopy(self._live_pose))
             r = str(((scene.get("listener") or {}).get("render")) or "")
             if r in _GUI_LAYOUTS and r != self.render_mode and not self.fixed_layout:
                 self.set_render_mode(r)
@@ -406,27 +427,65 @@ class Studio:
             return {"ok": True, "applied": "scene", "note": str(exc)}
 
     def set_listener(self, position=None, heading_deg=None, pitch_deg=None, height_m=None) -> dict:
+        """The live listener pose (coalesced: the latest pose wins). On the native core it goes
+        straight to the engine's lock-free pose and never rebuilds; only a height change does."""
         with self.lock:
             L = self.scene.setdefault("listener", {})
-            changed = False
+            old_pos = list(L.get("position") or [0.0, 0.0, 0.0]) + [0.0] * 3
+            old_h = _num(L.get("heading_deg"), 0.0)
+            pos = h = p = hm = None
             if isinstance(position, (list, tuple)) and len(position) >= 2:
-                p = [_num(position[0], 0.0), _num(position[1], 0.0),
-                     _num(position[2], 0.0) if len(position) > 2 else 0.0]
-                old = L.get("position") or [0.0, 0.0, 0.0]
-                if max(abs(a - b) for a, b in zip(p, list(old) + [0.0] * 3)) > 0.05:
-                    changed = True
-                L["position"] = p
+                pos = [_num(position[0], 0.0), _num(position[1], 0.0),
+                       _num(position[2], old_pos[2]) if len(position) > 2 else _num(old_pos[2], 0.0)]
+                L["position"] = pos
             if heading_deg is not None:
-                h = _num(heading_deg, 0.0) % 360.0
-                if abs(((h - _num(L.get("heading_deg"), 0.0)) + 180.0) % 360.0 - 180.0) > 0.5:
-                    changed = True
+                h = _num(heading_deg, old_h) % 360.0
                 L["heading_deg"] = h
+            if pitch_deg is not None:
+                p = max(-90.0, min(90.0, _num(pitch_deg, 0.0)))
             if height_m is not None:
-                L["height_m"] = _num(height_m, 1.7)
-                changed = True
-            if changed:
-                self.dirty = True
+                v = max(0.1, _num(height_m, 1.7))
+                if abs(v - _num(L.get("height_m"), 1.7)) > 0.005:
+                    L["height_m"] = hm = v
+            self._live_pose = {k: copy.deepcopy(L[k]) for k in ("position", "heading_deg") if k in L}
+            eng = self.engine
+            native = bool(eng is not None and getattr(eng, "native", False))
+            if not native:
+                # the Python core rebuilds for the listener: coalesce it with the scene cadence
+                moved = pos is not None and max(abs(a - b) for a, b in zip(pos, old_pos)) > 0.05
+                turned = h is not None and abs(((h - old_h) + 180.0) % 360.0 - 180.0) > 0.5
+                if moved or turned or hm is not None:
+                    self.dirty = True
+        if native:
+            eng.set_listener(pos, h, p, hm)
         return {"ok": True}
+
+    def strike(self, distance_km=None, bearing_deg=None, intensity=None) -> dict:
+        """A lightning strike now: 'flash' then 'thunder' arrive on the event stream as for any strike."""
+        eng = self.engine
+        if eng is None or not eng.running:
+            raise ValueError("the sound is not running (POST /native/start first)")
+        kw = {}
+        for k, v in (("distance_km", distance_km), ("bearing_deg", bearing_deg), ("intensity", intensity)):
+            if v is not None:
+                f = _num(v, float("nan"))
+                if not math.isfinite(f):
+                    raise ValueError(f"{k} must be a number")
+                kw[k] = f
+        info = eng.strike(**kw)
+        flash = {"id": info["id"], "distanceKm": info["distance_km"], "bearingDeg": info["bearing_deg"],
+                 "intensity": info["intensity"], "delaySec": round(float(info["delay_s"]), 3)}
+        return {"ok": True, "id": info["id"], "flash": flash}
+
+    def seek(self, t) -> dict:
+        t = max(0.0, _num(t, float("nan")))
+        if not math.isfinite(t):
+            raise ValueError("t must be a number of seconds")
+        self.t = t
+        eng = self.engine
+        if eng is not None:
+            eng.seek(t)
+        return {"ok": True, "t": t}
 
     def upsert_object(self, obj: dict) -> dict:
         if not isinstance(obj, dict):
@@ -499,7 +558,7 @@ class Studio:
                 self.set_param(p["path"], p.get("value"), p.get("ramp", 0.5))
         L = body.get("listener")
         if isinstance(L, dict):
-            self.set_listener(L.get("position"), L.get("headingDeg"), L.get("pitchDeg"), L.get("heightM"))
+            self.set_listener(*_pose_args(L))
         V = body.get("volume")
         if isinstance(V, dict) and "db" in V:
             self.set_volume(V["db"], V.get("ramp", 0.05))
@@ -582,7 +641,14 @@ class Studio:
                         "cpuLoad": round(float(eng.cpu_load), 4), "badge": eng.badge,
                         "voicesActive": int(st.get("voices_active", 0) or 0),
                         "cpuMsPerBlock": round(float(st.get("cpu_ms_per_block", 0.0) or 0.0), 3),
-                        "threads": int(st.get("threads", 0) or 0)})
+                        "maxCpuMs": round(float(st.get("max_cpu_ms", 0.0) or 0.0), 3),
+                        "threads": int(st.get("threads", 0) or 0),
+                        "voiceRebuilds": int(st.get("voice_rebuilds", 0) or 0),
+                        "voicesKept": int(st.get("voices_kept", 0) or 0),
+                        "graphUpdates": int(st.get("graph_updates", 0) or 0),
+                        "sceneUpdates": int(getattr(eng, "scene_updates", 0)),
+                        "pipelineRebuilds": int(getattr(eng, "pipeline_rebuilds", 0)),
+                        "listener": [round(float(v), 3) for v in (st.get("listener") or [])]})
         return out
 
     # -- events ------------------------------------------------------------------------
@@ -826,8 +892,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 res = {"ok": True, "results": [st.set_param(p.get("path"), p.get("value"), p.get("ramp", 0.5))
                                                for p in items if isinstance(p, dict)]}
             elif path == "/native/listener":
-                res = st.set_listener(body.get("position"), body.get("headingDeg"), body.get("pitchDeg"),
-                                      body.get("heightM"))
+                res = st.set_listener(*_pose_args(body))
+            elif path == "/native/strike":
+                res = st.strike(_first(body, "distance_km", "distanceKm"), _first(body, "bearing_deg", "bearingDeg"),
+                                body.get("intensity"))
+            elif path == "/native/seek":
+                res = st.seek(_first(body, "t", "time"))
             elif path == "/native/object":
                 res = st.upsert_object(body.get("object", body))
             elif path == "/native/object/remove":
