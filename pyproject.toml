@@ -58,6 +58,9 @@ sofa = [
 app = [
     "pygame>=2.1.0"
 ]
+native = [
+    "raingen-native>=0.1.0"
+]
 all = [
     "sounddevice>=0.4.6",
     "soundfile>=0.12",

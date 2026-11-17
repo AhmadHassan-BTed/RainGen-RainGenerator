@@ -35,7 +35,12 @@ Python 3.10+ is required. The core needs only NumPy and SciPy; everything else i
 | `osc` | python-osc | OSC control of the live engine |
 | `sofa` | h5py | your own HRTFs from SOFA (AES69) files |
 | `app` | pygame | the classic visual simulator |
-| `all` | everything above | |
+| `native` | raingen-native | the Rust core: every generator live, on all cores, with its own audio output |
+| `all` | everything above except `native` | |
+
+Native core: `pip install "rain-generator[native]"` (prebuilt abi3 wheels for Linux, Windows and macOS).
+From source (Rust toolchain): `pip install maturin && cd native && maturin develop --release`.
+It is used automatically when installed; `RAINGEN_NATIVE=0` (or `native=False`) selects the Python generators.
 
 ## Python API
 

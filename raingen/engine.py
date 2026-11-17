@@ -28,6 +28,11 @@ level: heavier rain is louder, a closed window is quieter.
 
 Markers (lightning, thunder, gusts, drips) are delivered to `on_marker` by `poll()` on the
 caller's thread when the audio carrying them is played, never from the engine's threads.
+
+Native core: when the compiled `raingen_native` module imports (and RAINGEN_NATIVE is not 0),
+every pipeline is a raingen.native.NativeSession: the World still steps in Python, but all
+voices, encoding, shelter transfer and decoding run in Rust on every core. `native=False`
+(or a layout above third order) keeps the Python BlockRenderer.
 """
 
 from __future__ import annotations
@@ -220,14 +225,15 @@ class Engine:
     quality ('game' by default for real time), target_lufs (calibration at start, None = off),
     ceiling_dbtp, volume_db, on_marker(marker), xfade_s (structural crossfade), prime_s,
     latency (sounddevice latency hint), osc (port or (host, port) to serve OSC control),
-    honor_timer (sleep timer and Descent fade, on by default live).
+    honor_timer (sleep timer and Descent fade, on by default live), native (None = the Rust core
+    when installed, unless RAINGEN_NATIVE=0; False = the Python generators).
     """
 
     def __init__(self, scene, layout: Optional[str] = "stereo", device=None, blocksize: int = BLOCK, *,
                  buffer_s: float = 0.5, sample_rate: Optional[int] = None, quality: Optional[str] = "game",
                  target_lufs: Optional[float] = -20.0, ceiling_dbtp: float = -1.0, volume_db: float = 0.0,
                  on_marker: Optional[Callable] = None, xfade_s: float = 0.75, prime_s: float = 1.5,
-                 latency: Any = "high", osc=None, honor_timer: bool = True):
+                 latency: Any = "high", osc=None, honor_timer: bool = True, native: Optional[bool] = None):
         from .scene.graph import ParameterGraph
 
         if not isinstance(scene, Scene):
@@ -245,6 +251,8 @@ class Engine:
         self._quality = str(quality).lower() if quality else None
         from .render import resolve_layout
         self.layout = resolve_layout(target, layout)
+        from . import native as _native
+        self.native = bool(_native.enabled(native) and _native.supports_layout(self.layout))
         self.device = device
         self.blocksize = int(blocksize)
         self.buffer_s = max(float(buffer_s), BLOCK / SAMPLE_RATE)
@@ -538,6 +546,9 @@ class Engine:
         return sc
 
     def _make_pipeline(self, scene: Scene):
+        if self.native:
+            from .native import NativeSession
+            return NativeSession(scene, self.layout, stems=False)
         from .render import BlockRenderer
         return BlockRenderer(scene, self.layout, stems=False)
 

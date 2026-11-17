@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.16,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "raingen-native"
+version = "0.1.0"
+description = "Native real-time synthesis core of the raingen weather sound engine"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "raingen_native"
+features = ["pyo3/extension-module"]
+bindings = "pyo3"

@@ -653,8 +653,11 @@ class Renderer:
     sleep timer fade the render to silence; off by default for offline renders), strict
     (re-raise generator errors), start_tc / fps (bext TimeReference and caption timecode),
     tape (keep the pass-1 programme so pass 2 only re-masters it; False re-renders it),
-    tmp_dir (where a long tape is kept; default: next to the output file) and block (synthesis
-    block length in frames; BLOCK by default, other sizes are for testing).
+    tmp_dir (where a long tape is kept; default: next to the output file), block (synthesis
+    block length in frames; BLOCK by default, other sizes are for testing) and native (None:
+    synthesize, encode and decode in the Rust core when raingen_native is installed, unless
+    RAINGEN_NATIVE=0; False: the Python generators; True: require the native core). Mastering,
+    loudness, the limiter and the file writers are the same Python code either way.
     """
 
     def __init__(self, scene, seconds: float, layout: Optional[str] = None, destination: Optional[str] = None,
@@ -664,7 +667,8 @@ class Renderer:
                  ceiling_dbtp: Optional[float] = None, gain_db: Optional[float] = None,
                  quality: Optional[str] = None, mode: Optional[str] = None, honor_timer: bool = False,
                  strict: bool = False, start_tc: Optional[str] = None, fps: float = 24.0,
-                 tape: bool = True, tmp_dir: Optional[str] = None, block: int = BLOCK):
+                 tape: bool = True, tmp_dir: Optional[str] = None, block: int = BLOCK,
+                 native: Optional[bool] = None):
         from .master.destinations import get_destination
         from .wellness.modes import apply_mode, canonical_mode
 
@@ -741,6 +745,9 @@ class Renderer:
         if self.block < 16:
             raise ValueError("block must be at least 16 frames")
         self.tmp_dir = os.fspath(tmp_dir) if tmp_dir is not None else None
+        from . import native as _native
+        self.native = bool(_native.enabled(native) and _native.supports_layout(self.layout)
+                           and 16 <= self.block <= 16384)
         self.pass2: Optional[str] = None                    # 'replay' (tape) | 'render' (re-synthesis) | None
         self.warnings: list[str] = []
         self.summary: Optional[RenderReport] = None
@@ -751,6 +758,10 @@ class Renderer:
         return self._gain_db is None and self.target_lufs is not None
 
     def _block_renderer(self, stems: bool) -> BlockRenderer:
+        if self.native:
+            from .native import NativeSession
+            return NativeSession(self.scene, self.layout, stems=stems, mix=self.mix, strict=self.strict,
+                                 block=self.block)
         return BlockRenderer(self.scene, self.layout, stems=stems, mix=self.mix, strict=self.strict, block=self.block)
 
     def _governor(self):
@@ -1067,6 +1078,7 @@ class Renderer:
             scene=self.scene.name,
             seed=int(self.scene.seed),
             engine_version=__version__,
+            synthesis="native" if self.native else "python",
             seconds=self.seconds,
             frames=chain.written,
             sample_rate=self.sr_out,

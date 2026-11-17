@@ -6,6 +6,9 @@ import os
 # thread pools only add overhead (and oversubscribe CPUs under pytest-xdist).
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
+# The suite checks the Python reference generators (and monkeypatches them); the native Rust
+# core is exercised separately. RAINGEN_NATIVE=1 runs the suite against it instead.
+os.environ.setdefault("RAINGEN_NATIVE", "0")
 
 import numpy as np
 import pytest

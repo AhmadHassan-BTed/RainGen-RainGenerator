@@ -1,0 +1,144 @@
+name: Native wheels
+
+# Builds the raingen-native extension (native/, PyO3 + maturin, abi3: one wheel per platform
+# serves CPython 3.10+) for Linux, Windows and macOS, plus the sdist.
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*", "native-v*" ]
+    paths: [ "native/**", ".github/workflows/wheels.yml" ]
+  pull_request:
+    paths: [ "native/**", ".github/workflows/wheels.yml" ]
+  workflow_dispatch:
+
+concurrency:
+  group: wheels-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    # native runners per architecture: alsa-sys links the container's own ALSA, no cross sysroot
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: native
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: "2_28"
+          sccache: "true"
+          # cpal needs the ALSA headers inside the manylinux container
+          before-script-linux: |
+            if command -v dnf >/dev/null 2>&1; then dnf install -y alsa-lib-devel;
+            elif command -v yum >/dev/null 2>&1; then yum install -y alsa-lib-devel;
+            else apt-get update && apt-get install -y libasound2-dev; fi
+      - name: Smoke test
+        run: |
+          pip install native/dist/*.whl
+          python -c "import raingen_native as n; e = n.Engine(); print(e.render(1024).shape)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: native/dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: native
+          target: x64
+          args: --release --out dist
+          sccache: "true"
+      - name: Smoke test
+        shell: bash
+        run: |
+          pip install native/dist/*.whl
+          python -c "import raingen_native as n; e = n.Engine(); print(e.render(1024).shape)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: native/dist
+
+  macos:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64
+          - runner: macos-14
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: native
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: "true"
+      - name: Smoke test
+        run: |
+          pip install native/dist/*.whl
+          python -c "import raingen_native as n; e = n.Engine(); print(e.render(1024).shape)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: native/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: native
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: native/dist
+
+  release:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows, macos, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

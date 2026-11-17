@@ -311,8 +311,38 @@ def cmd_play(a: argparse.Namespace) -> int:
         print(f"{m.t:8.2f}s  {caption_for(m)}", flush=True)
 
     osc = a.osc if a.osc is None else (a.osc_host, a.osc)
-    eng = Engine(scene, layout=a.layout or "stereo", device=a.device, quality=a.quality or "game",
-                 volume_db=a.volume, on_marker=show, osc=osc)
+    from . import native as nat
+    from .wellness.modes import canonical_mode
+
+    layout = a.layout or "stereo"
+    if (getattr(a, "engine", "auto") != "python" and nat.enabled(True if getattr(a, "engine", "auto") == "native" else None)
+            and nat.supports_layout(layout) and canonical_mode(scene.mode) == "none"):
+        # the Rust core streams through cpal; Python only steps the World once per block
+        sess = nat.NativeSession(scene, layout, quality=a.quality or scene.render.quality or "studio")
+        if not a.quiet:
+            print(f"Playing {scene.name!r} ({sess.layout}, native, {sess.scene.render.quality}, "
+                  f"{len(sess.voices)} voices). Ctrl+C to stop.", file=sys.stderr)
+        srv = None
+        if osc is not None:
+            from .control.osc import serve_osc
+            srv = serve_osc(sess, host=osc[0], port=int(osc[1]))
+            if not a.quiet:
+                print(f"OSC control on {osc[0]}:{osc[1]} (e.g. /rg/weather/precipitation/rate_mm_h 20)",
+                      file=sys.stderr)
+        try:
+            sess.run(_length(a) if _has_length(a) else None, device=a.device, volume_db=a.volume, on_marker=show)
+        finally:
+            if srv is not None:
+                srv.stop()
+        if not a.quiet:
+            st = sess.stats()
+            print(f"native: {st.get('realtime_factor', 0.0):.3f} x real-time CPU, "
+                  f"{st.get('cpu_ms_per_block', 0.0):.2f} ms/block (max {st.get('max_cpu_ms', 0.0):.1f}), "
+                  f"{st.get('voices', 0)} voices, "
+                  f"{st.get('underruns', 0)} underruns", file=sys.stderr)
+        return 0
+    eng = Engine(scene, layout=layout, device=a.device, quality=a.quality or "game",
+                 volume_db=a.volume, on_marker=show, osc=osc, native=False if getattr(a, "engine", "auto") == "python" else None)
     if not a.quiet:
         print(f"Playing {scene.name!r} ({eng.layout}). Ctrl+C to stop.", file=sys.stderr)
         if osc is not None:
@@ -442,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--json", action="store_true")
     lv.set_defaults(func=cmd_live)
 
-    pl = sub.add_parser("play", help="play a scene in real time (needs sounddevice)")
+    pl = sub.add_parser("play", help="play a scene in real time (native core, or sounddevice)")
     pl.add_argument("what", nargs="+", help="preset, scene file, METAR or plain words")
     _add_duration(pl, "default: until Ctrl+C")
     pl.add_argument("--layout", "-l", choices=LAYOUTS, help="output layout (default stereo)")
@@ -453,6 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--osc", type=int, help="serve OSC control on this UDP port")
     pl.add_argument("--osc-host", default="127.0.0.1", help="OSC bind address (default localhost)")
     pl.add_argument("--quiet", "-q", action="store_true", help="do not print events")
+    pl.add_argument("--engine", choices=("auto", "native", "python"), default="auto",
+                    help="synthesis core: native (Rust, cpal output) when installed, or python (sounddevice)")
     pl.set_defaults(func=cmd_play)
 
     mf = sub.add_parser("manifest", help="export the parameter manifest")

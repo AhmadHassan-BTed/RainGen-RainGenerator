@@ -235,9 +235,26 @@ def render_array(what, seconds: Optional[float] = None, minutes: Optional[float]
 
 
 def play(what, seconds: Optional[float] = None, layout: Optional[str] = None, device=None, **kw) -> None:
-    """Play a scene on the sound card (blocks; Ctrl+C stops). Needs the 'audio' extra (sounddevice)."""
+    """Play a scene on the sound card (blocks; Ctrl+C stops).
+
+    With the native core installed (pip install 'raingen[native]') the Rust engine streams through
+    cpal at the scene's full quality; otherwise (or native=False, a wellness mode, or Engine-only
+    options) the Python Engine plays through sounddevice (the 'audio' extra).
+    """
+    from . import native as _nat
+    from .render import resolve_layout
+    from .wellness.modes import canonical_mode
+
     scene = load_scene(what)
-    eng = Engine(scene, layout=layout, device=device, **kw)
+    native = kw.pop("native", None)
+    native_kw = {"quality", "volume_db", "on_marker", "target_lufs", "ceiling_dbtp", "latency_ms"}
+    lay = resolve_layout(scene, layout)
+    if (_nat.enabled(native) and _nat.supports_layout(lay) and canonical_mode(scene.mode) == "none"
+            and set(kw) <= native_kw):
+        sess = _nat.NativeSession(scene, lay, quality=kw.pop("quality", None))
+        sess.run(seconds, device=device, **kw)
+        return
+    eng = Engine(scene, layout=layout, device=device, native=native, **kw)
     eng.run(seconds)
 
 
