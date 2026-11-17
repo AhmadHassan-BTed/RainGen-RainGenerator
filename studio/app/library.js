@@ -13,7 +13,7 @@ export const LIBRARY = [
     group: 'Ground & surfaces',
     items: [
       { key: 'tin-roof', label: 'Tin roof', desc: 'Thin steel sheet, bright ring (critical freq ~24 kHz)', material: 'tin_roof', make: (p) => make.surface(id('tin'), 'tin_roof', p[0], p[1], 4, 3, Math.max(p[2], 0.05)) },
-      { key: 'glass', label: 'Glass', desc: 'Pane lying flat (skylight, table)', material: 'glass', make: (p) => make.surface(id('glass'), 'glass', p[0], p[1], 1.5, 1, Math.max(p[2], 0.05)) },
+      { key: 'glass', label: 'Glass', desc: 'Pane lying flat (skylight, table): bright short tick', material: 'glass', make: (p) => make.surface(id('glass'), 'glass', p[0], p[1], 1.5, 1, Math.max(p[2], 0.05)) },
       { key: 'concrete', label: 'Concrete', desc: 'Hard slab: clicks and splash tails', material: 'concrete', make: (p) => make.surface(id('concrete'), 'concrete', p[0], p[1], 5, 5, p[2]) },
       { key: 'puddle', label: 'Puddle', desc: 'Shallow water: bubble plinks', material: 'puddle', make: (p) => make.surface(id('puddle'), 'puddle', p[0], p[1], 1.6, 1.1, p[2]) },
       { key: 'pond', label: 'Pond', desc: 'Deep water: Minnaert bubbles, small-drop ring', material: 'water', make: (p) => make.water(id('pond'), p[0], p[1], 6, 4, 0.8) },
@@ -26,12 +26,12 @@ export const LIBRARY = [
     group: 'Structures',
     items: [
       { key: 'roof', label: 'Roof', desc: 'Gable roof (tiles)', material: 'tile', make: (p) => make.roof(id('roof'), 'tile', p[0], p[1], 2.8, 6, 5) },
-      { key: 'window', label: 'Window', desc: 'Glazing: rain ticks, transmission loss', material: 'glass', make: (p) => make.window(id('window'), p[0], p[1], 1.0, 1.2, 1.2) },
-      { key: 'wall', label: 'Wall', desc: 'Reflecting wall (brick)', material: 'brick', make: (p) => make.wall(id('wall'), 'brick', p[0], p[1], 6, 3) },
+      { key: 'window', label: 'Window', desc: 'Glazing: rain ticks, transmission loss', material: 'window', make: (p) => make.window(id('window'), p[0], p[1], 1.0, 1.2, 1.2) },
+      { key: 'wall', label: 'Wall', desc: 'Reflecting wall (brick): dull thud plus click', material: 'brick_wall', make: (p) => make.wall(id('wall'), 'brick_wall', p[0], p[1], 6, 3) },
       { key: 'porch', label: 'Porch', desc: 'Shed roof on posts', material: 'wood', make: (p) => make.porch(id('porch'), p[0], p[1], 6, 3, 2.6, 'wood') },
       { key: 'tent', label: 'Tent', desc: 'Tensioned membrane: low dense modes', material: 'tent_fabric', make: (p) => make.tent(id('tent'), p[0], p[1]) },
       { key: 'umbrella', label: 'Umbrella', desc: 'Close membrane over the head', material: 'umbrella_fabric', make: (p) => make.umbrella(id('umbrella'), p[0], p[1]) },
-      { key: 'car', label: 'Car', desc: 'Steel roof, glass, wipers', material: 'car_body', make: (p) => make.car(id('car'), p[0], p[1]) },
+      { key: 'car', label: 'Car', desc: 'Aluminium roof, glass, wipers', material: 'car_body', make: (p) => make.car(id('car'), p[0], p[1]) },
     ],
   },
   {
@@ -45,8 +45,8 @@ export const LIBRARY = [
   {
     group: 'Water flow',
     items: [
-      { key: 'gutter', label: 'Gutter', desc: 'Roof run-off: trickle and bubble cloud', material: 'metal', make: (p) => make.gutter(id('gutter'), p[0], p[1], 2.6, 5) },
-      { key: 'downspout', label: 'Downspout', desc: 'Pipe resonance, gurgle', material: 'metal', make: (p) => make.downspout(id('downspout'), p[0], p[1], 2.6) },
+      { key: 'gutter', label: 'Gutter', desc: 'Roof run-off: trickle and bubble cloud', material: 'metal_gutter', make: (p) => make.gutter(id('gutter'), p[0], p[1], 2.6, 5) },
+      { key: 'downspout', label: 'Downspout', desc: 'Pipe resonance, gurgle', material: 'metal_gutter', make: (p) => make.downspout(id('downspout'), p[0], p[1], 2.6) },
       { key: 'eave', label: 'Eave drips', desc: 'Integrate-and-fire drips (Tate drops)', material: 'wood', make: (p) => make.eave(id('eave'), p[0], p[1], 2.6, 4) },
     ],
   },
