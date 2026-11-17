@@ -69,7 +69,7 @@ _MACRO_KEYS = ("intensity", "closeness", "wildness")
 _APPLY_EVERY_S = 0.35            # structural changes (objects, listener, scene) at most this often
 _IDLE_STOP_S = 15.0              # stop the sound when every Composer window has been gone this long
 _CAPTION_KINDS = ("hail", "rain_start", "rain_stop", "gutter_overflow")
-_BUFFER_S = 0.75                 # render-ahead: headroom for the Composer's 3-D view sharing the CPU
+_BUFFER_S = 0.2                  # render-ahead; the GUI window runs at lower CPU priority (open_window)
 _RENDER_DESTINATION = "streaming_broadcaster"   # -18 LUFS / -1 dBTP for 'Render WAV' (scene destination wins)
 
 
@@ -912,6 +912,17 @@ def _profile_dir() -> str:
     return p
 
 
+def _low_priority() -> dict:
+    """Run the GUI window below normal CPU priority so the audio engine always wins the CPU.
+
+    Lowering priority needs no privileges (raising the audio thread's would), and the window
+    uses its own browser profile, so this touches only the Composer window.
+    """
+    if os.name == "nt":
+        return {"creationflags": 0x00004000}          # BELOW_NORMAL_PRIORITY_CLASS
+    return {"preexec_fn": lambda: os.nice(10)}
+
+
 def open_window(url: str) -> Optional[subprocess.Popen]:
     """An app window (Edge / Chrome / Chromium --app=URL, own profile) or the default browser."""
     for exe in _browsers():
@@ -920,7 +931,7 @@ def open_window(url: str) -> Optional[subprocess.Popen]:
                                      "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required",
                                      "--window-size=1440,900"],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    start_new_session=(os.name != "nt"))
+                                    start_new_session=(os.name != "nt"), **_low_priority())
         except OSError:
             continue
     webbrowser.open(url)
