@@ -78,6 +78,19 @@ const BLOCK_REF: f32 = 1024.0;
 const LIVE_EPS: f32 = 1e-12;
 pub const AIR_MIN_DIST_M: f32 = 3.0;
 
+/// Shared drop-arrival clustering of the local rain field (one stream, same key for every patch
+/// and the bed, so the whole near field breathes together instead of averaging out over ~30
+/// independent patches). Rain arrivals are a doubly stochastic Poisson process, clustered on
+/// 0.1-few s scales (Kostinski & Jameson 1997; Jameson & Kostinski 1999-2001; 1-s rain-rate
+/// CV ~0.3-0.5 in steady rain); sigma 0.4 of log-rate over OU time constants 0.1-1.6 s lifts
+/// the envelope modulation in the 0.5-5 Hz band from ~-24 dB to >= -20 dB re 100 % (10 % rms).
+pub const CLUSTER_SIGMA: f64 = 0.4;
+pub const CLUSTER_TAU_S: (f64, f64) = (0.1, 1.6);
+
+pub fn cluster_modulator(bc: &super::BuildCtx) -> RateModulator {
+    RateModulator::new(&bc.rngf, "rain/cluster", CLUSTER_SIGMA, CLUSTER_TAU_S.0, CLUSTER_TAU_S.1, bc.sr as f64)
+}
+
 #[inline]
 fn splash_a2() -> f32 {
     ((0.03f64 * 0.03 - 0.005 * 0.005) / (2.0 * (0.03f64 / 0.005).ln())) as f32
@@ -387,6 +400,7 @@ pub struct RainPatchVoice {
     lod_prev: Option<([bool; 5], [bool; 5])>,
     // state
     cox: RateModulator,
+    cluster: RateModulator,
     table: ClassTable,
     table_ver: u64,
     key_ev: u64,
@@ -492,6 +506,7 @@ impl RainPatchVoice {
             dense_key: None,
             lod_prev: None,
             cox: RateModulator::new(&bc.rngf, &format!("{name}/cox"), 0.22, 0.1, 12.0, sr as f64),
+            cluster: cluster_modulator(bc),
             table: ClassTable::default(),
             table_ver: 0,
             key_ev: bc.rngf.key(&format!("{name}/events")),
@@ -891,8 +906,10 @@ impl Voice for RainPatchVoice {
             return Emission::silent(self.stem);
         }
         let w = ctx.weather;
-        let m1 = self.cox.step(ctx.index, n);
-        let m0 = self.cox.prev;
+        let c1 = self.cluster.step(ctx.index, n);
+        let c0 = self.cluster.prev;
+        let m1 = self.cox.step(ctx.index, n) * c1;
+        let m0 = self.cox.prev * c0;
         let gate = rain_gate(w.precip_type);
         if gate > 0.0 && self.base > 0.0 && w.class_flux.iter().any(|v| *v > 0.0) {
             self.events(ctx, gate, m0, m1, n);
@@ -961,6 +978,7 @@ impl Voice for RainPatchVoice {
         self.rad.reset();
         self.direct.clear();
         self.cox.reset();
+        self.cluster.reset();
         self.lod_prev = None;
         self.dense_key = None;
         self.color_key = [None; 5];

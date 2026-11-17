@@ -250,7 +250,14 @@ impl Graph {
 pub fn build_graph(scene: Scene, patches: Vec<Patch>, materials: &MaterialTable, cfg: &BuildCfg) -> Graph {
     let mut voices: Vec<BoxedVoice> = crate::rain::build_voices(&scene, &patches, materials, cfg);
     voices.extend(crate::env::build_voices(&scene, &patches, materials, cfg));
-    let procs = crate::env::build_bus_processors(&scene, &patches, materials, cfg);
+    let mut procs: Vec<BoxedProcessor> = Vec::new();
+    // place acoustics (early reflections + outdoor diffuse tail) of the exterior rain field,
+    // first, so the shelter transfer that follows also filters the reflections
+    let space = crate::spatial::space::SpaceProcessor::new(&scene, cfg);
+    if space.needed() {
+        procs.push(Box::new(space));
+    }
+    procs.extend(crate::env::build_bus_processors(&scene, &patches, materials, cfg));
     let slots = voices.into_iter().map(|v| Slot::new(v, cfg.block)).collect();
     Graph { rng: cfg.rng, scene: Arc::new(scene), patches: Arc::new(patches), slots, procs }
 }

@@ -20,7 +20,11 @@ use crate::rng::Rng;
 use crate::types::{bearing_to_azimuth, Emission, MaterialKind, PatchKind, Stem, Weather, N_AMBI, N_CLASSES};
 use std::sync::Arc;
 
-const BANDS: [(f32, f32); 4] = [(120.0, 700.0), (700.0, 2500.0), (2500.0, 8000.0), (8000.0, 18000.0)];
+// The lowest band reaches down to 60 Hz: large drops (classes 3-4, 2.8-4.2 mm, ~9 m/s) carry
+// 0.25-0.40 of their impact energy below 700 Hz, and on compliant ground (soil, litter, leaf
+// plates with fundamental modes ~50-200 Hz) part of it radiates as the 60-120 Hz "thud" that
+// gives a heavy downpour its body; with a 120 Hz edge the bed had none (-15 dB at 63 Hz).
+const BANDS: [(f32, f32); 4] = [(60.0, 700.0), (700.0, 2500.0), (2500.0, 8000.0), (8000.0, 18000.0)];
 const IMPACT_BANDS: [[f32; 4]; 5] = [
     [0.00, 0.10, 0.40, 0.50],
     [0.02, 0.15, 0.48, 0.35],
@@ -61,6 +65,7 @@ pub struct RainBedVoice {
     olas: Vec<Ola>,
     psd: Vec<f32>,
     wander: (RateModulator, RateModulator),
+    cluster: RateModulator,
     key: u64,
 }
 
@@ -183,6 +188,7 @@ impl RainBedVoice {
                 RateModulator::new(&bc.rngf, "rain/bed/wander_x", 0.6, 1.0, 30.0, sr as f64),
                 RateModulator::new(&bc.rngf, "rain/bed/wander_y", 0.6, 1.0, 30.0, sr as f64),
             ),
+            cluster: super::rain::cluster_modulator(bc),
             key: bc.rngf.key("rain/bed"),
             kb,
         }
@@ -285,7 +291,12 @@ impl Voice for RainBedVoice {
         if n == 0 || out.len() < N_AMBI * n {
             return Emission::silent(Stem::RainFar);
         }
-        let power = self.band_power(w);
+        let mut power = self.band_power(w);
+        // the shared clustering, at half the log-depth: the bed averages over 10-300 m
+        let cl = (self.cluster.step(ctx.index, n) as f32).sqrt();
+        for p in power.iter_mut() {
+            *p *= cl;
+        }
         let v: f32 = power.iter().map(|x| x.max(0.0)).sum();
         // the wanderers advance every block so their state never depends on silence
         let vdir = self.aniso(w, ctx.index, n);
@@ -358,6 +369,7 @@ impl Voice for RainBedVoice {
         self.aniso_prev = [0.0; 3];
         self.wander.0.reset();
         self.wander.1.reset();
+        self.cluster.reset();
         self.band_key = None;
     }
 }

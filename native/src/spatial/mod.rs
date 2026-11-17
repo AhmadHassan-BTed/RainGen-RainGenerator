@@ -8,6 +8,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod sh;
 pub mod simd;
+pub mod space;
 pub mod stems;
 
 pub use allpass::{allpass_bank, design_allpass_firs};

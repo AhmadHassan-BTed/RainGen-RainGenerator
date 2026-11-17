@@ -262,7 +262,7 @@ class NativeSession:
         self.error: Optional[BaseException] = None
         self.cal_db = 0.0
         self.volume_db = 0.0
-        self.latency_ms = 30.0
+        self.latency_ms = 120.0
         self.control_ms = 0.0
 
     # -- structure ------------------------------------------------------------
@@ -384,7 +384,7 @@ class NativeSession:
         self.reset()
         return float(np.clip(float(target_lufs) - lufs, -G, G)) if math.isfinite(lufs) else 0.0
 
-    def start(self, device: Optional[str] = None, latency_ms: float = 30.0, *, target_lufs: Optional[float] = -20.0,
+    def start(self, device: Optional[str] = None, latency_ms: float = 120.0, *, target_lufs: Optional[float] = -20.0,
               prime_s: float = 1.5, volume_db: float = 0.0, ceiling_dbtp: float = -1.0,
               on_marker: Optional[Callable] = None) -> "NativeSession":
         """Stream live through cpal (Rust producer + lock-free ring); Python steps the World per block."""

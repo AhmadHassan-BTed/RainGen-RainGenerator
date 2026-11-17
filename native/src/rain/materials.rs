@@ -43,8 +43,44 @@ impl MatData {
     }
 }
 
+/// Widest gap between neighbouring modes before it is filled (ratio, half an octave).
+const MODE_GAP_RATIO: f32 = 1.414;
+/// Gaps are filled only above this frequency.
+const MODE_FILL_MIN_HZ: f32 = 250.0;
+/// Spacing of the filling modes (third octave).
+const MODE_FILL_RATIO: f32 = 1.26;
+
+/// The material's modes, with gaps wider than half an octave filled. A plate's modal density is
+/// constant in frequency (n = S/(4 pi) sqrt(rho h / D), Cremer & Heckl), so a table that lists the
+/// lowest plate modes and then jumps to a log-spaced high series (tin_roof: 408 Hz -> 900 Hz)
+/// leaves a hole that real panels do not have: measured as a 15-17 dB notch at 500-630 Hz in
+/// the attic presets. The filling modes take log-interpolated T60 and gain from their neighbours.
 fn modes_of(m: &Material) -> Vec<(f32, f32, f32)> {
-    m.modes.iter().map(|md| (md.freq_hz, md.t60_s, md.gain)).collect()
+    let mut v: Vec<(f32, f32, f32)> = m.modes.iter().map(|md| (md.freq_hz, md.t60_s, md.gain)).collect();
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if v.len() < 2 {
+        return v;
+    }
+    let mut out = Vec::with_capacity(v.len() + 8);
+    for i in 0..v.len() {
+        out.push(v[i]);
+        if i + 1 == v.len() {
+            break;
+        }
+        let (a, b) = (v[i], v[i + 1]);
+        // only above the fundamental region: the lowest plate / membrane modes are genuinely
+        // sparse (constant density per Hz means wide ratios at the bottom)
+        if a.0 < MODE_FILL_MIN_HZ || b.0 / a.0 <= MODE_GAP_RATIO {
+            continue;
+        }
+        let k = ((b.0 / a.0).ln() / MODE_FILL_RATIO.ln()).ceil() as usize;
+        for j in 1..k {
+            let x = j as f32 / k as f32;
+            let lerp = |p: f32, q: f32| (p.max(1e-9).ln() * (1.0 - x) + q.max(1e-9).ln() * x).exp();
+            out.push((lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2)));
+        }
+    }
+    out
 }
 
 fn calibration(modes: &[(f32, f32, f32)], rad: &[BiquadCoefs], level_db: f32, sr: f32) -> f32 {
@@ -222,10 +258,17 @@ pub fn patch_geometry(p: &Patch) -> (f32, f32) {
     (r_eq.max(0.1), spread)
 }
 
+/// Patches closer than this are the near layer (rain_near, coherent, localised). Within ~5 m a
+/// listener resolves single drop impacts on a patch: the per-patch event rate per critical band is
+/// below the ear's ~2-5 ms temporal resolution and the direct sound dominates the outdoor
+/// reverberation (direct-to-reverberant > 0 dB for the place tails of spatial::space). The
+/// 1.5-4 m ground ring (r_eq ~3.3 m) belongs here, not to the diffuse far field.
+pub const NEAR_STEM_M: f32 = 5.0;
+
 pub fn stem_for(p: &Patch) -> Stem {
     if p.interior {
         Stem::Interior
-    } else if p.distance() < 3.0 {
+    } else if p.distance() < NEAR_STEM_M {
         Stem::RainNear
     } else {
         Stem::RainFar
