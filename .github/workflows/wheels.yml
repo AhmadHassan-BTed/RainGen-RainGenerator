@@ -85,6 +85,7 @@ jobs:
     # One universal2 wheel (Intel + Apple Silicon) from the current arm64 runner; the
     # macos-13 Intel image is being retired and can queue indefinitely.
     runs-on: macos-14
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -128,7 +129,8 @@ jobs:
   release:
     name: Attach wheels to the GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, windows, macos, sdist]
+    # macOS runners can queue for hours; release with what built and add macOS when it lands.
+    needs: [linux, windows, sdist]
     runs-on: ubuntu-latest
     permissions:
       contents: write
