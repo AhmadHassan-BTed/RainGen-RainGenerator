@@ -203,7 +203,7 @@ export class Viewport {
   }
 
   _syncLoop() {
-    const run = !(this._lite && document.hidden);
+    const run = this.visualsMode !== 'off' && !(this._lite && document.hidden);
     if (run === this._looping) return;
     this._looping = run;
     if (run) {
@@ -1606,14 +1606,10 @@ export class Viewport {
   setVisualsMode(mode) {
     this.visualsMode = mode;
     this.fx.setMode(mode);
-    if (mode === 'off') {
-      this.renderer.setAnimationLoop(null);
-      this.container.classList.add('visuals-off');
-    } else {
-      this.container.classList.remove('visuals-off');
-      this.clock.getDelta();
-      this.renderer.setAnimationLoop(() => this._frame());
-    }
+    // One owner of the render loop: Scene off stops all 3-D drawing (the CPU goes to the sound).
+    this.container.classList.toggle('visuals-off', mode === 'off');
+    this._looping = null;
+    this._syncLoop();
   }
 
   setReducedMotion(on) {
