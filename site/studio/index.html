@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>raingen · 4D Composer</title>
+<meta name="description" content="Build the world, not the knobs: place roofs, trees, puddles, cars and storm cells in 3-D, move through time, and hear physics-driven rain, wind and thunder from wherever you stand. Runs in your browser.">
+<link rel="canonical" href="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/studio/">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="raingen">
+<meta property="og:title" content="raingen · 4D Composer">
+<meta property="og:description" content="Place roofs, trees, cars and storm cells in 3-D, move through time and hear physics-driven rain, wind and thunder from wherever you stand. In the browser, no install.">
+<meta property="og:url" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/studio/">
+<meta property="og:image" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/assets/og.png">
+<meta property="og:image:alt" content="raingen: physics-driven weather sound">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="raingen · 4D Composer">
+<meta name="twitter:description" content="Build a weather scene in 3-D and hear physics-driven rain, wind and thunder from wherever you stand.">
+<meta name="twitter:image" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/assets/og.png">
+<meta name="twitter:image:alt" content="raingen: physics-driven weather sound">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<link rel="modulepreload" href="app/main.js?v=20261117a">
+<link rel="stylesheet" href="studio.css">
+</head>
+<body>
+<a class="skip-link" href="#listener-ui">Skip to listening controls</a>
+<a class="skip-link" href="#stage">Skip to the 3-D view</a>
+<a class="skip-link" href="#inspector">Skip to the inspector</a>
+<a class="skip-link" href="#timeline">Skip to the timeline</a>
+
+<header class="topbar" role="banner">
+  <a class="brand" href="../" aria-label="raingen home">
+    <img src="../assets/logo.svg" alt="" width="28" height="28">
+    <span class="brand-name">raingen</span>
+    <span class="brand-sub">4D Composer</span>
+  </a>
+
+  <div class="ws-toggle" role="radiogroup" aria-label="Workspace">
+    <button type="button" role="radio" id="ws-listener" data-ws="listener" aria-checked="true" tabindex="0" aria-keyshortcuts="Control+1" title="Listener (Ctrl+1)">Listener</button>
+    <button type="button" role="radio" id="ws-studio" data-ws="studio" aria-checked="false" tabindex="-1" aria-keyshortcuts="Control+2" title="Studio (Ctrl+2)">Studio</button>
+  </div>
+
+  <div class="transport" role="group" aria-label="Transport">
+    <button type="button" id="btn-play" class="btn-play" aria-keyshortcuts="Space" aria-label="Play">
+      <svg class="ico ico-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l12.5-7.5z"/></svg>
+      <svg class="ico ico-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg>
+    </button>
+    <button type="button" id="btn-stop" class="icon-btn" aria-label="Stop and return to start" title="Stop (return to start)">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5h11v11h-11z"/></svg>
+    </button>
+    <div class="clock" aria-label="Timeline clock">
+      <output id="clock-tc" class="clock-tc" aria-label="Time" aria-live="off">00:00.00</output>
+      <output id="clock-smpte" class="clock-smpte" aria-label="SMPTE timecode" aria-live="off">00:00:00:00</output>
+    </div>
+    <div class="f2b" id="f2b" role="group" aria-label="Flash-to-bang counter" title="Seconds between a lightning flash and its thunder (about 3 s per km)">
+      <svg class="ico ico-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 2 5 13.5h6L9.5 22 19 9.5h-6.2z"/></svg>
+      <output id="f2b-value" class="f2b-value" aria-live="off">—</output>
+    </div>
+    <span id="audio-status" class="audio-status" data-state="idle">Audio off</span>
+  </div>
+
+  <div class="meter" id="meter" role="meter" aria-label="Loudness, momentary" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60" aria-valuetext="silent">
+    <span class="meter-track"><span class="meter-fill" id="meter-fill"></span></span>
+    <span class="meter-text" id="meter-text">– LUFS</span>
+  </div>
+
+  <div class="topbar-actions">
+    <label class="vol-studio" for="vol-studio">
+      <span class="sr-only">Volume</span>
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h4l5-4v13l-5-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <input type="range" id="vol-studio" min="0" max="100" step="1" value="70">
+      <output id="vol-studio-out" class="vol-out" aria-live="off">70 %</output>
+    </label>
+    <button type="button" id="btn-undo" class="icon-btn" aria-label="Undo" title="Undo (Ctrl+Z)" aria-keyshortcuts="Control+Z" disabled>
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 4 12l5 5M4.5 12H15a5 5 0 0 1 0 10h-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button type="button" id="btn-redo" class="icon-btn" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" aria-keyshortcuts="Control+Shift+Z" disabled>
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 7 5 5-5 5M19.5 12H9a5 5 0 0 0 0 10h2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button type="button" id="btn-save-preset" class="btn btn-ghost" aria-keyshortcuts="Control+S" title="Save as my preset (Ctrl+S)">Save preset</button>
+    <button type="button" id="btn-render" class="btn btn-ghost" title="Render a WAV file offline">Render WAV</button>
+    <button type="button" id="btn-export" class="btn btn-ghost" title="Download the scene as rainscene JSON (also opens in the Python CLI)">Export</button>
+    <button type="button" id="btn-import" class="btn btn-ghost" title="Open a rainscene JSON file">Import</button>
+    <input type="file" id="file-import" accept=".json,application/json" hidden>
+    <button type="button" id="btn-share" class="btn btn-primary" title="Copy a link with the whole scene inside it">Share</button>
+    <button type="button" id="btn-help" class="icon-btn" aria-label="Help and keyboard shortcuts" title="Help (F1 or ?)" aria-keyshortcuts="F1">?</button>
+  </div>
+</header>
+
+<main id="app" class="app" data-workspace="listener">
+  <aside id="library" class="panel panel-library" aria-label="Library" tabindex="-1" hidden></aside>
+
+  <section id="stage" class="stage" aria-label="3-D environment" tabindex="-1">
+    <div id="viewport" class="viewport"></div>
+    <div id="vp-fallback" class="vp-fallback" role="status" hidden></div>
+
+    <div id="vp-toolbar" class="vp-toolbar" role="toolbar" aria-label="Viewport tools">
+      <div class="vp-group" role="group" aria-label="Camera">
+        <button type="button" class="vp-btn" data-cam="director" aria-pressed="true" title="Director: orbit (1)">Director</button>
+        <button type="button" class="vp-btn" data-cam="top" aria-pressed="false" title="Top: map view (2)">Top</button>
+        <button type="button" class="vp-btn" data-cam="walk" aria-pressed="false" title="Walk: WASD + mouse look, Shift runs (3)">Walk</button>
+        <button type="button" class="vp-btn vp-demo" id="btn-demo" title="Guided demo: walk in from the storm">Walk in from the storm</button>
+      </div>
+      <div class="vp-group" role="group" aria-label="Transform">
+        <button type="button" class="vp-btn" data-gizmo="translate" aria-pressed="true" title="Move (W)">Move</button>
+        <button type="button" class="vp-btn" data-gizmo="rotate" aria-pressed="false" title="Rotate (E)">Rotate</button>
+        <button type="button" class="vp-btn" data-gizmo="scale" aria-pressed="false" title="Scale (R)">Scale</button>
+        <button type="button" class="vp-btn" id="btn-snap" aria-pressed="false" title="Snap to 0.5 m / 15° (N)">Snap</button>
+        <button type="button" class="vp-btn" id="btn-frame" title="Frame selection (F)">Frame</button>
+      </div>
+      <details class="vp-menu">
+        <summary class="vp-btn">Layers</summary>
+        <div class="vp-menu-body" role="group" aria-label="Viewport layers">
+          <label><input type="checkbox" data-layer="footprint" checked> Hearing footprint (50 % / 90 %)</label>
+          <label><input type="checkbox" data-layer="wind" checked> Wind streamlines</label>
+          <label><input type="checkbox" data-layer="wavefront" checked> Thunder wavefront</label>
+          <label><input type="checkbox" data-layer="heatmap"> Impact heatmap</label>
+          <label><input type="checkbox" data-layer="rays"> Propagation rays</label>
+          <label><input type="checkbox" data-layer="labels"> Object labels</label>
+          <label><input type="checkbox" data-layer="grid" checked> Grid</label>
+          <label><input type="checkbox" id="opt-autoshelter" checked> Shelter follows where you stand</label>
+        </div>
+      </details>
+      <div class="vp-group segmented vp-visuals" role="radiogroup" aria-label="Visuals">
+        <input type="radio" name="vp-visuals" id="vp-vis-full" value="full" checked><label for="vp-vis-full">Full</label>
+        <input type="radio" name="vp-visuals" id="vp-vis-calm" value="calm"><label for="vp-vis-calm">Calm</label>
+        <input type="radio" name="vp-visuals" id="vp-vis-off" value="off"><label for="vp-vis-off">Off</label>
+      </div>
+    </div>
+
+    <div id="walk-hint" class="walk-hint" hidden>
+      <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk · click the view to look around · <kbd>Shift</kbd> run · <kbd>Esc</kbd> exit. Shelter changes because you moved.
+    </div>
+    <p id="subtitle" class="subtitle" aria-hidden="true"></p>
+    <div id="flash-glow" class="flash-glow" aria-hidden="true"></div>
+
+    <section id="listener-ui" class="listener-ui" aria-label="Listening controls" tabindex="-1"></section>
+  </section>
+
+  <aside id="inspector" class="panel panel-inspector" aria-labelledby="inspector-title" tabindex="-1" hidden></aside>
+
+  <section id="timeline" class="panel panel-timeline" aria-label="Timeline" tabindex="-1" hidden>
+    <div id="timeline-main" class="timeline-main"></div>
+    <section class="captions-panel" aria-labelledby="captions-title">
+      <div class="captions-head">
+        <h2 id="captions-title">Captions</h2>
+        <button type="button" id="btn-captions-vtt" class="btn btn-small" title="Download the caption log as WebVTT">VTT</button>
+        <button type="button" id="btn-captions-clear" class="icon-btn" aria-label="Clear captions" title="Clear captions">×</button>
+      </div>
+      <ol id="captions" class="captions-list"></ol>
+    </section>
+  </section>
+</main>
+
+<div id="gate" class="gate" role="dialog" aria-modal="true" aria-labelledby="gate-title" aria-describedby="gate-scene">
+  <div class="gate-inner">
+    <p class="gate-kicker" id="gate-title">raingen · physics-driven weather sound</p>
+    <p class="gate-scene" id="gate-scene">Steady rain on leaves, night</p>
+    <button type="button" id="gate-play" class="gate-play">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l12.5-7.5z"/></svg>
+      <span>Press to hear the rain</span>
+    </button>
+    <p class="gate-note" id="gate-note">Starts quietly and fades in. Headphones bring the 3-D sound alive.</p>
+    <button type="button" id="gate-silent" class="link-btn">Explore without sound</button>
+  </div>
+</div>
+
+<dialog id="dlg-help" class="dlg dlg-wide" aria-labelledby="help-title">
+  <form method="dialog" class="dlg-inner">
+    <div class="dlg-head"><h2 id="help-title">Help · keyboard</h2><button class="icon-btn" value="close" aria-label="Close help">×</button></div>
+    <div class="help-grid">
+      <section>
+        <h3>Everywhere</h3>
+        <dl class="keys">
+          <dt><kbd>Space</kbd></dt><dd>Play / pause (when the view, page or timeline has focus)</dd>
+          <dt><kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>2</kbd></dt><dd>Listener / Studio workspace</dd>
+          <dt><kbd>Ctrl</kbd>+<kbd>Z</kbd></dt><dd>Undo · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redo</dd>
+          <dt><kbd>Ctrl</kbd>+<kbd>S</kbd></dt><dd>Save as my preset</dd>
+          <dt><kbd>T</kbd></dt><dd>Strike lightning now</dd>
+          <dt><kbd>F1</kbd> or <kbd>?</kbd></dt><dd>This help</dd>
+          <dt>Sliders</dt><dd>Arrows fine, <kbd>PgUp</kbd>/<kbd>PgDn</kbd> coarse, <kbd>Home</kbd>/<kbd>End</kbd></dd>
+        </dl>
+      </section>
+      <section>
+        <h3>3-D view (Studio)</h3>
+        <dl class="keys">
+          <dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>Director · Top · Walk camera</dd>
+          <dt><kbd>W</kbd> <kbd>E</kbd> <kbd>R</kbd></dt><dd>Move · rotate · scale gizmo</dd>
+          <dt>Arrows</dt><dd>Move the selection (or the listener) 0.5 m · <kbd>Shift</kbd> 5 m</dd>
+          <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Turn the selection (or the listener) 15°</dd>
+          <dt><kbd>Ctrl</kbd>+<kbd>D</kbd></dt><dd>Duplicate · <kbd>Delete</kbd> remove</dd>
+          <dt><kbd>F</kbd> · <kbd>N</kbd></dt><dd>Frame selection · toggle snapping</dd>
+          <dt><kbd>Esc</kbd></dt><dd>Leave Walk / the demo, or deselect</dd>
+          <dt>Walk</dt><dd><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> + mouse (click to lock), <kbd>Shift</kbd> runs</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Timeline</h3>
+        <dl class="keys">
+          <dt><kbd>P</kbd></dt><dd>Add a point at the playhead on the selected track</dd>
+          <dt><kbd>Ctrl</kbd>+<kbd>G</kbd></dt><dd>Go to time (accepts 1:30 or 00:01:30:00)</dd>
+          <dt><kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd></dt><dd>Previous / next point</dd>
+          <dt><kbd>I</kbd> · <kbd>O</kbd> · <kbd>L</kbd></dt><dd>Loop in · loop out · loop on/off</dd>
+          <dt>On a point</dt><dd>Arrows move it (<kbd>Shift</kbd> 1 s), Up/Down change the value, <kbd>C</kbd> cycles the curve</dd>
+          <dt>Ruler</dt><dd>Drag to scrub · <kbd>Shift</kbd>-drag sets the loop</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>What you see</h3>
+        <ul class="help-list">
+          <li><b>Rings round the listener:</b> for drops hitting hard ground and panels heard at ear height <i>h</i>, half the sound comes from within radius <i>h</i> and 90 % from within 3<i>h</i>.</li>
+          <li><b>Thunder wavefront:</b> a sphere growing at the speed of sound for the air temperature, c = 331.3·√(1 + T/273.15) m/s. You hear the thunder the moment it reaches you: about 3 s per km.</li>
+          <li><b>Rain streaks:</b> count follows the rate, fall speed the drop size (Atlas et al. 1973), slant the wind at ear height.</li>
+          <li><b>Badges:</b> <span class="badge" data-state="auto">Auto</span> follows the Listener macros, <span class="badge" data-state="offset">Offset</span> keeps your adjustment on top, <span class="badge" data-state="pinned">Pinned</span> ignores macros, <span class="badge" data-state="automation">Anim</span> follows a timeline track. Alt-click re-links.</li>
+        </ul>
+      </section>
+    </div>
+    <label class="opt-row"><input type="checkbox" id="opt-single-keys" checked> Single-key shortcuts (T, P, I, O, L and the 3-D view keys)</label>
+    <p class="hint">Flashes are limited to 3 per second; with “reduce motion” or Calm visuals they become a soft glow. Everything is synthesized from physics: no recordings, never loops.</p>
+  </form>
+</dialog>
+
+<dialog id="dlg-render" class="dlg" aria-labelledby="render-title">
+  <form method="dialog" class="dlg-inner" id="render-form">
+    <div class="dlg-head"><h2 id="render-title">Render WAV</h2><button class="icon-btn" value="close" aria-label="Close render dialog">×</button></div>
+    <p class="hint">Renders offline from the start of the timeline with the same engine graph, automation included. 24-bit; binaural or stereo per the listener setting.</p>
+    <div class="field-row">
+      <label for="render-seconds">Length</label>
+      <input type="number" id="render-seconds" class="num" min="1" max="3600" step="1" value="60"> <span class="unit">s</span>
+      <button type="button" class="btn btn-small" id="render-use-timeline">Timeline</button>
+      <button type="button" class="btn btn-small" id="render-use-loop">Loop</button>
+    </div>
+    <div class="field-row">
+      <label for="render-rate">Sample rate</label>
+      <select id="render-rate">
+        <option value="48000" selected>48 kHz</option>
+        <option value="44100">44.1 kHz</option>
+        <option value="96000">96 kHz</option>
+      </select>
+    </div>
+    <progress id="render-progress" max="1" value="0" aria-label="Render progress"></progress>
+    <p id="render-status" class="render-status" role="status"></p>
+    <a id="render-link" class="btn btn-ghost" hidden>Download</a>
+    <div class="dlg-actions">
+      <button type="button" class="btn btn-primary" id="render-go">Render</button>
+      <button class="btn btn-ghost" value="cancel">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-share" class="dlg" aria-labelledby="share-title">
+  <form method="dialog" class="dlg-inner">
+    <div class="dlg-head"><h2 id="share-title">Share this weather</h2><button class="icon-btn" value="close" aria-label="Close share dialog">×</button></div>
+    <label for="share-url">Link</label>
+    <input type="text" id="share-url" class="mono share-url" readonly>
+    <p id="share-note" class="hint"></p>
+    <p id="share-status" class="hint" role="status"></p>
+    <div class="dlg-actions">
+      <button type="button" class="btn btn-primary" id="share-copy">Copy link</button>
+      <button type="button" class="btn btn-ghost" id="share-json">Download JSON</button>
+      <button class="btn btn-ghost" value="cancel">Done</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-save" class="dlg" aria-labelledby="save-title">
+  <form method="dialog" class="dlg-inner" id="save-form">
+    <div class="dlg-head"><h2 id="save-title">Save as my preset</h2><button class="icon-btn" value="close" aria-label="Close" formnovalidate>×</button></div>
+    <label for="save-name">Name</label>
+    <input type="text" id="save-name" maxlength="80" required autocomplete="off">
+    <p class="hint">Saved in this browser with every setting, object and timeline track. It appears first under Scenes · My presets. Use Share or Export to move it elsewhere.</p>
+    <div class="dlg-actions">
+      <button type="submit" class="btn btn-primary" value="save">Save</button>
+      <button class="btn btn-ghost" value="cancel" formnovalidate>Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+<noscript>
+  <style>.gate, .app, .skip-link, .topbar > :not(.brand) { display: none !important; }</style>
+  <div class="noscript">
+    <p><strong>The 4D Composer needs JavaScript.</strong> Turn it on for this site and reload the page.</p>
+    <p>The Python CLI renders the same scenes offline: <code>raingen render scene.json</code>. <a href="https://github.com/AhmadHassan-BTed/RainGen-RainGenerator">Get raingen on GitHub</a> or go <a href="../">back to the raingen home page</a>.</p>
+  </div>
+</noscript>
+
+<script type="module" src="app/main.js?v=20261117a"></script>
+<script>
+  /* If the composer did not start (a browser without ES modules, or a script that
+     failed to load), the start screen explains that instead of offering dead buttons. */
+  window.addEventListener('load', function () {
+    if (document.documentElement.getAttribute('data-ready')) return;
+    var gate = document.getElementById('gate');
+    var inner = gate && gate.querySelector('.gate-inner');
+    if (!inner) return;
+    while (inner.firstChild) inner.removeChild(inner.firstChild);
+    function para(id, cls, text) {
+      var p = document.createElement('p');
+      if (id) p.id = id;
+      p.className = cls;
+      p.textContent = text;
+      inner.appendChild(p);
+    }
+    para('gate-title', 'gate-kicker', 'raingen · 4D Composer');
+    para('', 'gate-scene', 'The composer could not start here');
+    para('gate-scene', 'gate-note', 'It needs a current version of Chrome, Edge, Firefox or Safari with JavaScript turned on. If you are on one, check your connection and reload the page.');
+    var back = document.createElement('a');
+    back.className = 'link-btn';
+    back.href = '../';
+    back.textContent = 'Back to the raingen home page';
+    inner.appendChild(back);
+    gate.hidden = false;
+  });
+</script>
+</body>
+</html>

@@ -4,55 +4,98 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rain-generator"
-version = "2.0.0"
+version = "3.0.0.dev0"
 authors = [
     { name = "Andre Oliveira", email = "azuletto@users.noreply.github.com" },
     { name = "Ahmad Hassan", email = "ahmadhassan@users.noreply.github.com" }
 ]
-description = "An immersive, procedural rain and thunderstorm simulator with dynamic audio synthesis and particle physics."
+description = "raingen: a physically based weather and environment sound engine (rain, wind, thunder, shelters) with studio-grade, loudness-correct rendering, plus the classic pygame rain simulator."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["rain", "thunderstorm", "simulator", "pygame", "audio-synthesis", "particles", "procedural"]
+keywords = [
+    "rain", "thunderstorm", "weather", "ambience", "sound-design", "procedural-audio", "audio-synthesis",
+    "physics", "ambisonics", "binaural", "loudness", "ebu-r128", "sleep-sounds", "foley", "simulator"
+]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
     "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio :: Sound Synthesis",
+    "Topic :: Multimedia :: Sound/Audio :: Mixers",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
     "Topic :: Games/Entertainment :: Simulation"
 ]
 dependencies = [
-    "pygame>=2.1.0",
-    "numpy>=1.20.0",
-    "sounddevice>=0.4.0",
-    "scipy>=1.7.0"
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "threadpoolctl>=3.1"
 ]
 
 [project.optional-dependencies]
+audio = [
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12"
+]
+yaml = [
+    "pyyaml>=6.0"
+]
+osc = [
+    "python-osc>=1.8"
+]
+sofa = [
+    "h5py>=3.8"
+]
+app = [
+    "pygame>=2.1.0"
+]
+native = [
+    "raingen-native>=0.1.0"
+]
+all = [
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "pyyaml>=6.0",
+    "python-osc>=1.8",
+    "h5py>=3.8",
+    "pygame>=2.1.0"
+]
 dev = [
     "pytest>=7.0.0",
-    "flake8>=5.0.0"
+    "flake8>=5.0.0",
+    "soundfile>=0.12",
+    "pyyaml>=6.0",
+    "python-osc>=1.8"
 ]
 
 [project.urls]
-Homepage = "https://github.com/azuletto/rain_generator"
-Repository = "https://github.com/azuletto/rain_generator.git"
-"Bug Tracker" = "https://github.com/azuletto/rain_generator/issues"
+Homepage = "https://ahmadhassan-bted.github.io/RainGen-RainGenerator/"
+Repository = "https://github.com/AhmadHassan-BTed/RainGen-RainGenerator"
+"Bug Tracker" = "https://github.com/AhmadHassan-BTed/RainGen-RainGenerator/issues"
+Documentation = "https://github.com/AhmadHassan-BTed/RainGen-RainGenerator/blob/main/docs/MASTER_PLAN.md"
 
 [project.scripts]
+raingen = "raingen.cli:main"
 rain-generator = "rain_generator.simulator:main"
 thunderstorm = "rain_generator.simulator:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rain_generator*"]
+include = ["rain_generator*", "raingen*"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-ra -q"
 testpaths = ["tests"]
+markers = [
+    "slow: long renders or sweeps (deselect with -m 'not slow')",
+]

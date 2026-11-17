@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest>=7.0.0
 flake8>=5.0.0
+# optional raingen features exercised by tests/raingen (pyproject extras: yaml, osc)
+pyyaml>=6.0
+python-osc>=1.8

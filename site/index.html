@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>raingen · Real weather, dialed in, not looped</title>
+<meta name="description" content="raingen is a physics-driven weather and environment sound engine. Describe the weather the way you would experience it (heavy rain, a gusty westerly, a storm 3 km away, you're in a tent) and get endless, never-repeating, studio-grade sound you fully own.">
+<link rel="canonical" href="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#000000">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="raingen">
+<meta property="og:title" content="raingen · Real weather, dialed in, not looped">
+<meta property="og:description" content="Weather you can direct: physics-driven, never-looping, deterministic weather sound for games, film and TV, sleep and focus apps, creators and musicians. MIT licensed.">
+<meta property="og:url" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/">
+<meta property="og:image" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/assets/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="raingen: Weather you can direct. Rain falling on a black stage.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="raingen · Real weather, dialed in, not looped">
+<meta name="twitter:description" content="Weather you can direct: physics-driven, never-looping, deterministic weather sound. MIT licensed.">
+<meta name="twitter:image" content="https://ahmadhassan-bted.github.io/RainGen-RainGenerator/assets/og.png">
+<meta name="twitter:image:alt" content="raingen: Weather you can direct.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="modulepreload" href="assets/landing.js?v=20261117a">
+<script>document.documentElement.classList.add('js');</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="./" aria-label="raingen, home"><img src="assets/logo.svg" alt="" width="22" height="22"><span>raingen</span></a>
+    <nav class="site-nav" aria-label="Page sections">
+      <a href="#space">Sound</a>
+      <a href="#physics">Physics</a>
+      <a href="#composer">Composer</a>
+      <a href="#code">Developers</a>
+      <a href="#delivery">Delivery</a>
+    </nav>
+    <a class="btn btn-secondary btn-sm header-cta" href="studio/">Open the Composer</a>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" aria-labelledby="hero-title">
+  <canvas class="hero-sky" id="hero-sky" aria-hidden="true"></canvas>
+  <div class="wrap hero-copy">
+    <p class="eyebrow rise">Weather and environment sound engine</p>
+    <h1 id="hero-title" class="rise" data-d="1">Weather you<br>can direct.</h1>
+    <p class="hero-sub rise" data-d="2">Rain, wind and thunder, simulated from physics. Describe it in plain words and it plays, endlessly, never looped.</p>
+    <div class="hero-actions rise" data-d="3">
+      <a class="btn btn-primary" href="studio/">Open the Composer
+        <svg class="arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4"/></svg></a>
+    </div>
+  </div>
+
+  <div class="console" role="group" aria-labelledby="listen-label">
+    <div class="wrap">
+      <div class="console-grid">
+        <div class="console-cell listen-cell">
+          <button id="listen" class="listen-btn" type="button" aria-pressed="false" aria-describedby="listen-status">
+            <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7Z" fill="currentColor"/></svg>
+            <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true" hidden><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" fill="currentColor"/></svg>
+            <span class="visually-hidden">Listen</span>
+          </button>
+          <div>
+            <p class="listen-title" id="listen-label">Listen</p>
+            <p class="listen-note" id="listen-status">Headphones recommended. Nothing plays until you press.</p>
+            <noscript><p class="listen-note is-error">Live sound needs JavaScript.</p></noscript>
+          </div>
+        </div>
+        <div class="console-cell">
+          <label class="field-label" for="c-rain">How much rain</label>
+          <output class="field-value" id="c-rain-out" for="c-rain">5.0 mm/h · moderate</output>
+          <input type="range" id="c-rain" min="0" max="1000" step="1" value="566">
+        </div>
+        <div class="console-cell">
+          <label class="field-label" for="c-wind">Wind</label>
+          <output class="field-value" id="c-wind-out" for="c-wind">Force 3.0 · gentle breeze</output>
+          <input type="range" id="c-wind" min="0" max="12" step="0.1" value="3">
+        </div>
+        <div class="console-cell">
+          <div class="field-row">
+            <label for="c-thunder">Thunder</label>
+            <input type="checkbox" class="switch" id="c-thunder-on" checked aria-label="Thunder on">
+          </div>
+          <output class="field-value" id="c-thunder-out" for="c-thunder">6.0 km · 17.6 s</output>
+          <input type="range" id="c-thunder" min="0" max="1000" step="1" value="635">
+        </div>
+        <div class="console-cell">
+          <label class="field-label" for="c-shelter">Where you are</label>
+          <select id="c-shelter" class="select">
+            <option value="open">Out in it</option>
+            <option value="tree">Under a tree</option>
+            <option value="umbrella">Under an umbrella</option>
+            <option value="porch" selected>On a porch</option>
+            <option value="tent">In a tent</option>
+            <option value="room_open">Indoors, window open</option>
+            <option value="room_closed">Indoors, window shut</option>
+            <option value="car">In a car, wipers on</option>
+            <option value="attic">Attic under a tin roof</option>
+          </select>
+        </div>
+      </div>
+      <div class="console-status">
+        <p class="flash" id="flash-counter"><span class="flash-text" id="flash-text">Watch for a flash, then count: thunder at 6.0&nbsp;km arrives 17.6&nbsp;s later.</span></p>
+        <p class="captions" id="captions" aria-live="polite"></p>
+        <div class="meter" id="meter" hidden>
+          <span id="meter-text">-- LUFS</span>
+          <span class="meter-bar" aria-hidden="true"><span id="meter-fill"></span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="space" id="space" aria-labelledby="space-title">
+  <div class="space-stage">
+    <div class="space-copy">
+      <p class="eyebrow">Sound in space</p>
+      <h2 id="space-title">Every drop has a place.</h2>
+      <p class="lede">Rain lands all around you. Wind arrives from its bearing. Thunder reaches you after the flash, at the speed of sound in that air.</p>
+      <ol class="layouts" id="layouts">
+        <li data-step="0" class="is-active"><span class="name">Around the listener <span class="mono">3D</span></span><span class="desc"><span>Every impact, gust and thunderclap is placed in the scene and heard from where you stand.</span></span></li>
+        <li data-step="1"><span class="name">Stereo <span class="mono">2.0</span></span><span class="desc"><span>Two speakers at ±30°, folded down from the full scene.</span></span></li>
+        <li data-step="2"><span class="name">Surround <span class="mono">5.1</span></span><span class="desc"><span>Rain all around, thunder from its bearing, low end on the LFE, with the right WAVE channel masks.</span></span></li>
+        <li data-step="3"><span class="name">Immersive <span class="mono">7.1.4</span></span><span class="desc"><span>Four height channels put the rain overhead. Binaural for headphones, and AmbiX ambisonics, first to third order, for 360 video, VR and game engines.</span></span></li>
+      </ol>
+    </div>
+    <div class="space-canvas-wrap" aria-hidden="true">
+      <canvas class="space-canvas" id="space-canvas"></canvas>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="physics" aria-labelledby="physics-title">
+  <div class="wrap">
+    <div class="physics-head">
+      <div>
+        <p class="eyebrow reveal">Physics, not loops</p>
+        <h2 id="physics-title" class="reveal" data-d="1">Rain is a population of&nbsp;drops.</h2>
+      </div>
+      <p class="lede reveal" data-d="2">raingen simulates the drops, the surfaces they strike, the wind in trees and wires, and the air the thunder crosses to reach you. Nothing is a recording, so nothing repeats.</p>
+    </div>
+    <ul class="numbers">
+      <li class="reveal"><div class="num">14.9<small>kHz</small></div><p>The ring of a 0.22&nbsp;mm bubble, trapped when a small drop hits water.</p><span class="src">Minnaert · Medwin, Nystuen et al. 1992</span></li>
+      <li class="reveal" data-d="1"><div class="num">9.14<small>m/s</small></div><p>How fast a 5&nbsp;mm drop lands. Bigger drops land harder, and you hear it.</p><span class="src">Atlas 1973 fall speeds</span></li>
+      <li class="reveal" data-d="2"><div class="num">2.91<small>s/km</small></div><p>Flash to bang at 20&nbsp;°C. In colder air it stretches to 3.08 at −10&nbsp;°C.</p><span class="src">Speed of sound c(T)</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="section" id="composer" aria-labelledby="composer-title">
+  <div class="wrap">
+    <div class="composer-head">
+      <div>
+        <p class="eyebrow reveal">The 4D Composer</p>
+        <h2 id="composer-title" class="reveal" data-d="1">Build the world.<br>Then walk into it.</h2>
+        <p class="lede reveal" data-d="2">Put a tin roof over the listener, set an oak beside it, string a power line, draw the storm's track, then walk through it in first person. It runs in your browser, and nothing is uploaded.</p>
+      </div>
+      <a class="btn btn-secondary reveal" data-d="3" href="studio/">Open the Composer
+        <svg class="arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4"/></svg></a>
+    </div>
+    <figure class="composer-figure reveal">
+      <div class="composer-bar" aria-hidden="true"><span class="live">Top view</span><span class="hide-sm">Porch · tin roof · storm cell 25 km/h</span><span>05:12</span></div>
+        <svg class="cmp-svg" viewBox="0 0 720 470" role="img" aria-labelledby="cmp-title cmp-desc">
+          <title id="cmp-title">Composer top view illustration</title>
+          <desc id="cmp-desc">A top-down map: a listener under a tin porch roof, deciduous and conifer trees, a puddle, a downspout and a power line. A storm cell crosses from the north-east along a dashed track with keyframes. A lightning strike sends circular sound wavefronts outward toward the listener. Below, two automation lanes show rain rate and storm keyframes with a moving playhead.</desc>
+          <defs>
+            <pattern id="cmp-grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" class="grid-l"/></pattern>
+            <pattern id="cmp-rain" width="26" height="26" patternUnits="userSpaceOnUse" patternTransform="rotate(18)"><path d="M6 2v8M19 13v8" class="rain-l"/></pattern>
+            <clipPath id="cmp-clip"><rect width="720" height="380"/></clipPath>
+            <marker id="cmp-arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10Z" class="key"/></marker>
+          </defs>
+          <g clip-path="url(#cmp-clip)">
+            <rect class="floor" width="720" height="380"/>
+            <rect width="720" height="380" fill="url(#cmp-grid)"/>
+            <rect width="720" height="380" fill="url(#cmp-rain)"/>
+            <ellipse class="storm" cx="590" cy="98" rx="122" ry="78"/>
+            <path class="track" d="M712 22C650 60 600 82 560 110S470 190 424 226" marker-end="url(#cmp-arrow)"/>
+            <rect class="key" x="-5" y="-5" width="10" height="10" transform="translate(648 60) rotate(45)"/>
+            <rect class="key" x="-5" y="-5" width="10" height="10" transform="translate(500 160) rotate(45)"/>
+            <text class="lbl" x="606" y="196">Storm cell · 25 km/h</text>
+            <circle class="wave cmp-wave w1" cx="560" cy="110" r="330"/>
+            <circle class="wave cmp-wave w2" cx="560" cy="110" r="330"/>
+            <circle class="wave cmp-wave w3" cx="560" cy="110" r="330"/>
+            <path class="strike cmp-strike" d="M566 86l-12 18h8l-6 16 14-20h-8l6-14Z"/>
+            <path class="wire" d="M20 40Q200 70 420 30"/>
+            <circle class="pole" cx="20" cy="40" r="4"/>
+            <circle class="pole" cx="420" cy="30" r="4"/>
+            <text class="lbl-s" x="160" y="34">Power line Ø 30 mm · 67 Hz at 10 m/s</text>
+            <circle class="conifer" cx="62" cy="118" r="22"/>
+            <circle class="conifer" cx="62" cy="118" r="10"/>
+            <circle class="tree" cx="138" cy="196" r="42"/>
+            <circle class="tree" cx="204" cy="128" r="30"/>
+            <circle class="tree" cx="92" cy="304" r="32"/>
+            <text class="lbl" x="138" y="256" text-anchor="middle">Oak · deciduous</text>
+            <text class="lbl-s" x="62" y="156" text-anchor="middle">Pine</text>
+            <rect class="roof" x="245" y="250" width="110" height="62" rx="3"/>
+            <path class="roof-rib" d="M256 250v62M267 250v62M278 250v62M289 250v62M300 250v62M311 250v62M322 250v62M333 250v62M344 250v62"/>
+            <text class="lbl" x="300" y="243" text-anchor="middle">Porch · tin roof</text>
+            <path class="cone" d="M300 300L268 236A70 70 0 0 1 332 236Z"/>
+            <circle class="listener" cx="300" cy="300" r="9"/>
+            <text class="lbl" x="300" y="334" text-anchor="middle">You · 1.6 m</text>
+            <rect class="gutter" x="358" y="304" width="8" height="8" rx="1"/>
+            <text class="lbl-s" x="372" y="312">Downspout</text>
+            <ellipse class="water" cx="452" cy="338" rx="46" ry="16"/>
+            <text class="lbl-s" x="452" y="368" text-anchor="middle">Puddle · 8 mm deep</text>
+            <circle cx="682" cy="338" r="20" fill="none" class="grid-l" style="stroke-width: 1.5"/>
+            <path d="M682 322l6 16h-12Z" class="key"/>
+            <text class="lbl-s" x="682" y="372" text-anchor="middle">N</text>
+          </g>
+          <rect class="tl-bg" x="0" y="380" width="720" height="90"/>
+          <line class="tl-lane" x1="0" y1="427" x2="720" y2="427"/>
+          <text class="lbl-s" x="12" y="410">Rain mm/h</text>
+          <text class="lbl-s" x="12" y="452">Storm</text>
+          <path class="tl-curve" d="M120 418C200 418 240 394 330 396S470 416 560 412 660 404 700 406"/>
+          <rect class="tl-key" x="-4.5" y="-4.5" width="9" height="9" transform="translate(120 418) rotate(45)"/>
+          <rect class="tl-key" x="-4.5" y="-4.5" width="9" height="9" transform="translate(330 396) rotate(45)"/>
+          <rect class="tl-key" x="-4.5" y="-4.5" width="9" height="9" transform="translate(560 412) rotate(45)"/>
+          <line x1="240" y1="448" x2="470" y2="448" class="tl-lane" style="stroke-width: 3"/>
+          <rect class="tl-key-2" x="-4.5" y="-4.5" width="9" height="9" transform="translate(240 448) rotate(45)"/>
+          <rect class="tl-key-2" x="-4.5" y="-4.5" width="9" height="9" transform="translate(470 448) rotate(45)"/>
+          <text class="lbl-s" x="120" y="466" text-anchor="middle">0:00</text>
+          <text class="lbl-s" x="330" y="466" text-anchor="middle">5:00</text>
+          <text class="lbl-s" x="560" y="466" text-anchor="middle">12:00</text>
+          <line class="playhead cmp-playhead" x1="120" y1="384" x2="120" y2="470"/>
+        </svg>
+    </figure>
+  </div>
+</section>
+
+<section class="section" id="work" aria-labelledby="work-title">
+  <div class="wrap uses">
+    <div class="uses-head">
+      <p class="eyebrow reveal">For your work</p>
+      <h2 id="work-title" class="reveal" data-d="1">Wherever weather has to sound&nbsp;real.</h2>
+    </div>
+    <ul class="use-list">
+      <li class="reveal"><h3>Film and TV</h3><p>Stems, BWF with timecode and the scene in iXML, 7.1.4 and ambisonics, UCS names, and EDL cue sheets for every thunderclap and gust.</p></li>
+      <li class="reveal"><h3>Games</h3><p>Parameters in human units, a real-time engine with smooth glides, Wwise and FMOD manifests, and a seed per scene so QA can reproduce any bug.</p></li>
+      <li class="reveal"><h3>Music</h3><p>Thunder one-shot packs with UCS names, stems that mix like any other track, and OSC control of the live engine.</p></li>
+      <li class="reveal"><h3>Sleep and focus</h3><p>Relax, Sleep and Focus modes with low default levels, a timer and a long fade-out. No sudden loud sounds, and no loop for your ear to learn.</p></li>
+      <li class="reveal"><h3>Apps and installations</h3><p>A browser engine on Web Audio, a Python library and CLI, and one open scene format between them. METAR, disdrometer and live-weather import.</p></li>
+    </ul>
+  </div>
+</section>
+
+<section class="section" id="code" aria-labelledby="code-title">
+  <div class="wrap">
+    <div class="dev-head">
+      <div>
+        <p class="eyebrow reveal">Developers</p>
+        <h2 id="code-title" class="reveal" data-d="1">Plain words in.<br>Sound out.</h2>
+      </div>
+      <p class="lede reveal" data-d="2">A Python library, a CLI and a browser engine that share one scene format. Every example runs as shown.</p>
+    </div>
+    <div class="code-shell reveal">
+      <div class="tabs" role="tablist" aria-label="Code examples">
+        <button role="tab" type="button" id="tab-py" aria-controls="panel-py" aria-selected="true" tabindex="0">Python</button>
+        <button role="tab" type="button" id="tab-cli" aria-controls="panel-cli" aria-selected="false" tabindex="-1">CLI</button>
+        <button role="tab" type="button" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">Scene file</button>
+        <button role="tab" type="button" id="tab-js" aria-controls="panel-js" aria-selected="false" tabindex="-1">Browser</button>
+      </div>
+      <div class="code-panel" role="tabpanel" id="panel-py" aria-labelledby="tab-py" tabindex="0">
+        <button class="btn btn-secondary btn-sm copy-btn" type="button" data-copy="code-py">Copy</button>
+<pre class="code-block"><code id="code-py" data-lang="python">import raingen as rg
+
+# 1 · Just listen (real time; Ctrl+C stops; needs the "audio" extra)
+rg.play("rain on a tent, gusty, distant thunder")
+
+# 2 · Plain words → file (streams to disk; any length)
+report = rg.render("rain on a tin roof, wind 30 km/h from the west, distant thunder",
+                   minutes=60, out="cabin_storm.wav", destination="youtube")
+print(report)   # the file, loudness, true peak, events and the words it understood
+
+# 3 · Human units, one canonical path per parameter
+scene = rg.preset("tent-in-a-storm")
+scene.weather.precipitation.rate_mm_h = 8
+scene.weather.wind.speed_mps = rg.beaufort(5)      # 9.3 m/s, "fresh breeze"
+scene.weather.wind.from_deg = 270                  # meteorological "from": the west
+scene.weather.thunder.distance_km = 3              # ≈ 8.7 s flash-to-bang at 20 °C
+print(scene.describe())                            # "What am I hearing?" in plain words
+scene.save("my_tent.json")                         # the whole storm in about 2 KB
+
+# 4 · Long renders stream to disk in bounded memory
+scene.render(hours=10, seed=42, out="tent_sleep.wav", destination="sleep", mode="sleep")
+
+# 5 · Studio: automation, stems, 7.1.4, cue sheets, timecode
+from raingen.scene.timeline import ramp
+scene.timeline += ramp("weather.precipitation.rate_mm_h",
+                       [(0, 0.5), ("05:00", 25), ("12:00", 2)], curve="log")
+rg.render(scene, minutes=12, out="storm_714.wav", layout="7.1.4", stems=True,
+          captions=("srt", "edl"), start_tc="01:00:00:00", destination="post_stems")
+
+# 6 · A thunder one-shot pack with UCS file names
+rg.one_shots("thunder", count=12, out_dir="thunder_pack/")
+
+# 7 · Variations for a sound library or a game: derived seeds, small jitter
+for v in scene.variations(20):
+    v.render(seconds=90, out_dir="library/")       # UCS-named files
+
+# 8 · Real time: parameters glide, structural changes crossfade
+with rg.Engine(scene, layout="binaural") as eng:
+    eng.set("weather.wind.speed_mps", 14, ramp=2.0)
+    eng.set("weather.thunder.distance_km", "2 km", ramp=30)
+    eng.set("place.shelter", "car")
+    eng.run(60)</code></pre>
+      </div>
+      <div class="code-panel" role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" tabindex="0">
+        <button class="btn btn-secondary btn-sm copy-btn" type="button" data-copy="code-cli">Copy</button>
+<pre class="code-block"><code id="code-cli" data-lang="bash">raingen play "rain on a tent, gusty"              # real time; Ctrl+C stops
+raingen render "heavy rain on a car roof, wipers on" --minutes 30 --out car.flac --destination youtube
+raingen scene tent-in-a-storm --out my_tent.json
+raingen render my_tent.json --hours 10 --layout binaural --destination sleep --mode sleep
+raingen render tin-roof-cabin-storm --minutes 5 --stems --captions srt edl
+raingen variations tent-in-a-storm --count 20 --seconds 90 --out-dir library/
+raingen metar "KJFK 121755Z 21016G24KT 1SM +TSRA BR BKN015CB 18/17 A2990" --minutes 10 --out jfk.wav
+raingen live --place "Bergen, Norway" --minutes 5 --out bergen.wav    # the weather there now
+raingen play focus-steady-roof --osc 9000          # OSC control on UDP port 9000
+raingen presets --tag sleep
+raingen destinations
+raingen manifest --format wwise --out raingen_wwise.json</code></pre>
+      </div>
+      <div class="code-panel" role="tabpanel" id="panel-json" aria-labelledby="tab-json" tabindex="0">
+        <button class="btn btn-secondary btn-sm copy-btn" type="button" data-copy="code-json">Copy</button>
+<pre class="code-block"><code id="code-json" data-lang="json">{
+  "rainscene": 1,
+  "name": "Tent in a storm",
+  "seed": 1592642302,
+  "weather": {
+    "precipitation": { "type": "rain", "rate_mm_h": 8, "drops": "normal", "character": "showery",
+                       "shower_period_min": 12, "hail_size_mm": 13 },
+    "wind": { "speed_mps": 9.3, "from_deg": 270, "gust_factor": 1.8 },
+    "thunder": { "enabled": true, "distance_km": 3, "bearing_deg": 300, "approach_kmh": 15,
+                 "flashes_per_min": 2, "stroke_intensity": 0.6 },
+    "temperature_c": 14, "humidity_pct": 92, "hour": 23, "season": "autumn",
+    "storm_arc": "arriving", "arc_minutes": 20
+  },
+  "place": {
+    "preset": "conifer_forest", "shelter": "tent",
+    "surfaces": { "leaves": 40, "soil": 30, "puddle": 10, "fabric": 20 },
+    "window_open": 0, "wipers": "off",
+    "objects": [
+      { "id": "tent", "type": "tent", "material": "fabric", "position": [0, 0, 0],
+        "size": [2.2, 1.6, 1.2], "rotation_deg": 0, "params": {} },
+      { "id": "pine-1", "type": "tree", "material": "leaves", "position": [-7, 4, 0],
+        "size": [5, 5, 18], "rotation_deg": 0, "params": { "species": "conifer", "height": 18 } },
+      { "id": "storm-1", "type": "storm", "material": "", "position": [6000, 4000, 0],
+        "size": [8000, 8000, 10000], "rotation_deg": 0,
+        "params": { "track": [[6000, 4000], [-2000, -1500]], "speed_kmh": 25,
+                    "flashes_per_min": 2, "intensity": 0.7, "radius_km": 4 } }
+    ]
+  },
+  "listener": { "position": [0, 0, 0], "height_m": 0.5, "heading_deg": 0, "render": "binaural" },
+  "mode": "none",
+  "timeline": [
+    { "at": 0,   "path": "weather.precipitation.rate_mm_h", "value": 0.5, "curve": "log" },
+    { "at": 300, "path": "weather.precipitation.rate_mm_h", "value": 25,  "curve": "log" },
+    { "at": 720, "path": "weather.precipitation.rate_mm_h", "value": 2,   "curve": "smooth" }
+  ]
+}</code></pre>
+      </div>
+      <div class="code-panel" role="tabpanel" id="panel-js" aria-labelledby="tab-js" tabindex="0">
+        <button class="btn btn-secondary btn-sm copy-btn" type="button" data-copy="code-js">Copy</button>
+<pre class="code-block"><code id="code-js" data-lang="js">import { WeatherEngine, defaultScene } from './engine/weather-engine.js';
+
+const scene = defaultScene();                    // the same rainscene format the CLI renders
+scene.place.shelter = 'tent';
+scene.weather.thunder.enabled = true;
+
+const engine = new WeatherEngine();
+await engine.start();                            // call from a click: browsers need a gesture
+engine.setScene(scene);
+engine.setListener({ position: [0, 0, 0], headingDeg: 90 });
+
+// a 12-second swell into a downpour
+engine.setParam('weather.precipitation.rate_mm_h', 25, 12);
+
+// sight and sound share one lightning channel: [x, y, z] points in metres
+engine.on('flash', ({ channel, delaySec }) =&gt; console.log(`bolt of ${channel.length} points, thunder in ${delaySec.toFixed(1)} s`));
+engine.on('thunder', ({ distanceKm }) =&gt; console.log(`thunder from ${distanceKm.toFixed(1)} km`));
+
+// same graph, rendered offline to a 24-bit WAV Blob
+const wav = await engine.renderOffline(90, { sampleRate: 48000 });</code></pre>
+      </div>
+    </div>
+    <p class="code-note">Install from the repository with <code>pip install -e ".[audio]"</code>. The <code>audio</code> extra adds real-time playback and FLAC; <code>osc</code> adds OSC control. A saved storm is a <code>rainscene</code> JSON file of about 2&nbsp;KB that the Composer, the browser engine and the CLI all read.</p>
+  </div>
+</section>
+
+<section class="section" id="delivery" aria-labelledby="delivery-title">
+  <div class="wrap">
+    <div class="dev-head">
+      <div>
+        <p class="eyebrow reveal">Delivery</p>
+        <h2 id="delivery-title" class="reveal" data-d="1">Pick a destination.<br>Pass QC.</h2>
+      </div>
+      <p class="lede reveal" data-d="2">A BS.1770-5 meter over the whole programme, a true-peak limiter that detects at 8× oversampling, and TPDF dither on every integer export.</p>
+    </div>
+    <div class="table-wrap reveal">
+      <table class="data">
+        <caption class="visually-hidden">Loudness and true-peak targets by destination</caption>
+        <thead><tr><th scope="col">Destination</th><th scope="col">Loudness</th><th scope="col">True peak</th><th scope="col" class="notes">Notes</th></tr></thead>
+        <tbody>
+          <tr data-dest="youtube spotify"><th scope="row">YouTube · Spotify · music</th><td class="fig">−14 LUFS</td><td class="fig">−1 dBTP</td><td class="notes">−2 dBTP if the master is louder. FLAC for Spotify, 48&nbsp;k/24 WAV for YouTube.</td></tr>
+          <tr data-dest="apple_music"><th scope="row">Apple Music</th><td class="fig">≈ −16 LUFS</td><td class="fig">−1 dBTP</td><td class="notes">Unofficial target</td></tr>
+          <tr data-dest="podcast"><th scope="row">Apple Podcasts</th><td class="fig">−16 LKFS ±1</td><td class="fig">−1 dBTP</td><td class="notes">Stereo, 44.1&nbsp;kHz or higher</td></tr>
+          <tr data-dest="sleep"><th scope="row">Sleep video or app</th><td class="fig">−27 LUFS</td><td class="fig">−1 dBTP</td><td class="notes">Loudness range ≤ 4 LU, no event far above the bed, a long fade-out</td></tr>
+          <tr data-dest="broadcast_eu"><th scope="row">EU broadcast · EBU R128</th><td class="fig">−23.0 LUFS</td><td class="fig">−1 dBTP</td><td class="notes">BWF 48&nbsp;k/24 with bext v2 loudness fields</td></tr>
+          <tr data-dest="streaming_broadcaster"><th scope="row">Streaming broadcaster · R128 s2</th><td class="fig">−18 LUFS</td><td class="fig">−1 dBTP</td><td class="notes">The middle of the −20 to −16 LUFS range</td></tr>
+          <tr data-dest="broadcast_us"><th scope="row">US broadcast · ATSC A/85</th><td class="fig">−24 LKFS ±2</td><td class="fig">−2 dBTP</td><td class="notes">Full-mix measurement for content with no dialogue</td></tr>
+          <tr data-dest="online_streaming"><th scope="row">Online streaming · AES71</th><td class="fig">−24 LKFS</td><td class="fig">−2 dBTP</td><td class="notes">One target inside the −23 to −27 LKFS range</td></tr>
+          <tr class="is-key" data-dest="post_stems"><th scope="row">Film and TV post stems</th><td class="fig">Not normalized</td><td class="fig">−2 dBTP</td><td class="notes">Calibrated relative levels; BWF with timecode and the scene in iXML</td></tr>
+          <tr data-dest="game"><th scope="row">Game</th><td class="fig">Calibrated</td><td class="fig">−1 dBTP</td><td class="notes">Levels for middleware mixing, with Wwise and FMOD manifests</td></tr>
+          <tr data-dest="vr"><th scope="row">VR and 360</th><td class="fig">Calibrated</td><td class="fig">−1 dBTP</td><td class="notes">AmbiX first order for 360 video; third order for engines</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul class="formats">
+      <li class="reveal"><b>WAV, RF64 and BW64</b>Past 2&nbsp;GiB a file switches to RF64 in place, so a ten-hour render is one valid file.</li>
+      <li class="reveal" data-d="1"><b>BWF and iXML</b>Loudness, timecode and coding history in bext v2, and the full scene in iXML.</li>
+      <li class="reveal" data-d="2"><b>Every layout</b>Stereo, binaural, 5.1, 7.1 and 7.1.4 with the right channel masks; AmbiX first and third order.</li>
+      <li class="reveal"><b>Seven stems</b>Rain near, rain far, wind and foliage, thunder, drips, ambience, and the shelter interior.</li>
+      <li class="reveal" data-d="1"><b>Captions and cues</b>SRT and VTT captions; CSV and EDL cue sheets for thunder, gusts and flashes.</li>
+      <li class="reveal" data-d="2"><b>UCS v8.2.1 names</b><code>RAINClth_Moderate rain on tent close, wind W 15kmh gusty_RGN_raingen</code></li>
+    </ul>
+  </div>
+</section>
+
+<section class="final" aria-labelledby="final-title">
+  <div class="wrap">
+    <h2 id="final-title" class="reveal">Hear the weather you have in mind.</h2>
+    <p class="lede reveal" data-d="1">Open the Composer, build a place, and start the storm.</p>
+    <div class="hero-actions reveal" data-d="2">
+      <a class="btn btn-primary" href="studio/">Open the Composer
+        <svg class="arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4"/></svg></a>
+      <a class="btn btn-secondary" href="https://github.com/AhmadHassan-BTed/RainGen-RainGenerator">View on GitHub</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <a class="brand" href="./" aria-label="raingen, home"><img src="assets/logo.svg" alt="" width="22" height="22"><span>raingen</span></a>
+    <nav class="footer-links" aria-label="Project">
+      <a href="https://github.com/AhmadHassan-BTed/RainGen-RainGenerator">GitHub</a>
+      <a href="https://github.com/AhmadHassan-BTed/RainGen-RainGenerator/blob/main/LICENSE">MIT licence</a>
+    </nav>
+    <div class="footer-legal">
+      <span>© 2026 Ahmad Hassan. Released under the MIT licence.</span>
+      <span>100&nbsp;% synthesized. Lightning visuals are limited to 3 flashes per second.</span>
+    </div>
+  </div>
+</footer>
+
+<script type="module" src="assets/landing.js?v=20261117a"></script>
+</body>
+</html>

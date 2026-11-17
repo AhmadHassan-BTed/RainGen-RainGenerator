@@ -1,0 +1,67 @@
+# Publishes site/ (the landing page, the browser engine and the 4D Composer) to the gh-pages
+# branch with plain git. Only site/ is published: internal design documents stay in the repository.
+# In the repository settings, set Pages to deploy from the gh-pages branch (root). Only
+# actions/checkout is used; the push authenticates with GITHUB_TOKEN.
+name: Pages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the site
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f site/index.html
+          # internal planning documents must never be published
+          if find site -iname 'MASTER_PLAN*' -o -iname 'plan.html' | grep -q .; then
+            echo "::error::site/ contains an internal planning document; remove it before publishing."
+            exit 1
+          fi
+          touch site/.nojekyll
+
+      - name: Publish to gh-pages
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          work="$(mktemp -d)"
+          if git ls-remote --exit-code --heads "$remote" gh-pages >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch gh-pages "$remote" "$work"
+          else
+            git init --quiet "$work"
+            git -C "$work" checkout --quiet --orphan gh-pages
+            git -C "$work" remote add origin "$remote"
+          fi
+          find "$work" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a site/. "$work/"
+          cd "$work"
+          # Commit as the person whose push triggered the publish.
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+          git add --all
+          if git diff --cached --quiet; then
+            echo "Site unchanged; nothing to publish."
+            exit 0
+          fi
+          git commit --quiet -m "Publish site from ${GITHUB_SHA::7}"
+          git push --quiet origin HEAD:gh-pages
