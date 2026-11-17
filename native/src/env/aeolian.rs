@@ -551,6 +551,8 @@ pub struct ChimeVoice {
     amps: Vec<f32>,
     offs: Vec<usize>,
     y: Vec<f32>,
+    /// Live level (place.biophony.chimes) for the place's own chime set; None for layout objects.
+    amb: Option<AmbLevel>,
 }
 
 impl ChimeVoice {
@@ -596,6 +598,7 @@ impl ChimeVoice {
             amps: Vec::with_capacity(64 * m.max(1)),
             offs: Vec::with_capacity(64),
             y: vec![0.0; n],
+            amb: None,
         }
     }
 
@@ -625,7 +628,14 @@ impl Voice for ChimeVoice {
             return Emission::silent(Stem::Wind);
         }
         let start = (ctx.t0 * ctx.sr as f64).round() as u64;
-        let rate = (3.5 * smoothstep(u_loc, 0.8, 3.5) * (u_loc.max(0.1) / 5.0).powf(0.6) * (1.0 + 1.5 * (g - 1.0).max(0.0))).min(10.0);
+        let mut rate = (3.5 * smoothstep(u_loc, 0.8, 3.5) * (u_loc.max(0.1) / 5.0).powf(0.6) * (1.0 + 1.5 * (g - 1.0).max(0.0))).min(10.0);
+        let mut lv = 1.0f32;
+        if let Some(a) = self.amb.as_mut() {
+            lv = a.step(ctx, 0.0).clamp(0.0, 1.0) as f32;
+            if lv <= 1e-4 {
+                rate = 0.0;
+            }
+        }
         if rate <= 0.0 && self.bank.silent() && self.carry.is_empty() {
             return Emission::silent(Stem::Wind);
         }
@@ -667,6 +677,9 @@ impl Voice for ChimeVoice {
         y.iter_mut().for_each(|v| *v = 0.0);
         let gain = self.level * spreading(self.b.dist, 1.0);
         self.bank.process(&self.strikes, &self.amps, y, gain);
+        if self.amb.is_some() {
+            y.iter_mut().for_each(|v| *v *= lv);
+        }
         let y = &mut self.y[..n];
         let em = self.b.emit(ctx, y);
         out[..n].copy_from_slice(y);
@@ -678,6 +691,9 @@ impl Voice for ChimeVoice {
         self.b.air.reset();
         self.bank.reset();
         self.carry.clear();
+        if let Some(a) = self.amb.as_mut() {
+            a.reset();
+        }
     }
 }
 
@@ -1106,6 +1122,13 @@ pub fn build(scene: &Scene, patches: &[Patch], cfg: &BuildCfg) -> Vec<BoxedVoice
         if let Some(v) = from_patch(scene, p, cfg, h, mains) {
             out.push(v);
         }
+    }
+    // the place's own wind chimes (place.biophony.chimes, live level; silent at 0)
+    {
+        let mut c = cfg_rng(cfg, "place.chimes");
+        let mut v = ChimeVoice::new("place.chimes", [2.2, 1.6, 2.3 - h], 2.3, scene, cfg, &mut c, 5, 523.25, "pentatonic", "aluminium", 72.0, 1.0);
+        v.amb = Some(AmbLevel::new(crate::types::amb::CHIMES));
+        out.push(Box::new(v));
     }
     let shelter = scene.place.shelter;
     match shelter {

@@ -19,7 +19,7 @@ use super::common::*;
 use crate::dsp::{Biquad, BiquadCoefs, Sos};
 use crate::engine::{BlockCtx, BoxedVoice, BuildCfg, Voice};
 use crate::rng::{combine, hash3, Rng};
-use crate::types::{precip, season, Emission, Patch, PatchKind, Scene, Shelter, Stem, Weather, N_AMBI};
+use crate::types::{amb, precip, season, Emission, Patch, PatchKind, Scene, Shelter, Stem, Weather, AMB_N, N_AMBI};
 use realfft::num_complex::Complex64;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
@@ -30,24 +30,6 @@ const AIR_MIN_M: f32 = 8.0;
 pub fn dolbear_chirps_per_min(temp_c: f64) -> f64 {
     let t_f = 1.8 * temp_c + 32.0;
     (4.0 * (t_f - 50.0) + 40.0).max(0.0)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
-    Auto,
-    On,
-    Off,
-}
-
-fn mode_of(scene: &Scene, key: &str) -> Mode {
-    match biophony_str(scene, key) {
-        None => Mode::Auto,
-        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" => Mode::On,
-            "off" | "false" | "no" | "0" | "none" => Mode::Off,
-            _ => Mode::Auto,
-        },
-    }
 }
 
 #[inline]
@@ -200,7 +182,7 @@ impl Insect {
             Insect::FieldCricket => 4600.0,
             Insect::TrillCricket => 2400.0 + 20.0 * t,
             Insect::BellCricket => 4400.0,
-            Insect::Katydid => 10000.0,
+            Insect::Katydid => 7000.0,
         }
     }
     fn duty(self) -> f64 {
@@ -237,13 +219,13 @@ impl Insect {
 fn region_birds(r: &str) -> &'static [Bird] {
     use Bird::*;
     match r {
-        "boreal" => &[Flute, Trill, Warbler, Chip, Caw],
+        "boreal" => &[Flute, Trill, Warbler, Chip],
         "mediterranean" => &[Warbler, TwoNote, Chip, Coo, Trill],
-        "east_asia" => &[Warbler, TwoNote, Chip, Coo, Caw],
+        "east_asia" => &[Warbler, TwoNote, Chip, Coo],
         "tropical" => &[Flute, TwoNote, Warbler, Chip, Coo, Trill],
-        "arid" => &[Chip, Coo, Caw, TwoNote],
-        "oceania" => &[Flute, Warbler, Chip, Caw],
-        _ => &[Warbler, Flute, Trill, TwoNote, Chip, Coo, Caw],
+        "arid" => &[Chip, Coo, TwoNote],
+        "oceania" => &[Flute, Warbler, Chip],
+        _ => &[Warbler, Flute, Trill, TwoNote, Chip, Coo],
     }
 }
 
@@ -279,29 +261,106 @@ const OWL_REGIONS: [&str; 5] = ["temperate_europe", "boreal", "north_america", "
 // --------------------------------------------------------------------------
 // activity rules (shared logic, one copy per voice)
 // --------------------------------------------------------------------------
-const A_INSECTS: usize = 0;
-const A_CICADAS: usize = 1;
-const A_BIRDS: usize = 2;
-const A_OWLS: usize = 3;
-const A_FROGS: usize = 4;
-const ACT_TAUS: [f64; 5] = [90.0, 60.0, 60.0, 60.0, 120.0];
+const ACT_N: usize = AMB_N;
+
+/// Smoothing (s) of the ecological activity per category (amb indices).
+fn act_tau(k: usize) -> f64 {
+    match k {
+        amb::CRICKETS | amb::KATYDIDS => 90.0,
+        amb::FROGS => 120.0,
+        amb::DOGS => 30.0,
+        _ => 60.0,
+    }
+}
+
+/// How present a category is in a region when left on auto (0 = absent).
+fn region_factor(region: &str, cat: usize) -> f64 {
+    match cat {
+        // true katydids are New World / tropical; Old World bush crickets fill the niche thinner
+        amb::KATYDIDS => match region {
+            "north_america" | "tropical" => 1.0,
+            "oceania" => 0.8,
+            "east_asia" | "mediterranean" => 0.6,
+            "temperate_europe" => 0.45,
+            "arid" => 0.2,
+            _ => 0.1,
+        },
+        amb::CICADAS => {
+            if CICADA_REGIONS.contains(&region) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        amb::OWLS => {
+            if OWL_REGIONS.contains(&region) {
+                1.0
+            } else {
+                0.5
+            }
+        }
+        amb::CROWS => match region {
+            "tropical" => 0.4,
+            "arid" => 0.6,
+            "mediterranean" => 0.8,
+            _ => 1.0,
+        },
+        _ => 1.0,
+    }
+}
+
+/// Dogs within earshot of a place preset (0..1).
+fn dog_place_factor(scene: &Scene) -> f64 {
+    let p = scene.place.preset.to_ascii_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| p.contains(k));
+    if has(&["suburb", "village", "garden", "backyard", "residential", "farm", "town", "porch"]) {
+        1.0
+    } else if has(&["city", "street", "urban", "alley", "park", "downtown"]) {
+        0.7
+    } else if scene.place.shelter == Shelter::Car {
+        0.5
+    } else if has(&["forest", "wood", "mountain", "beach", "coast", "desert", "jungle", "lake", "meadow", "field"]) {
+        0.2
+    } else {
+        0.5
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Activity {
     tropical: bool,
     lat: f32,
-    m_birds: Mode,
-    m_insects: Mode,
-    m_frogs: Mode,
     has_water: bool,
+    /// region factors per category (auto)
+    reg: [f64; ACT_N],
+    dog_place: f64,
     rain_ema: f64,
     wet_memory: f64,
     dry_s: f64,
-    act: Option<[f64; 5]>,
+    act: Option<[f64; ACT_N]>,
 }
 
 impl Activity {
-    fn targets(&mut self, w: &Weather, dt: f64) -> [f64; 5] {
+    fn new(scene: &Scene, region: &str, has_water: bool) -> Activity {
+        let mut reg = [1.0; ACT_N];
+        for (k, r) in reg.iter_mut().enumerate() {
+            *r = region_factor(region, k);
+        }
+        Activity {
+            tropical: region == "tropical",
+            lat: scene.weather.latitude_deg,
+            has_water,
+            reg,
+            dog_place: dog_place_factor(scene),
+            rain_ema: 0.0,
+            wet_memory: 0.0,
+            dry_s: 3600.0,
+            act: None,
+        }
+    }
+
+    /// Ecological activity (the 'auto' level) of every category from the weather.
+    fn targets(&mut self, w: &Weather, dt: f64) -> [f64; ACT_N] {
         let r = w.rain_rate_mm_h as f64;
         let u = w.wind_listener_mps as f64;
         let t = w.temperature_c as f64;
@@ -323,6 +382,7 @@ impl Activity {
         let (rise, sset) = sun_times(self.lat, sea);
         let (rise, sset) = (rise as f64, sset as f64);
         let night = !w.is_day;
+        let mut out = [0.0; ACT_N];
 
         let rain_off = 1.0 - ss(r, 0.6, 2.0);
         let wind_off = 1.0 - ss(u, 5.0, 9.0);
@@ -338,25 +398,33 @@ impl Activity {
         };
         let dusk = gauss_bump(hour_dist(hour, sset), 0.5, 1.0);
         let time_i = if night { 1.0 } else { dusk };
-        let mut insects = ss(t, 12.0, 16.0) * rain_off * wind_off * seas_i * time_i;
-        match self.m_insects {
-            Mode::On => insects = insects.max((1.0 - ss(r, 2.0, 6.0)) * wind_off),
-            Mode::Off => insects = 0.0,
-            Mode::Auto => {}
-        }
-        let mut cicadas = 0.0;
-        if self.m_insects != Mode::Off {
-            let seas_c = if tropical {
-                1.0
-            } else {
-                match sea {
-                    season::SUMMER => 1.0,
-                    season::AUTUMN => 0.3,
-                    _ => 0.0,
-                }
-            };
-            cicadas = (if night { 0.0 } else { 1.0 }) * ss(t, 22.0, 27.0) * rain_off * wind_off * seas_c;
-        }
+        out[amb::CRICKETS] = ss(t, 12.0, 16.0) * rain_off * wind_off * seas_i * time_i;
+
+        // katydids: nocturnal singers of late summer and autumn (Pterophylla: ~ 16 C threshold)
+        let seas_k = if tropical {
+            1.0
+        } else {
+            match sea {
+                season::SUMMER => 1.0,
+                season::AUTUMN => 0.8,
+                _ => 0.0,
+            }
+        };
+        let time_k = if night { 1.0 } else { 0.3 * dusk };
+        out[amb::KATYDIDS] = ss(t, 15.0, 19.0) * rain_off * wind_off * seas_k * time_k;
+
+        // cicadas: hot summer days; they stop singing once rain passes ~1 mm/h
+        let seas_c = if tropical {
+            1.0
+        } else {
+            match sea {
+                season::SUMMER => 1.0,
+                season::AUTUMN => 0.3,
+                _ => 0.0,
+            }
+        };
+        let cic_rain = 1.0 - ss(r, 0.25, 1.0);
+        out[amb::CICADAS] = (if night { 0.0 } else { 1.0 }) * ss(t, 22.0, 27.0) * cic_rain * wind_off * seas_c;
 
         let dawn = gauss_bump(hour_dist(hour, rise + 0.3), 0.0, 0.75);
         let evening = 0.45 * gauss_bump(hour_dist(hour, sset - 0.3), 0.0, 0.7);
@@ -376,19 +444,23 @@ impl Activity {
         };
         let rain_b = 1.0 / (1.0 + (r / 0.8).powf(1.5));
         let wind_b = 1.0 / (1.0 + (u / 8.0).powi(3));
-        let rebound = 1.0
-            + 1.5 * (self.wet_memory / 2.0).min(1.0) * (-self.dry_s / 1200.0).exp() * ss(self.dry_s, 30.0, 240.0);
-        let mut birds = dawn.max(evening).max(day) * seas_b * rain_b * wind_b * rebound;
-        match self.m_birds {
-            Mode::On => birds = birds.max(0.4 * rain_b * wind_b),
-            Mode::Off => birds = 0.0,
-            Mode::Auto => {}
-        }
-        let mut owls = 0.0;
-        if self.m_birds != Mode::Off && night {
+        let after = (self.wet_memory / 2.0).min(1.0) * (-self.dry_s / 1200.0).exp() * ss(self.dry_s, 30.0, 240.0);
+        let rebound = 1.0 + 1.5 * after;
+        out[amb::BIRDS] = dawn.max(evening).max(day) * seas_b * rain_b * wind_b * rebound;
+
+        if night {
             let autumn_winter = sea == season::AUTUMN || sea == season::WINTER;
-            owls = (1.0 / (1.0 + (r / 0.5).powi(2))) * wind_b * (0.6 + 0.4 * autumn_winter as u8 as f64);
+            out[amb::OWLS] = (1.0 / (1.0 + (r / 0.5).powi(2))) * wind_b * (0.6 + 0.4 * autumn_winter as u8 as f64);
         }
+
+        // crows: daylight all year, busiest early morning; they keep calling through light and
+        // moderate rain and are loudest right after it (foraging on wet ground)
+        let light = ss(hour, rise - 0.3, rise + 0.4) * (1.0 - ss(hour, sset - 0.2, sset + 0.4));
+        let morning = 1.0 + 0.6 * gauss_bump(hour_dist(hour, rise + 1.5), 0.0, 1.5);
+        let wet_now = 0.35 * ss(self.rain_ema, 0.1, 1.0) * (1.0 / (1.0 + (r / 10.0).powi(2)));
+        let after_c = 0.9 * ss(self.wet_memory, 0.2, 2.0) * (-self.dry_s / 2400.0).exp() * ss(self.dry_s, 20.0, 180.0);
+        let heavy_c = 1.0 / (1.0 + (r / 12.0).powi(2));
+        out[amb::CROWS] = (light * morning * (0.4 + wet_now + after_c) * heavy_c * wind_b).min(1.2);
 
         let wet = ss(self.rain_ema, 0.1, 1.5)
             .max(ss(self.wet_memory, 0.2, 2.0) * (-self.dry_s / 10800.0).exp())
@@ -405,23 +477,26 @@ impl Activity {
         };
         let time_f = if night { 1.0 } else { gauss_bump(hour_dist(hour, sset), 0.3, 0.8).max(0.12) };
         let heavy = 1.0 - 0.4 * ss(r, 15.0, 40.0);
-        let mut frogs = ss(t, 8.0, 14.0) * wet * seas_f * time_f * heavy * wind_off;
-        match self.m_frogs {
-            Mode::On => frogs = frogs.max(0.7 * heavy),
-            Mode::Off => frogs = 0.0,
-            Mode::Auto => {}
+        out[amb::FROGS] = ss(t, 8.0, 14.0) * wet * seas_f * time_f * heavy * wind_off;
+
+        // distant dogs: occasional, mostly by day and evening, fewer out in heavy rain
+        let time_d = if night { 0.35 } else { 1.0 } + 0.3 * gauss_bump(hour_dist(hour, sset + 0.5), 0.0, 1.0);
+        out[amb::DOGS] = 0.5 * self.dog_place * time_d * (1.0 / (1.0 + (r / 4.0).powi(2)));
+
+        for (k, v) in out.iter_mut().enumerate() {
+            *v *= self.reg[k];
         }
-        [insects, cicadas, birds, owls, frogs]
+        out
     }
 
     /// Smoothed activities for this block (call once per block).
-    fn step(&mut self, w: &Weather, dt: f64) -> [f64; 5] {
+    fn step(&mut self, w: &Weather, dt: f64) -> [f64; ACT_N] {
         let tgt = self.targets(w, dt);
         match self.act.as_mut() {
             None => self.act = Some(tgt),
             Some(a) => {
-                for k in 0..5 {
-                    a[k] += (tgt[k] - a[k]) * (1.0 - (-dt / ACT_TAUS[k]).exp());
+                for k in 0..ACT_N {
+                    a[k] += (tgt[k] - a[k]) * (1.0 - (-dt / act_tau(k)).exp());
                 }
             }
         }
@@ -685,6 +760,67 @@ fn bull_note(out: &mut Vec<f32>, rng: &mut Rng, sr: f64, dur: f64, p: f64) {
 enum Call {
     Bird(Bird),
     Frog(Frog),
+    Dog,
+}
+
+/// A bout of distant dog barks. Voiced harmonic source, f0 0.5-1 kHz with a rise-fall contour and
+/// jitter, a noisy onset, formant emphasis near 1.1 and 2.4 kHz; barks 0.1-0.25 s, 2-8 a bout at
+/// 2-4 per second (Yin 2002 J. Comp. Psychol. 116; Pongracz et al. 2005; Feddersen-Petersen 2000).
+/// The path's excess ground / vegetation loss is a distance-dependent low-pass here; the caller's
+/// AirPath adds ISO 9613-1 air absorption.
+fn bark_dog(rng: &mut Rng, sr: f64, p: f64, dist: f32, out: &mut Vec<f32>) {
+    let s0 = out.len();
+    let fb = rng.range(520.0, 900.0) * p;
+    let n_barks = ri(rng, 2, 9);
+    let srf = sr as f32;
+    for b in 0..n_barks {
+        let dur = rng.range(0.11, 0.24);
+        let n = (dur * sr) as usize;
+        let s1 = out.len();
+        let f_peak = fb * rng.lognormal(0.0, 0.06);
+        let noise_mix = rng.range(0.25, 0.5);
+        let mut ph = 0.0f64;
+        let mut jit = Biquad::new(lp2(40.0, srf));
+        for i in 0..n {
+            let x = i as f64 / n as f64;
+            let t = i as f64 / sr;
+            let contour = 0.78 + 0.27 * (PI * (x * 1.7).min(1.0)).sin() - 0.12 * x;
+            let f = (f_peak * contour * (1.0 + 0.4 * jit.process(rng.normal() as f32) as f64)).clamp(80.0, 4000.0);
+            ph += 2.0 * PI * f / sr;
+            if ph > 2.0 * PI {
+                ph -= 2.0 * PI;
+            }
+            let (s1_, c1) = ph.sin_cos();
+            let (mut sm2, mut sm1) = (0.0f64, s1_);
+            let mut y = 0.0;
+            for k in 1..10 {
+                if (k as f64) * f < 0.45 * sr {
+                    y += sm1 / (k as f64).powf(1.1);
+                }
+                let nx = 2.0 * c1 * sm1 - sm2;
+                sm2 = sm1;
+                sm1 = nx;
+            }
+            let env = (1.0 - (-t / 0.006).exp()) * (-t / (0.45 * dur)).exp();
+            let onset = (-t / 0.02).exp();
+            out.push(((y + rng.normal() * (noise_mix + 1.2 * onset)) * env) as f32);
+        }
+        let mut f1 = Biquad::new(peak_eq(1100.0, 8.0, 1.2, srf));
+        let mut f2 = Biquad::new(peak_eq(2400.0, 5.0, 1.5, srf));
+        let mut f3 = Biquad::new(hp2(280.0, srf));
+        f1.process_block(&mut out[s1..]);
+        f2.process_block(&mut out[s1..]);
+        f3.process_block(&mut out[s1..]);
+        let g = if b + 1 < n_barks && rng.uniform() < 0.15 { rng.range(0.7, 1.4) } else { rng.range(0.16, 0.42) };
+        gap(out, sr, g);
+    }
+    // excess attenuation of a long grazing path (ground, hedges, houses): high frequencies first
+    let fc = (7000.0 * (60.0 / dist.max(1.0) as f64).powf(0.6)).clamp(900.0, 7000.0) as f32;
+    let mut l1 = Biquad::new(lp2(fc, srf));
+    let mut l2 = Biquad::new(lp2(fc * 1.3, srf));
+    l1.process_block(&mut out[s0..]);
+    l2.process_block(&mut out[s0..]);
+    norm_from(out, s0);
 }
 
 fn song_bird(b: Bird, rng: &mut Rng, sr: f64, p: f64, out: &mut Vec<f32>) {
@@ -776,8 +912,10 @@ fn song_bird(b: Bird, rng: &mut Rng, sr: f64, p: f64, out: &mut Vec<f32>) {
             }
         }
         Bird::Caw => {
+            // carrion / American crow 'caw': 0.3-0.5 s harsh harmonic stack, energy 0.5-2 kHz,
+            // 2-5 calls a bout (Thompson 1982; Laiolo et al. 2000)
             for _ in 0..ri(rng, 2, 6) {
-                let dur = rng.range(0.22, 0.4);
+                let dur = rng.range(0.3, 0.5);
                 let n = (dur * sr) as usize;
                 let f0 = rng.range(420.0, 620.0) * p;
                 let s1 = out.len();
@@ -916,7 +1054,9 @@ fn point_of(pos: [f32; 3]) -> (f32, f32, f32) {
 pub struct CallerVoice {
     name: String,
     act: Activity,
-    act_idx: usize,
+    lvl: AmbLevel,
+    /// playback gate (a category set to Off fades out the call in progress)
+    pg: Ramp,
     call: Call,
     level: f32,
     per_min: f32,
@@ -950,10 +1090,12 @@ const CALL_DELAY_BLOCKS: i64 = 12;
 
 impl CallerVoice {
     #[allow(clippy::too_many_arguments)]
-    fn new(name: String, layer: &str, call: Call, pos: [f32; 3], act: &Activity, act_idx: usize, cfg_rng: &mut Rng, cfg: &BuildCfg) -> CallerVoice {
-        let (lvl, per_min, max_s) = match call {
+    fn new(name: String, layer: &str, call: Call, pos: [f32; 3], act: &Activity, cat: usize, cfg_rng: &mut Rng, cfg: &BuildCfg) -> CallerVoice {
+        let (lvl, per_min, _max_s) = match call {
             Call::Bird(b) => b.spec(),
             Call::Frog(f) => f.spec(),
+            // (peak dB SPL at 1 m: a medium / large dog's bark ~100 dB; bouts per minute)
+            Call::Dog => (100.0, 1.2, 6.0),
         };
         let level = db_spl(lvl) * cfg_rng.lognormal(0.0, 0.15) as f32;
         let per_min = per_min * cfg_rng.range(0.7, 1.3) as f32;
@@ -965,7 +1107,8 @@ impl CallerVoice {
         let (job_tx, job_rx) = crossbeam_channel::bounded(1);
         CallerVoice {
             act: act.clone(),
-            act_idx,
+            lvl: AmbLevel::new(cat),
+            pg: Ramp::new(1.0),
             call,
             level,
             per_min,
@@ -977,7 +1120,8 @@ impl CallerVoice {
             key_song: cfg.rng.key(&format!("{layer}.{id}")),
             key_call: cfg.rng.key(&format!("bio.calls.{id}")),
             busy_until: -1,
-            song: Vec::with_capacity(((max_s + 0.2) * sr) as usize),
+            // grown on the worker pool by the first call, then reused (built once, lazily)
+            song: Vec::new(),
             song_start: 0,
             air: AirPath::new(dist, sr, AIR_MIN_M),
             name,
@@ -1018,6 +1162,7 @@ impl CallerVoice {
                         song_bird(b, &mut trng, sr, pitch, &mut song)
                     }
                     Call::Frog(f) => call_frog(f, &mut rng, sr, pitch, &mut song),
+                    Call::Dog => bark_dog(&mut rng, sr, pitch, dist, &mut song),
                 }
                 let amp = level * rng.lognormal(0.0, 0.15) as f32 * (0.6 + 0.4 * a.min(1.0) as f32) / dist;
                 song.iter_mut().for_each(|v| *v *= amp);
@@ -1060,7 +1205,10 @@ impl Voice for CallerVoice {
         let n = ctx.n;
         let dt = n as f64 / ctx.sr as f64;
         let act = self.act.step(ctx.weather, dt);
-        let a = act[self.act_idx];
+        let a = self.lvl.step(ctx, act[self.lvl.cat]);
+        // right after a hand switch-on, slow callers (crows, owls, dogs) get the first call within
+        // a couple of seconds: the boost targets ~0.5 calls/s per voice, fading over ~6 s
+        let boost = 1.0 + (self.lvl.kick() - 1.0) / 8.0 * (30.0 / self.per_min.max(0.1) as f64).max(8.0);
         let start = (ctx.t0 * ctx.sr as f64).round() as i64;
         if a > 1e-3 && start >= self.busy_until && self.slot.is_some() {
             let (per, phi) = self.slot.unwrap();
@@ -1072,7 +1220,7 @@ impl Voice for CallerVoice {
                 let jit = (crate::rng::uniform_at(self.key_call, ku, 1) - 0.5) * 0.08 * per;
                 let ts = (k as f64 + phi) * per + jit;
                 if ts >= t0 && ts < t1 {
-                    let p_call = (a * self.per_min as f64 * per / 60.0).min(0.92);
+                    let p_call = (a * boost * self.per_min as f64 * per / 60.0).min(0.92);
                     if crate::rng::uniform_at(self.key_call, ku, 2) < p_call {
                         let off = (((ts - t0) * ctx.sr as f64) as usize).min(n - 1);
                         self.begin(ctx, a, start, off);
@@ -1082,7 +1230,7 @@ impl Voice for CallerVoice {
             }
         } else if a > 1e-3 && start >= self.busy_until {
             let mut crng = ctx.rng.stream(self.key_call, ctx.index);
-            let lam = self.per_min as f64 / 60.0 * a * dt;
+            let lam = self.per_min as f64 / 60.0 * a * boost * dt;
             let c = crng.poisson(lam);
             if c > 0 {
                 let mut off = n;
@@ -1103,10 +1251,15 @@ impl Voice for CallerVoice {
         if self.song.is_empty() || s_end <= start || self.song_start >= end {
             return Emission::silent(Stem::Ambience);
         }
+        let (g0, g1) = self.pg.to(self.lvl.gate);
+        if g0 <= 0.0 && g1 <= 0.0 {
+            return Emission::silent(Stem::Ambience);
+        }
         let lo = start.max(self.song_start);
         let hi = end.min(s_end);
         for t in lo..hi {
-            out[(t - start) as usize] = self.song[(t - self.song_start) as usize];
+            let i = (t - start) as usize;
+            out[i] = self.song[(t - self.song_start) as usize] * ramp_at(g0, g1, i, n);
         }
         Emission::point(self.az, self.el, self.dist, 0.05, Stem::Ambience)
     }
@@ -1114,6 +1267,8 @@ impl Voice for CallerVoice {
     fn reset(&mut self) {
         self.collect(true);
         self.act.reset();
+        self.lvl.reset();
+        self.pg = Ramp::new(1.0);
         self.busy_until = -1;
         self.song_type = 0;
         self.song.clear();
@@ -1158,7 +1313,9 @@ impl InsectState {
 
 /// Every insect of the scene as one bank and one SH emission (self-encoded).
 pub struct InsectBankVoice {
+    name: &'static str,
     act: Activity,
+    lvl: AmbLevel,
     ins: Vec<InsectState>,
     sr: f32,
     key: u64,
@@ -1170,7 +1327,7 @@ pub struct InsectBankVoice {
 
 impl Voice for InsectBankVoice {
     fn name(&self) -> &str {
-        "bio.insects"
+        self.name
     }
 
     fn channels(&self) -> usize {
@@ -1182,13 +1339,15 @@ impl Voice for InsectBankVoice {
         let w = ctx.weather;
         let sr = self.sr as f64;
         let dt = n as f64 / sr;
-        let act = self.act.step(w, dt)[A_INSECTS];
+        let act = self.act.step(w, dt);
+        let act = self.lvl.step(ctx, act[self.lvl.cat]);
+        let boost = self.lvl.kick();
         let mut rng = ctx.rng.stream(self.key, ctx.index);
         for s in self.ins.iter_mut() {
             let u = rng.uniform();
             if s.singing && u < dt / 120.0 {
                 s.singing = false;
-            } else if !s.singing && u < dt / 20.0 * act.max(0.05) {
+            } else if !s.singing && u < dt / 20.0 * act.max(0.05) * boost {
                 s.singing = true;
             }
         }
@@ -1281,6 +1440,7 @@ impl Voice for InsectBankVoice {
 
     fn reset(&mut self) {
         self.act.reset();
+        self.lvl.reset();
         self.air_key = (i32::MIN, i32::MIN);
         for (s, &(cp, carp, sing)) in self.ins.iter_mut().zip(&self.init) {
             s.chirp_phase = cp;
@@ -1296,6 +1456,7 @@ impl Voice for InsectBankVoice {
 pub struct CicadaVoice {
     name: String,
     act: Activity,
+    lvl: AmbLevel,
     fc: f64,
     pulse: f64,
     swell_f: f64,
@@ -1321,7 +1482,8 @@ impl Voice for CicadaVoice {
     fn render(&mut self, ctx: &BlockCtx, out: &mut [f32]) -> Emission {
         let n = ctx.n;
         let sr = self.sr as f64;
-        let a = self.act.step(ctx.weather, n as f64 / sr)[A_CICADAS];
+        let a = self.act.step(ctx.weather, n as f64 / sr);
+        let a = self.lvl.step(ctx, a[self.lvl.cat]);
         let target = self.level * a as f32 / self.dist;
         if target <= 0.0 && self.amp.v < 1e-9 {
             return Emission::silent(Stem::Ambience);
@@ -1350,6 +1512,7 @@ impl Voice for CicadaVoice {
 
     fn reset(&mut self) {
         self.act.reset();
+        self.lvl.reset();
         self.phase = self.phase0;
         self.pphase = 0.0;
         self.filt.reset();
@@ -1366,6 +1529,7 @@ const CHORUS_DIRS: usize = 6;
 
 pub struct ChorusVoice {
     act: Activity,
+    lvl: AmbLevel,
     filts: Vec<Biquad>, // CHORUS_DIRS x carriers
     gains: Vec<f32>,
     rate_sp: Option<Insect>,
@@ -1392,7 +1556,8 @@ impl Voice for ChorusVoice {
     fn render(&mut self, ctx: &BlockCtx, out: &mut [f32]) -> Emission {
         let n = ctx.n;
         let sr = self.sr as f64;
-        let a = self.act.step(ctx.weather, n as f64 / sr)[A_INSECTS];
+        let a = self.act.step(ctx.weather, n as f64 / sr);
+        let a = self.lvl.step(ctx, a[self.lvl.cat]);
         let target = self.level * a as f32;
         if (target <= 0.0 && self.amp.v < 1e-9) || self.tmp.len() < n || self.acc.len() < n {
             return Emission::silent(Stem::Ambience);
@@ -1441,6 +1606,7 @@ impl Voice for ChorusVoice {
 
     fn reset(&mut self) {
         self.act.reset();
+        self.lvl.reset();
         self.phase = 0.0;
         self.amp = Ramp::default();
         for f in &mut self.filts {
@@ -1461,8 +1627,10 @@ fn perch(perches: &[&Patch], cfg: &mut Rng, h: f32) -> [f32; 3] {
     [(d * az.cos()) as f32, (d * az.sin()) as f32, z]
 }
 
-/// Crickets, cicadas, birds (incl. owls), frogs and the insect chorus of the scene
-/// (place.biophony: region, birds / insects / frogs = auto | on | off).
+/// Every biophony voice of the scene: crickets, katydids, cicadas, songbirds, crows, owls, frogs,
+/// distant dogs and the insect chorus. All of them are built whatever their level (place.biophony.*
+/// = auto | 0..1, live through Engine.set_ambience), so turning one on is instant; a silent voice
+/// costs almost nothing. Only place.biophony.region changes the species (a rebuild).
 pub fn build(scene: &Scene, patches: &[Patch], cfg: &BuildCfg) -> Vec<BoxedVoice> {
     let mut out: Vec<BoxedVoice> = Vec::new();
     let sr = cfg.sr as f32;
@@ -1472,225 +1640,249 @@ pub fn build(scene: &Scene, patches: &[Patch], cfg: &BuildCfg) -> Vec<BoxedVoice
     }
     let region = region.as_str();
     let tropical = region == "tropical";
-    let m_birds = mode_of(scene, "birds");
-    let m_insects = mode_of(scene, "insects");
-    let m_frogs = mode_of(scene, "frogs");
     let h = scene.listener.height_m;
     let mut rng = cfg.rng.get("bio.cfg", 0);
     let ponds: Vec<&Patch> = patches.iter().filter(|p| p.kind == PatchKind::Water || p.material == "puddle").collect();
-    let has_water = m_frogs != Mode::Off && ponds.iter().any(|p| p.kind == PatchKind::Water);
-    let act = Activity {
-        tropical,
-        lat: scene.weather.latitude_deg,
-        m_birds,
-        m_insects,
-        m_frogs,
-        has_water,
-        rain_ema: 0.0,
-        wet_memory: 0.0,
-        dry_s: 3600.0,
-        act: None,
+    let has_water = ponds.iter().any(|p| p.kind == PatchKind::Water);
+    let act = Activity::new(scene, region, has_water);
+
+    let make_insect = |rng: &mut Rng, sp: Insect, k: usize, d_lo: f64, d_hi: f64, z_up: f32| -> InsectState {
+        let az = rng.range(-PI, PI);
+        let d = rng.range(d_lo, d_hi);
+        let z = -h + z_up;
+        let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, z];
+        let (paz, pel, dist) = point_of(pos);
+        let jit = rng.range(0.95, 1.05);
+        let cjit = rng.range(0.96, 1.04);
+        let chirp_phase = rng.uniform();
+        let car_phase = rng.range(0.0, 2.0 * PI);
+        let singing = rng.uniform() < 0.7;
+        let trill_len = rng.range(2.0, 6.0);
+        let trill_gap = rng.range(0.6, 2.5);
+        let level = db_spl(sp.level()) * rng.lognormal(0.0, 0.2) as f32;
+        // field crickets (Gryllus) chirp 3-5 syllables (Alexander 1961; Bennet-Clark 1999);
+        // katydids 2-3 ('ka-ty' / 'ka-ty-did'; Shaw 1968, Pterophylla camellifolia)
+        let nsy = match sp {
+            Insect::FieldCricket => (3 + (k * 7 + 1) % 3) as f64,
+            Insect::Katydid => (2 + (k * 5 + 1) % 2) as f64,
+            _ => sp.syll(),
+        };
+        // katydid broadband buzz: each individual's peak somewhere in 5-10 kHz
+        let nf = if sp == Insect::Katydid { rng.range(5500.0, 9000.0) as f32 } else { sp.carrier(20.0) as f32 };
+        InsectState {
+            sp,
+            nsy,
+            jit,
+            cjit,
+            chirp_phase,
+            car_phase,
+            singing,
+            trill_len,
+            trill_gap,
+            level,
+            dist,
+            air: 1.0,
+            amp: Ramp::default(),
+            noise_f: Biquad::new(bp(nf, 2.5, sr)),
+            g: crate::spatial::spread_gains(paz, pel, 0.05).0,
+        }
     };
 
-    let mut insects: Vec<InsectState> = Vec::new();
+    // crickets (the bank) and the distant chorus
+    let species: Vec<Insect> = region_insects(region).iter().copied().filter(|s| *s != Insect::Katydid).collect();
+    let species = if species.is_empty() { vec![Insect::FieldCricket] } else { species };
+    let n_ins = if tropical { ri(&mut rng, 8, 12) } else { ri(&mut rng, 5, 9) } as usize;
+    let mut crickets: Vec<InsectState> = Vec::with_capacity(n_ins);
+    for k in 0..n_ins {
+        let sp = species[k % species.len()];
+        let up = if sp == Insect::TreeCricket { 1.0 } else { 0.1 };
+        crickets.push(make_insect(&mut rng, sp, k, 2.5, 25.0, up));
+    }
+    let mut krng = cfg.rng.get("bio.katydid.cfg", 0);
+    let n_kat = if tropical { 6 } else { 4 };
+    let katydids: Vec<InsectState> =
+        (0..n_kat).map(|k| make_insect(&mut krng, Insect::Katydid, k, 5.0, 30.0, krng_height(k))).collect();
+
+    let carriers: Vec<f64> = species.iter().take(2).map(|s| s.carrier(20.0)).collect();
+    let mut drng = cfg.rng.get("bio.chorus.dirs", 0);
+    let az0 = drng.range(-PI, PI);
+    let mut dir_y = [[0f32; N_AMBI]; CHORUS_DIRS];
+    let mut ph_off = [0f64; CHORUS_DIRS];
+    let mut filts: Vec<Biquad> = Vec::with_capacity(CHORUS_DIRS * carriers.len());
+    for d in 0..CHORUS_DIRS {
+        let az = az0 + 2.0 * PI * (d as f64 + drng.range(-0.25, 0.25)) / CHORUS_DIRS as f64;
+        dir_y[d] = sh_gains(az as f32, drng.range(-0.05, 0.12) as f32, 0.3);
+        ph_off[d] = drng.uniform();
+        // each region's population sings a little sharp or flat (temperature / species spread)
+        let detune = drng.range(0.97, 1.03);
+        for &f in &carriers {
+            filts.push(Biquad::new(bp((f * detune) as f32, 6.0, sr)));
+        }
+    }
+    let gains: Vec<f32> = carriers.iter().map(|&f| noise_rms_gain(&[bp(f as f32, 6.0, sr)])).collect();
+    let chorus = ChorusVoice {
+        dir_y,
+        ph_off,
+        acc: vec![0.0; cfg.block],
+        act: act.clone(),
+        lvl: AmbLevel::new(amb::CRICKETS),
+        filts,
+        gains,
+        rate_sp: Some(species[0]),
+        level: db_spl(if tropical { 46.0 } else { 36.0 }),
+        phase: 0.0,
+        amp: Ramp::default(),
+        sr,
+        key: cfg.rng.key("bio.chorus"),
+        tmp: vec![0.0; cfg.block],
+    };
+
+    // cicadas: a pulsed 4-7 kHz buzz high in the trees (Young & Bennet-Clark 1995; Sueur 2002)
     let mut cicadas: Vec<CicadaVoice> = Vec::new();
-    let mut chorus: Option<ChorusVoice> = None;
-    if m_insects != Mode::Off {
-        let species = region_insects(region);
-        let n_ins = if tropical { ri(&mut rng, 10, 15) } else { ri(&mut rng, 6, 11) } as usize;
-        for k in 0..n_ins {
-            let sp = species[k % species.len()];
-            let az = rng.range(-PI, PI);
-            let d = rng.range(2.5, 25.0);
-            let z = -h + if matches!(sp, Insect::TreeCricket | Insect::Katydid) { 1.0 } else { 0.1 };
-            let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, z];
-            let (paz, pel, dist) = point_of(pos);
-            let jit = rng.range(0.95, 1.05);
-            let cjit = rng.range(0.96, 1.04);
-            let chirp_phase = rng.uniform();
-            let car_phase = rng.range(0.0, 2.0 * PI);
-            let singing = rng.uniform() < 0.7;
-            let trill_len = rng.range(2.0, 6.0);
-            let trill_gap = rng.range(0.6, 2.5);
-            let level = db_spl(sp.level()) * rng.lognormal(0.0, 0.2) as f32;
-            // field crickets (Gryllus) chirp 3-5 syllables (Alexander 1961; Bennet-Clark 1999)
-            let nsy = if sp == Insect::FieldCricket { (3 + (k * 7 + 1) % 3) as f64 } else { sp.syll() };
-            insects.push(InsectState {
-                sp,
-                nsy,
-                jit,
-                cjit,
-                chirp_phase,
-                car_phase,
-                singing,
-                trill_len,
-                trill_gap,
-                level,
-                dist,
-                air: 1.0,
-                amp: Ramp::default(),
-                noise_f: Biquad::new(bp(Insect::Katydid.carrier(20.0) as f32, 3.0, sr)),
-                g: crate::spatial::spread_gains(paz, pel, 0.05).0,
-            });
-        }
-        let carriers: Vec<f64> = species.iter().take(2).map(|s| s.carrier(20.0)).collect();
-        let mut drng = cfg.rng.get("bio.chorus.dirs", 0);
-        let az0 = drng.range(-PI, PI);
-        let mut dir_y = [[0f32; N_AMBI]; CHORUS_DIRS];
-        let mut ph_off = [0f64; CHORUS_DIRS];
-        let mut filts: Vec<Biquad> = Vec::with_capacity(CHORUS_DIRS * carriers.len());
-        for d in 0..CHORUS_DIRS {
-            let az = az0 + 2.0 * PI * (d as f64 + drng.range(-0.25, 0.25)) / CHORUS_DIRS as f64;
-            dir_y[d] = sh_gains(az as f32, drng.range(-0.05, 0.12) as f32, 0.3);
-            ph_off[d] = drng.uniform();
-            // each region's population sings a little sharp or flat (temperature / species spread)
-            let detune = drng.range(0.97, 1.03);
-            for &f in &carriers {
-                filts.push(Biquad::new(bp((f * detune) as f32, 6.0, sr)));
-            }
-        }
-        let gains: Vec<f32> = carriers.iter().map(|&f| noise_rms_gain(&[bp(f as f32, 6.0, sr)])).collect();
-        chorus = Some(ChorusVoice {
-            dir_y,
-            ph_off,
-            acc: vec![0.0; cfg.block],
+    let mut crng = cfg.rng.get("bio.cicada.cfg", 0);
+    for k in 0..2 {
+        let az = crng.range(-PI, PI);
+        let d = crng.range(10.0, 35.0);
+        let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, 5.0 - h];
+        let (paz, pel, dist) = point_of(pos);
+        let fc = crng.range(4500.0, 6500.0);
+        let pulse = crng.range(110.0, 180.0);
+        let swell_f = 1.0 / crng.range(20.0, 40.0);
+        let phase = crng.uniform();
+        let secs = [bp(fc as f32, 2.5, sr), bp((fc * 1.1) as f32, 2.0, sr)];
+        cicadas.push(CicadaVoice {
+            name: format!("bio.cicada{k}"),
             act: act.clone(),
-            filts,
-            gains,
-            rate_sp: Some(species[0]),
-            level: db_spl(if tropical { 46.0 } else { 36.0 }),
-            phase: 0.0,
+            lvl: AmbLevel::new(amb::CICADAS),
+            fc,
+            pulse,
+            swell_f,
+            phase0: phase,
+            phase,
+            pphase: 0.0,
+            filt: Sos::new(&secs),
+            g: noise_rms_gain(&secs),
             amp: Ramp::default(),
+            level: db_spl(76.0),
+            az: paz,
+            el: pel,
+            dist,
             sr,
-            key: cfg.rng.key("bio.chorus"),
-            tmp: vec![0.0; cfg.block],
+            key: cfg.rng.key(&format!("bio.cicada.cicada{k}")),
         });
-        if CICADA_REGIONS.contains(&region) {
-            for k in 0..2 {
-                let az = rng.range(-PI, PI);
-                let d = rng.range(10.0, 35.0);
-                let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, 5.0 - h];
-                let (paz, pel, dist) = point_of(pos);
-                let fc = rng.range(4500.0, 6500.0);
-                let pulse = rng.range(110.0, 180.0);
-                let swell_f = 1.0 / rng.range(20.0, 40.0);
-                let phase = rng.uniform();
-                let secs = [bp(fc as f32, 2.5, sr), bp((fc * 1.1) as f32, 2.0, sr)];
-                cicadas.push(CicadaVoice {
-                    name: format!("bio.cicada{k}"),
-                    act: act.clone(),
-                    fc,
-                    pulse,
-                    swell_f,
-                    phase0: phase,
-                    phase,
-                    pphase: 0.0,
-                    filt: Sos::new(&secs),
-                    g: noise_rms_gain(&secs),
-                    amp: Ramp::default(),
-                    level: db_spl(76.0),
-                    az: paz,
-                    el: pel,
-                    dist,
-                    sr,
-                    key: cfg.rng.key(&format!("bio.cicada.cicada{k}")),
-                });
-            }
-        }
     }
 
     let perches: Vec<&Patch> = patches
         .iter()
         .filter(|p| p.kind == PatchKind::Vegetation && p.param_str("species").unwrap_or("") != "grass")
         .collect();
-    let mut birds: Vec<CallerVoice> = Vec::new();
-    let mut owls: Vec<CallerVoice> = Vec::new();
-    if m_birds != Mode::Off {
-        let palette = region_birds(region);
-        let n_b = match region {
-            "arid" => 3,
-            "boreal" => 5,
-            "tropical" => 11,
-            _ => 9,
-        };
-        for k in 0..n_b {
-            let tpl = palette[k % palette.len()];
-            let pos = perch(&perches, &mut rng, h);
-            let name = format!("bird{k}.{}", tpl.name());
-            birds.push(CallerVoice::new(name, "bio.bird", Call::Bird(tpl), pos, &act, A_BIRDS, &mut rng, cfg));
-        }
-        if OWL_REGIONS.contains(&region) {
-            let az = rng.range(-PI, PI);
-            let d = rng.range(40.0, 120.0);
-            let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, 8.0 - h];
-            owls.push(CallerVoice::new("owl0".into(), "bio.owl", Call::Bird(Bird::Owl), pos, &act, A_OWLS, &mut rng, cfg));
-        }
+    let mut callers: Vec<CallerVoice> = Vec::new();
+    let palette = region_birds(region);
+    let n_b = match region {
+        "arid" => 3,
+        "boreal" => 5,
+        "tropical" => 11,
+        _ => 8,
+    };
+    for k in 0..n_b {
+        let tpl = palette[k % palette.len()];
+        let pos = perch(&perches, &mut rng, h);
+        let name = format!("bird{k}.{}", tpl.name());
+        callers.push(CallerVoice::new(name, "bio.bird", Call::Bird(tpl), pos, &act, amb::BIRDS, &mut rng, cfg));
+    }
+    // crows: a pair / family group on tall trees and roofs some way off
+    let mut orng = cfg.rng.get("bio.corvid.cfg", 0);
+    for k in 0..2 {
+        let az = orng.range(-PI, PI);
+        let d = orng.range(25.0, 110.0);
+        let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, orng.range(8.0, 16.0) as f32 - h];
+        callers.push(CallerVoice::new(format!("crow{k}"), "bio.bird", Call::Bird(Bird::Caw), pos, &act, amb::CROWS, &mut orng, cfg));
+    }
+    // owls: a calling male and a farther neighbour answering (tawny owl territories ~ 200-400 m)
+    for k in 0..2 {
+        let az = orng.range(-PI, PI);
+        let d = if k == 0 { orng.range(40.0, 120.0) } else { orng.range(150.0, 320.0) };
+        let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, 8.0 - h];
+        let name = if k == 0 { "owl0".to_string() } else { format!("owl{k}") };
+        callers.push(CallerVoice::new(name, "bio.owl", Call::Bird(Bird::Owl), pos, &act, amb::OWLS, &mut orng, cfg));
+    }
+    // dogs: two yards some hundreds of metres away
+    let mut grng = cfg.rng.get("bio.dog.cfg", 0);
+    for k in 0..2 {
+        let az = grng.range(-PI, PI);
+        let d = grng.range(120.0, 420.0);
+        let pos = [(d * az.cos()) as f32, (d * az.sin()) as f32, 0.5 - h];
+        callers.push(CallerVoice::new(format!("dog{k}"), "bio.dog", Call::Dog, pos, &act, amb::DOGS, &mut grng, cfg));
     }
 
     let mut frogs: Vec<CallerVoice> = Vec::new();
-    if m_frogs != Mode::Off {
-        let species = region_frogs(region);
-        let n_f = if tropical { ri(&mut rng, 12, 18) } else { ri(&mut rng, 6, 12) } as usize;
-        for k in 0..n_f {
-            let sp = species[k % species.len()];
-            let pos = if !ponds.is_empty() {
-                let src = ponds[ri(&mut rng, 0, ponds.len() as i64) as usize];
-                let j0 = rng.gauss(0.0, 2.0) as f32;
-                let j1 = rng.gauss(0.0, 2.0) as f32;
-                [src.position[0] + j0, src.position[1] + j1, -h + 0.05]
-            } else {
-                let az = rng.range(-PI, PI);
-                let d = rng.range(6.0, 40.0);
-                [(d * az.cos()) as f32, (d * az.sin()) as f32, -h + 0.05]
-            };
-            let name = format!("frog{k}.{}", sp.name());
-            frogs.push(CallerVoice::new(name, "bio.frog", Call::Frog(sp), pos, &act, A_FROGS, &mut rng, cfg));
+    let fspecies = region_frogs(region);
+    let n_f = if tropical { ri(&mut rng, 12, 18) } else { ri(&mut rng, 6, 12) } as usize;
+    for k in 0..n_f {
+        let sp = fspecies[k % fspecies.len()];
+        let pos = if !ponds.is_empty() {
+            let src = ponds[ri(&mut rng, 0, ponds.len() as i64) as usize];
+            let j0 = rng.gauss(0.0, 2.0) as f32;
+            let j1 = rng.gauss(0.0, 2.0) as f32;
+            [src.position[0] + j0, src.position[1] + j1, -h + 0.05]
+        } else {
+            let az = rng.range(-PI, PI);
+            let d = rng.range(6.0, 40.0);
+            [(d * az.cos()) as f32, (d * az.sin()) as f32, -h + 0.05]
+        };
+        let name = format!("frog{k}.{}", sp.name());
+        frogs.push(CallerVoice::new(name, "bio.frog", Call::Frog(sp), pos, &act, amb::FROGS, &mut rng, cfg));
+    }
+    // chorus slots: same-species short callers share a clock and spread their phases evenly, so
+    // they alternate and answer each other instead of overlapping at random
+    let mut srng = cfg.rng.get("bio.frog.slots", 0);
+    for &sp in fspecies {
+        if !matches!(sp, Frog::Peeper | Frog::Tree | Frog::Chorus | Frog::Coqui | Frog::Common) {
+            continue;
         }
-        // chorus slots: same-species short callers share a clock and spread their phases evenly, so
-        // they alternate and answer each other instead of overlapping at random
-        let mut srng = cfg.rng.get("bio.frog.slots", 0);
-        for &sp in species {
-            if !matches!(sp, Frog::Peeper | Frog::Tree | Frog::Chorus | Frog::Coqui | Frog::Common) {
-                continue;
-            }
-            let idx: Vec<usize> =
-                frogs.iter().enumerate().filter(|(_, f)| matches!(f.call, Call::Frog(x) if x == sp)).map(|(i, _)| i).collect();
-            let m = idx.len();
-            if m == 0 || frogs[idx[0]].slot.is_some() {
-                continue;
-            }
-            let per = 60.0 / sp.spec().1 as f64 * srng.range(0.9, 1.1);
-            for (j, &i) in idx.iter().enumerate() {
-                let phi = ((j as f64 + 0.5 + srng.range(-0.15, 0.15)) / m as f64).rem_euclid(1.0);
-                frogs[i].slot = Some((per, phi));
-            }
+        let idx: Vec<usize> =
+            frogs.iter().enumerate().filter(|(_, f)| matches!(f.call, Call::Frog(x) if x == sp)).map(|(i, _)| i).collect();
+        let m = idx.len();
+        if m == 0 || frogs[idx[0]].slot.is_some() {
+            continue;
+        }
+        let per = 60.0 / sp.spec().1 as f64 * srng.range(0.9, 1.1);
+        for (j, &i) in idx.iter().enumerate() {
+            let phi = ((j as f64 + 0.5 + srng.range(-0.15, 0.15)) / m as f64).rem_euclid(1.0);
+            frogs[i].slot = Some((per, phi));
         }
     }
 
-    if !insects.is_empty() {
-        let init = insects.iter().map(|s| (s.chirp_phase, s.car_phase, s.singing)).collect();
-        let ng = noise_rms_gain(&[bp(Insect::Katydid.carrier(20.0) as f32, 3.0, sr)]);
-        out.push(Box::new(InsectBankVoice {
+    let bank = |name: &'static str, cat: usize, ins: Vec<InsectState>, key: &str, nf: f32| -> InsectBankVoice {
+        let init = ins.iter().map(|s| (s.chirp_phase, s.car_phase, s.singing)).collect();
+        InsectBankVoice {
+            name,
             act: act.clone(),
-            ins: insects,
+            lvl: AmbLevel::new(cat),
+            ins,
             sr,
-            key: cfg.rng.key("bio.insects"),
+            key: cfg.rng.key(key),
             air_key: (i32::MIN, i32::MIN),
-            noise_g: ng,
+            noise_g: noise_rms_gain(&[bp(nf, 2.5, sr)]),
             init,
             buf: vec![0.0; cfg.block],
-        }));
-    }
+        }
+    };
+    out.push(Box::new(bank("bio.insects", amb::CRICKETS, crickets, "bio.insects", Insect::Katydid.carrier(20.0) as f32)));
+    out.push(Box::new(bank("bio.katydids", amb::KATYDIDS, katydids, "bio.katydids", 7000.0)));
     for v in cicadas {
         out.push(Box::new(v));
     }
-    for v in birds.into_iter().chain(owls).chain(frogs) {
+    for v in callers.into_iter().chain(frogs) {
         out.push(Box::new(v));
     }
-    if let Some(c) = chorus {
-        out.push(Box::new(c));
-    }
+    out.push(Box::new(chorus));
     out
+}
+
+/// Katydids sing from shrubs and tree crowns (1.5-5 m).
+fn krng_height(k: usize) -> f32 {
+    [2.0, 3.5, 1.5, 4.5, 2.5, 5.0][k % 6]
 }
 
 // --------------------------------------------------------------------------
@@ -1933,6 +2125,7 @@ impl TrafficState {
 pub struct TrafficBedVoice {
     st: TrafficState,
     st0: TrafficState,
+    lvl: AmbLevel,
     bed: Sos,
     bed_g: f32,
     hiss: Sos,
@@ -1957,6 +2150,7 @@ impl Voice for TrafficBedVoice {
         let w = ctx.weather;
         let n = ctx.n;
         let dt = n as f64 / ctx.sr as f64;
+        self.st.level = self.lvl.step(ctx, 0.0).clamp(0.0, 1.0);
         let wet = self.st.wetness(w, dt);
         let q = self.st.flow(w.hour);
         if (q < 0.5 && self.bed_amp.v < 1e-9) || self.tmp.len() < n {
@@ -1995,6 +2189,7 @@ impl Voice for TrafficBedVoice {
 
     fn reset(&mut self) {
         self.st = self.st0.clone();
+        self.lvl.reset();
         self.bed.reset();
         self.hiss.reset();
         self.air.reset();
@@ -2051,6 +2246,8 @@ struct PassBy {
 pub struct TrafficCarsVoice {
     st: TrafficState,
     st0: TrafficState,
+    lvl: AmbLevel,
+    pg: Ramp,
     cars: Vec<PassBy>,
     tyre_g: f32,
     hiss_g: f32,
@@ -2127,6 +2324,7 @@ impl Voice for TrafficCarsVoice {
         let n = ctx.n;
         let sr = self.sr as f64;
         let dt = n as f64 / sr;
+        self.st.level = self.lvl.step(ctx, 0.0).clamp(0.0, 1.0);
         let wet = self.st.wetness(w, dt);
         let q = self.st.flow(w.hour);
         let any_active = self.cars.iter().any(|c| c.active);
@@ -2202,6 +2400,14 @@ impl Voice for TrafficCarsVoice {
                 car.active = false;
             }
         }
+        let (g0, g1) = self.pg.to(self.lvl.gate);
+        if emitted && (g0 < 1.0 || g1 < 1.0) {
+            for ch in 0..N_AMBI {
+                for (i, v) in out[ch * n..(ch + 1) * n].iter_mut().enumerate() {
+                    *v *= ramp_at(g0, g1, i, n);
+                }
+            }
+        }
         if emitted {
             Emission::diffuse(Stem::Ambience)
         } else {
@@ -2211,6 +2417,8 @@ impl Voice for TrafficCarsVoice {
 
     fn reset(&mut self) {
         self.st = self.st0.clone();
+        self.lvl.reset();
+        self.pg = Ramp::new(1.0);
         for c in &mut self.cars {
             c.active = false;
             c.tyre_f.reset();
@@ -2220,14 +2428,11 @@ impl Voice for TrafficCarsVoice {
 }
 
 /// Road traffic: a distant bed with a daily flow curve and wet-tyre hiss, plus individual pass-bys
-/// on nearby roads (streets, suburbs, a parked car by the kerb). Nothing when place.biophony.traffic
-/// is 0 (the default).
+/// on nearby roads (streets, suburbs, a parked car by the kerb). Always built: the level
+/// (place.biophony.traffic, default 0 = silent) is live through Engine.set_ambience.
 pub fn build_traffic(scene: &Scene, cfg: &BuildCfg) -> Vec<BoxedVoice> {
     let mut out: Vec<BoxedVoice> = Vec::new();
     let level = (biophony_num(scene, "traffic") as f64).clamp(0.0, 1.0);
-    if !(level > 0.0) {
-        return out;
-    }
     let sr = cfg.sr as f32;
     let preset = scene.place.preset.to_ascii_lowercase();
     let has = |keys: &[&str]| keys.iter().any(|k| preset.contains(k));
@@ -2267,6 +2472,7 @@ pub fn build_traffic(scene: &Scene, cfg: &BuildCfg) -> Vec<BoxedVoice> {
     out.push(Box::new(TrafficBedVoice {
         st: st.clone(),
         st0: st.clone(),
+        lvl: AmbLevel::new(amb::TRAFFIC),
         bed: Sos::new(&bed_secs),
         bed_g,
         hiss: Sos::new(&hiss_secs),
@@ -2313,6 +2519,8 @@ pub fn build_traffic(scene: &Scene, cfg: &BuildCfg) -> Vec<BoxedVoice> {
         out.push(Box::new(TrafficCarsVoice {
             st: st.clone(),
             st0: st,
+            lvl: AmbLevel::new(amb::TRAFFIC),
+            pg: Ramp::new(1.0),
             cars,
             tyre_g: noise_rms_gain(&tyre),
             hiss_g: noise_rms_gain(&hiss),

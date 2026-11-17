@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 from typing import Optional
 
-from .schema import Scene
+from .schema import BIOPHONY_DEFAULTS, Scene
 
 DEFAULT_PRESET = "steady-rain-leaves-night"
 
@@ -152,7 +152,7 @@ def apply_place(scene: Scene, name: str, keep_shelter: bool = True) -> Scene:
     p.surfaces = dict(tpl["surfaces"])
     p.vegetation = dict(tpl["vegetation"])
     p.emitters = [dict(e) for e in tpl["emitters"]]
-    p.biophony = dict(tpl["biophony"])
+    p.biophony = {**BIOPHONY_DEFAULTS, **tpl["biophony"]}
     if not keep_shelter:
         p.shelter = "open"
     return out

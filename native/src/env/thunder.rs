@@ -2024,3 +2024,139 @@ impl Voice for ThunderVoice {
 fn _api(_: f64) -> f64 {
     source_frequency_hz(5.0e4, 15.0)
 }
+
+// --------------------------------------------------------------------------
+// continuous cloud rumble (weather.thunder.rumble)
+// --------------------------------------------------------------------------
+/// The continuous low rumble of storms beyond the individual flashes: many distant, overlapping
+/// and in-cloud discharges whose thunder arrives refracted and absorbed down to its lowest band
+/// (energy 30-100 Hz; Holmes et al. 1971: distant thunder spectra peak 50-100 Hz; Few 1969). Slow
+/// swells (OU processes, ~1 s and ~6 s) and rolling surges. Auto: louder the nearer and the more
+/// active the storm cells; a fixed level (0..1) plays even without storms, still lifted by them.
+pub struct CloudRumbleVoice {
+    lvl: crate::env::common::AmbLevel,
+    sr: f32,
+    key: u64,
+    heading: f32,
+    filt: Vec<Biquad>,
+    g: f32,
+    ou_fast: f64,
+    ou_slow: f64,
+    surge: f64,
+    storm: f64,
+    az: f64,
+    amp: Ramp,
+}
+
+impl CloudRumbleVoice {
+    pub fn new(scene: &Scene, cfg: &BuildCfg) -> CloudRumbleVoice {
+        let sr = cfg.sr as f32;
+        let secs = [
+            BiquadCoefs::highpass(sr, 28.0, 0.541_196_1),
+            BiquadCoefs::highpass(sr, 28.0, 1.306_563),
+            BiquadCoefs::lowpass(sr, 95.0, 0.541_196_1),
+            BiquadCoefs::lowpass(sr, 95.0, 1.306_563),
+            peak_eq(55.0, 4.0, 0.8, sr),
+        ];
+        CloudRumbleVoice {
+            lvl: crate::env::common::AmbLevel::new(crate::types::amb::RUMBLE),
+            sr,
+            key: cfg.rng.key("thunder.cloud_rumble"),
+            heading: scene.listener.heading_deg,
+            g: noise_rms_gain(&secs),
+            filt: secs.iter().map(|c| Biquad::new(*c)).collect(),
+            ou_fast: 0.0,
+            ou_slow: 0.0,
+            surge: 0.0,
+            storm: -1.0,
+            az: bearing_to_azimuth(scene.weather.thunder.bearing_deg, scene.listener.heading_deg) as f64,
+            amp: Ramp::default(),
+        }
+    }
+
+    /// (storm factor 0..~1.5, weighted azimuth) from the storm cells.
+    fn storms(&self, w: &Weather) -> (f64, Option<f64>) {
+        let (mut s, mut x, mut y) = (0.0f64, 0.0f64, 0.0f64);
+        for c in &w.storms {
+            let d = (c.distance_km as f64).max(0.3);
+            let near = 1.0 / (1.0 + (d / 10.0).powf(1.5));
+            let active = 0.35 + 0.65 * smoothstep64(c.flash_rate_per_min as f64, 0.1, 6.0);
+            let si = 0.5 + 0.5 * (c.stroke_intensity as f64).clamp(0.0, 1.0);
+            let k = near * active * si;
+            s += k;
+            let a = bearing_to_azimuth(c.bearing_deg, self.heading) as f64;
+            x += k * a.cos();
+            y += k * a.sin();
+        }
+        let dir = if s > 1e-6 { Some(y.atan2(x)) } else { None };
+        (s.min(1.5), dir)
+    }
+}
+
+impl Voice for CloudRumbleVoice {
+    fn name(&self) -> &str {
+        "thunder.cloud_rumble"
+    }
+
+    fn render(&mut self, ctx: &BlockCtx, out: &mut [f32]) -> Emission {
+        let n = ctx.n;
+        let sr = self.sr as f64;
+        let dt = n as f64 / sr;
+        let (s_now, dir) = self.storms(ctx.weather);
+        if self.storm < 0.0 {
+            self.storm = s_now;
+        }
+        // storms build and fade over tens of seconds
+        self.storm += (s_now - self.storm) * (1.0 - (-dt / 8.0).exp());
+        if let Some(a) = dir {
+            let d = (a - self.az + PI).rem_euclid(2.0 * PI) - PI;
+            self.az += d * (1.0 - (-dt / 5.0).exp());
+        }
+        let st = self.storm.min(1.0);
+        let auto = 0.75 * st;
+        let raw = self.lvl.raw(ctx);
+        let v = self.lvl.step(ctx, auto);
+        let g = match raw {
+            Some(_) => v * (0.55 + 0.45 * st),
+            None => v,
+        };
+        let target = db_spl(68.0) * g as f32;
+        if target <= 1e-9 && self.amp.idle() {
+            return Emission::silent(Stem::Thunder);
+        }
+        let mut rng = ctx.rng.stream(self.key, ctx.index);
+        let af = (-dt / 1.2).exp();
+        let as_ = (-dt / 6.0).exp();
+        self.ou_fast = af * self.ou_fast + (1.0 - af * af).sqrt() * rng.normal();
+        self.ou_slow = as_ * self.ou_slow + (1.0 - as_ * as_).sqrt() * rng.normal();
+        // rolling surges: a few per minute, more with an active storm
+        if rng.uniform() < dt * (0.04 + 0.08 * st) {
+            self.surge += rng.range(0.6, 1.4);
+        }
+        self.surge *= (-dt / 3.5).exp();
+        let swell = (0.45 * self.ou_slow + 0.25 * self.ou_fast).exp() * (1.0 + 0.8 * self.surge.min(2.0));
+        let (g0, g1) = self.amp.to(target * swell as f32);
+        let o = &mut out[..n];
+        fill_gauss(&mut rng, o);
+        for f in self.filt.iter_mut() {
+            f.process_block(o);
+        }
+        let inv = 1.0 / self.g;
+        for (i, v) in o.iter_mut().enumerate() {
+            *v *= ramp_at(g0, g1, i, n) * inv;
+        }
+        Emission::point(self.az as f32, 0.12, 3000.0, 0.75, Stem::Thunder)
+    }
+
+    fn reset(&mut self) {
+        self.lvl.reset();
+        for f in self.filt.iter_mut() {
+            f.reset();
+        }
+        self.ou_fast = 0.0;
+        self.ou_slow = 0.0;
+        self.surge = 0.0;
+        self.storm = -1.0;
+        self.amp = Ramp::default();
+    }
+}

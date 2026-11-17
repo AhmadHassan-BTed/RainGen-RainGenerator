@@ -1112,3 +1112,92 @@ pub fn jnum(x: f64, dp: usize) -> String {
 pub fn jstr(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
+
+// ---------------------------------------------------------------------------
+// live ambience levels
+// ---------------------------------------------------------------------------
+/// One category's live level (`ctx.ambience[cat]`): auto (-1) follows the ecology value given to
+/// `step`, a fixed level (0..1) replaces it. Glides with a 0.3 s time constant.
+#[derive(Clone, Debug)]
+pub struct AmbLevel {
+    pub cat: usize,
+    /// smoothed effective value
+    pub v: f64,
+    /// smoothed playback gate: 0 while the category is set to 0 (Off), else 1
+    pub gate: f32,
+    init: bool,
+    /// true while a fixed level is set
+    pub manual: bool,
+    prev: f32,
+    /// seconds since the category was switched on by hand (large when not)
+    pub on_s: f64,
+}
+
+pub const AMB_TAU_S: f64 = 0.3;
+
+impl AmbLevel {
+    pub fn new(cat: usize) -> AmbLevel {
+        AmbLevel { cat, v: 0.0, gate: 1.0, init: false, manual: false, prev: -1.0, on_s: 1e9 }
+    }
+
+    /// Raw level now: None = auto.
+    #[inline]
+    pub fn raw(&self, ctx: &crate::engine::BlockCtx) -> Option<f32> {
+        let l = ctx.ambience.get(self.cat).copied().unwrap_or(-1.0);
+        if l >= 0.0 {
+            Some(l)
+        } else {
+            None
+        }
+    }
+
+    /// Effective (smoothed) value for this block; call once per block.
+    pub fn step(&mut self, ctx: &crate::engine::BlockCtx, auto: f64) -> f64 {
+        let dt = ctx.n as f64 / ctx.sr as f64;
+        let l = ctx.ambience.get(self.cat).copied().unwrap_or(-1.0);
+        let manual = l >= 0.0;
+        let tgt = if manual { l as f64 } else { auto.max(0.0) };
+        let gate_t = if manual && l <= 0.0 { 0.0 } else { 1.0 };
+        if !self.init {
+            self.init = true;
+            self.v = tgt;
+            self.gate = gate_t;
+        } else {
+            let a = 1.0 - (-dt / AMB_TAU_S).exp();
+            self.v += (tgt - self.v) * a;
+            self.gate += (gate_t - self.gate) * a as f32;
+            if (self.v - tgt).abs() < 1e-5 {
+                self.v = tgt;
+            }
+            if (self.gate - gate_t).abs() < 1e-4 {
+                self.gate = gate_t;
+            }
+        }
+        if manual && l > 0.0 && !(self.manual && self.prev > 0.0) {
+            self.on_s = 0.0;
+        } else {
+            self.on_s += dt;
+        }
+        self.manual = manual;
+        self.prev = l;
+        self.v
+    }
+
+    /// Event-rate boost right after a category is switched on by hand, so the first call comes
+    /// within a second or two instead of after a long natural pause.
+    #[inline]
+    pub fn kick(&self) -> f64 {
+        if self.manual {
+            1.0 + 8.0 * (-self.on_s / 6.0).exp()
+        } else {
+            1.0
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.init = false;
+        self.manual = false;
+        self.prev = -1.0;
+        self.on_s = 1e9;
+    }
+}

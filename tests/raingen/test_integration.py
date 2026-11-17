@@ -1119,7 +1119,7 @@ class TestEngine:
         assert np.all(np.diff(g) <= 1e-6)                     # monotone fade (float32 output: eps 1.2e-7)
 
     def test_rain_rate_glide(self, synth):
-        """set() glides the rain rate in log2 over >= the manifest smoothing time, never a step."""
+        """With no explicit ramp, set() glides the rain rate in log2 over >= the manifest smoothing time."""
         from raingen.scene import manifest as mf
 
         gens = {}
@@ -1136,7 +1136,7 @@ class TestEngine:
         eng = _engine(sc).start(audio=False)
         try:
             y = _read_all(eng, 0.3)
-            eng.set("rain", 16.0, ramp=0.5)
+            eng.set("rain", 16.0, ramp=None)
             y = np.concatenate([y, _read_all(eng, 4.5)], axis=1)
         finally:
             eng.stop()

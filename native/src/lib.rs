@@ -208,6 +208,15 @@ impl PyEngine {
         self.send(Command::Weather(Box::new(w)))
     }
 
+    /// Live ambience levels without a rebuild: {"birds": "auto" | 0..1, "crows", "owls",
+    /// "crickets", "katydids", "cicadas", "frogs", "dogs", "traffic", "stream", "chimes",
+    /// "insects" (legacy master), "rumble"} (missing = auto), or a scene-shaped
+    /// {"place": {"biophony": ...}, "weather": {"thunder": {"rumble": ...}}}. Voices glide (~0.3 s).
+    fn set_ambience(&self, json: &str) -> PyResult<()> {
+        let a = crate::types::ambience_from_json(json).map_err(verr)?;
+        self.send(Command::Ambience(a))
+    }
+
     /// Select the output. kind: stereo | mono | matrix | 5.1 | 7.1 | 7.1.4 (with `matrix`,
     /// channels x 16), binaural (with `firs`, 2 x 16 x taps), foa | hoa1 | hoa2 | hoa3 (raw SH).
     #[pyo3(signature = (kind, channels, matrix = None, firs = None, latency = 0, lfe_index = None, lfe_gain = 0.0, lfe_cutoff_hz = 120.0))]

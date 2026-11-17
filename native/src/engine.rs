@@ -210,6 +210,8 @@ pub struct BlockCtx<'a> {
     pub markers: &'a MarkerSink,
     /// Manual strikes to start in this block (thunder voice).
     pub strikes: &'a [Strike],
+    /// Live ambience levels (types::amb indices): -1 auto, else 0..1.
+    pub ambience: &'a crate::types::Ambience,
 }
 
 impl<'a> BlockCtx<'a> {
@@ -529,11 +531,18 @@ pub fn scene_struct_hash(scene: &Scene) -> u64 {
         m.remove("name");
         m.remove("overrides");
         if let Some(w) = m.get_mut("weather") {
+            if let Some(Value::Object(t)) = w.get_mut("thunder") {
+                t.remove("rumble");
+            }
             strip_numbers(w);
         }
         if let Some(Value::Object(p)) = m.get_mut("place") {
             for k in ["objects", "window_open", "aftermath_tau_min"] {
                 p.remove(k);
+            }
+            // live levels: only the region shapes the biophony voices
+            if let Some(Value::Object(b)) = p.get_mut("biophony") {
+                b.retain(|k, _| k == "region");
             }
         }
         if let Some(l) = m.get_mut("listener") {
@@ -762,6 +771,8 @@ pub enum Command {
     Strike(Strike),
     /// Move the scene clock to t (s) without touching the voices.
     Seek(f64),
+    /// Live ambience levels (place.biophony.*, weather.thunder.rumble).
+    Ambience(crate::types::Ambience),
     Reset,
 }
 
@@ -854,6 +865,7 @@ pub struct Core {
     patches: Arc<Vec<Patch>>,
     weather: Box<Weather>,
     weather_changed: bool,
+    ambience: crate::types::Ambience,
     slots: Vec<Slot>,
     fading: Vec<Slot>,
     procs: Vec<BoxedProcessor>,
@@ -953,6 +965,7 @@ impl Core {
             patches: Arc::new(Vec::new()),
             weather: Box::new(Weather::default()),
             weather_changed: true,
+            ambience: crate::types::AMB_AUTO,
             slots: Vec::new(),
             fading: Vec::new(),
             procs: Vec::new(),
@@ -1068,6 +1081,7 @@ impl Core {
                 self.slots.push(s)
             }
             Command::Strike(st) => self.strikes.push(st),
+            Command::Ambience(a) => self.ambience = a,
             Command::Seek(t) => {
                 if t.is_finite() {
                     self.time_offset = t - self.block_index as f64 * self.n as f64 / self.sr as f64;
@@ -1086,6 +1100,7 @@ impl Core {
         let Graph { rng, scene, patches, slots: new_slots, procs, procs_key, ref_pose } = g;
         self.rngf = rng;
         self.seed = rng.root_seed;
+        self.ambience = crate::types::ambience_from_scene(&scene);
         self.scene = scene;
         self.patches = patches;
         self.ref_pose = ref_pose;
@@ -1313,6 +1328,7 @@ impl Core {
             strikes,
             pose_ctx,
             ramp,
+            ambience,
             ..
         } = self;
         let ctx = BlockCtx {
@@ -1331,6 +1347,7 @@ impl Core {
             materials: &**materials,
             markers: &*sink,
             strikes: &strikes[..],
+            ambience: &*ambience,
         };
         let pose = *pose_ctx;
 

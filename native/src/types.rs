@@ -1435,3 +1435,79 @@ pub fn wrap_pi(a: f32) -> f32 {
     }
     r
 }
+
+// ---------------------------------------------------------------------------
+// live ambience levels (place.biophony.* and weather.thunder.rumble)
+// ---------------------------------------------------------------------------
+/// Sound categories with a live level: -1 = auto (ecology / storms decide), else 0..1 (0 = off).
+pub const AMB_N: usize = 12;
+pub mod amb {
+    pub const BIRDS: usize = 0;
+    pub const CROWS: usize = 1;
+    pub const OWLS: usize = 2;
+    pub const CRICKETS: usize = 3;
+    pub const KATYDIDS: usize = 4;
+    pub const CICADAS: usize = 5;
+    pub const FROGS: usize = 6;
+    pub const DOGS: usize = 7;
+    pub const TRAFFIC: usize = 8;
+    pub const STREAM: usize = 9;
+    pub const CHIMES: usize = 10;
+    pub const RUMBLE: usize = 11;
+}
+pub const AMB_KEYS: [&str; AMB_N] =
+    ["birds", "crows", "owls", "crickets", "katydids", "cicadas", "frogs", "dogs", "traffic", "stream", "chimes", "rumble"];
+pub type Ambience = [f32; AMB_N];
+pub const AMB_AUTO: Ambience = [-1.0; AMB_N];
+
+/// "auto" / null -> None, on/off/bool -> 1/0, a number (or numeric string) -> clamped 0..1.
+fn amb_value(v: Option<&Value>) -> Option<f32> {
+    match v? {
+        Value::Null => None,
+        Value::Bool(b) => Some(*b as u8 as f32),
+        Value::Number(n) => n.as_f64().filter(|x| x.is_finite()).map(|x| x.clamp(0.0, 1.0) as f32),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" => Some(1.0),
+            "off" | "false" | "no" | "none" => Some(0.0),
+            t => t.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(0.0, 1.0) as f32),
+        },
+        _ => None,
+    }
+}
+
+/// Levels from a biophony object plus the cloud-rumble value. An auto cricket / katydid / cicada
+/// row follows a non-auto legacy `insects` master.
+pub fn ambience_from_values(bio: &Value, rumble: Option<&Value>) -> Ambience {
+    let mut out = AMB_AUTO;
+    let master = amb_value(bio.get("insects"));
+    for (i, k) in AMB_KEYS.iter().enumerate() {
+        if i == amb::RUMBLE {
+            continue;
+        }
+        let mut v = amb_value(bio.get(*k));
+        if v.is_none() && matches!(i, amb::CRICKETS | amb::KATYDIDS | amb::CICADAS) {
+            v = master;
+        }
+        out[i] = v.unwrap_or(-1.0);
+    }
+    out[amb::RUMBLE] = amb_value(rumble).unwrap_or(-1.0);
+    out
+}
+
+pub fn ambience_from_scene(scene: &Scene) -> Ambience {
+    ambience_from_values(&scene.place.biophony, scene.get("weather.thunder.rumble"))
+}
+
+/// Engine.set_ambience: {"birds": "auto" | 0..1, ..., "insects": master, "rumble": ...}; also
+/// accepts {"place": {"biophony": {...}}, "weather": {"thunder": {"rumble": ...}}}. Missing = auto.
+pub fn ambience_from_json(s: &str) -> Result<Ambience, String> {
+    let v: Value = serde_json::from_str(s).map_err(|e| format!("ambience json: {e}"))?;
+    if !v.is_object() {
+        return Err("ambience json must be an object".into());
+    }
+    if let Some(bio) = v.get("place").and_then(|p| p.get("biophony")) {
+        let r = v.get("weather").and_then(|w| w.get("thunder")).and_then(|t| t.get("rumble"));
+        return Ok(ambience_from_values(bio, r));
+    }
+    Ok(ambience_from_values(&v, v.get("rumble")))
+}

@@ -78,6 +78,9 @@ PATH_ALIASES = {
     "volume": "vibe.volume_db",
 }
 _LIVE_PLACE = ("window_open", "aftermath_tau_min")
+# place.biophony.* levels are live (Engine.set_ambience on the native core); only the region
+# changes which species are built.
+_BIOPHONY_STRUCT = ("region",)
 _MACROS = ("intensity", "closeness", "wildness")
 
 
@@ -103,6 +106,8 @@ def _live_paths() -> tuple[tuple[str, ...], tuple[str, ...]]:
             (numeric if s.is_numeric else discrete).append(s.id)
         elif s.id in tuple(f"place.{p}" for p in _LIVE_PLACE):
             numeric.append(s.id)
+        elif s.id.startswith("place.biophony.") and s.id.rsplit(".", 1)[1] not in _BIOPHONY_STRUCT:
+            (discrete if getattr(s, "auto_level", False) or not s.is_numeric else numeric).append(s.id)
     return tuple(numeric), tuple(discrete)
 
 
@@ -140,7 +145,8 @@ def _structure_key(scene: Scene, live_listener: bool = False, none_live: bool = 
     ptype = d["weather"]["precipitation"]["type"]
     key = {
         "type": "liquid" if (none_live and ptype == "none") else _PRECIP_FAMILY.get(ptype, ptype),
-        "place": {k: v for k, v in d["place"].items() if k not in _LIVE_PLACE},
+        "place": {k: ({b: x for b, x in v.items() if b in _BIOPHONY_STRUCT} if k == "biophony" and isinstance(v, dict) else v)
+                  for k, v in d["place"].items() if k not in _LIVE_PLACE},
         "listener": {k: v for k, v in d["listener"].items() if k not in skip},
         "mode": d.get("mode"),
         "seed": d.get("seed"),
@@ -448,7 +454,8 @@ class Engine:
                     self._target.get(path)
                 except (AttributeError, KeyError, TypeError):
                     raise KeyError(f"unknown parameter {path!r}") from None
-        self._cmd.put(("set", path, value, 0.0 if ramp is None else float(ramp), bool(immediate)))
+        # None keeps the parameter's own (manifest) smoothing; an explicit ramp wins.
+        self._cmd.put(("set", path, value, None if ramp is None else float(ramp), bool(immediate)))
         return value
 
     def set_scene(self, scene, xfade: Optional[float] = None) -> None:
@@ -933,7 +940,7 @@ class Engine:
         self._vol_from = self._vol_db
         self._vol_to = float(db)
         self._vol_start = self._index
-        self._vol_blocks = 1 if immediate else max(1, int(round(max(ramp, 0.05) * SAMPLE_RATE / BLOCK)))
+        self._vol_blocks = 1 if immediate else max(1, int(round(max(ramp or 0.0, 0.05) * SAMPLE_RATE / BLOCK)))
 
     def _retarget(self, ramp: float, immediate: bool) -> None:
         with self._lock:

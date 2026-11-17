@@ -56,6 +56,7 @@ class Thunder:
     flashes_per_min: float = 2.0
     stroke_intensity: float = 0.5   # 0..1
     cg_fraction: float = 0.4
+    rumble: Any = "auto"            # continuous distant cloud rumble: "auto" (storms decide) or 0..1
 
 
 @dataclass
@@ -87,6 +88,12 @@ class SceneObject:
     params: dict = field(default_factory=dict)
 
 
+BIOPHONY_LEVELS = ("birds", "crows", "owls", "crickets", "katydids", "cicadas", "frogs", "dogs")
+BIOPHONY_AMBIENT = ("traffic", "stream", "chimes")
+BIOPHONY_DEFAULTS = {**{k: "auto" for k in BIOPHONY_LEVELS}, "insects": "auto",
+                     **{k: 0.0 for k in BIOPHONY_AMBIENT}, "region": "temperate_europe"}
+
+
 @dataclass
 class Place:
     preset: str = "garden"
@@ -97,10 +104,17 @@ class Place:
     objects: list[SceneObject] = field(default_factory=list)
     z0_m: Optional[float] = None    # roughness length (None = from preset)
     ground: str = "grass"           # for propagation: grass|soil|asphalt|water|snow_fresh|snow_old|forest_floor
-    biophony: dict = field(default_factory=lambda: {"birds": "auto", "insects": "auto", "frogs": "auto", "traffic": 0.0, "region": "temperate_europe"})
+    # sounds of the place: "auto" (ecology decides) or a live 0..1 level (0 = off); traffic, stream
+    # and chimes are plain levels. 'insects' is the legacy master for crickets / katydids / cicadas.
+    biophony: dict = field(default_factory=lambda: dict(BIOPHONY_DEFAULTS))
     aftermath_tau_min: float = 8.0
     window_open: float = 0.0        # 0..1 for room shelters
     wipers: str = "off"             # car: off|slow|fast
+
+    def __post_init__(self):
+        if isinstance(self.biophony, dict):
+            for k, v in BIOPHONY_DEFAULTS.items():
+                self.biophony.setdefault(k, v)
 
 
 @dataclass

@@ -143,6 +143,18 @@ def _live_precip_types(d: dict) -> Optional[list]:
     return sorted(types)
 
 
+_AMB_KEYS = ("birds", "crows", "owls", "crickets", "katydids", "cicadas", "frogs", "dogs", "insects",
+             "traffic", "stream", "chimes")
+
+
+def ambience_json(scene: Scene) -> str:
+    """Live ambience levels for Engine.set_ambience: place.biophony.* and weather.thunder.rumble."""
+    bio = getattr(scene.place, "biophony", None) or {}
+    d = {k: bio.get(k, "auto") for k in _AMB_KEYS}
+    d["rumble"] = getattr(scene.weather.thunder, "rumble", "auto")
+    return json.dumps(d, separators=(",", ":"), default=str)
+
+
 def scene_json(scene: Scene, precip_types=None) -> str:
     d = json.loads(scene.to_json())
     if precip_types == "live":
@@ -503,6 +515,7 @@ class NativeSession:
         weather = self.world.step(max(0, index + k_off), t0 + off, n, sc)
         self.last_weather = weather
         self.engine.update(weather_json(weather))
+        self._send_ambience(sc, index)
         stems = None
         if self.stems:
             st = np.asarray(self.engine.render_stems(n), dtype=np.float64)        # (7, 16, n)
@@ -800,6 +813,24 @@ class NativeSession:
         self.last_weather = w
         if send:
             self.engine.update(weather_json(w))
+            self._send_ambience(sc, k)
+
+    _amb_sent: Optional[str] = None
+    _amb_k: int = -(1 << 30)
+
+    def _send_ambience(self, sc: Scene, k: int) -> None:
+        """Forward place.biophony.* / weather.thunder.rumble to the voices (no rebuild): on change,
+        and again every ~0.7 s (a scene update in between resets the engine to its scene's levels)."""
+        if not hasattr(self.engine, "set_ambience"):
+            return
+        try:
+            js = ambience_json(sc)
+        except Exception:
+            return
+        if js != self._amb_sent or k - self._amb_k >= 64 or k < self._amb_k:
+            self.engine.set_ambience(js)
+            self._amb_sent = js
+            self._amb_k = k
 
     def _control(self) -> None:
         block_s = self.block / self.sr

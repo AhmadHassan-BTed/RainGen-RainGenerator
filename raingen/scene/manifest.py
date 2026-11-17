@@ -86,6 +86,7 @@ class ParamSpec:
     choices: tuple = ()
     type: str = "float"                       # float | int | bool | str | vec3
     nullable: bool = False                    # None means "auto"
+    auto_level: bool = False                  # "auto" or a 0..1 level (place.biophony.*, thunder rumble)
     wrap: bool = False                        # circular quantity (degrees, hour of day)
     zero_ok: bool = False                     # 0 is valid below a log range ("no rain"); it is never clamped up
     description: str = ""
@@ -194,6 +195,32 @@ def _p(id: str, label: str, unit: str = "", lo: Optional[float] = None, hi: Opti
                      nullable=nullable, wrap=wrap, zero_ok=zero_ok, description=description, ucs=ucs, group=group)
 
 
+_BIOPHONY_ROWS = (
+    ("birds", "Songbirds", "dawn chorus, quiet in heavy rain, rebound afterwards"),
+    ("crows", "Crows", "harsh caws by day, busy during and after rain"),
+    ("owls", "Owls", "tawny-owl hoots at night"),
+    ("crickets", "Crickets", "chirp rate follows temperature (Dolbear)"),
+    ("katydids", "Katydids", "'ka-ty-did' on summer and autumn nights"),
+    ("cicadas", "Cicadas", "hot summer days; silent once rain passes ~1 mm/h"),
+    ("frogs", "Frogs", "chorus on warm wet evenings"),
+    ("dogs", "Distant dogs", "occasional barking a few hundred metres away"),
+)
+_AMBIENT_ROWS = (
+    ("traffic", "Traffic", "wet-road tyre hiss and splashes; wetter roads hiss more"),
+    ("stream", "Stream", "a nearby brook that swells with the rain"),
+    ("chimes", "Wind chimes", "struck by the gusts"),
+)
+
+
+def _auto_level(id: str, label: str, hint: str, tier: int = 2) -> ParamSpec:
+    """'auto' (ecology / storms decide) or a live 0..1 level (0 = off)."""
+    import dataclasses
+
+    base = _p(id, label, "", type="str", tier=tier, hint=hint, smoothing=0.3, default="auto",
+              description="'auto' or a level 0..1 (0 = off)")
+    return dataclasses.replace(base, auto_level=True, default="auto")
+
+
 _H_DIRECT = "heard directly"
 _H_RATE = "level, density and timbre: more large drops add low-mid punch"
 _H_DROPS = "fine-rain hiss vs fat-drop splats; how many plinks on water"
@@ -255,6 +282,7 @@ def _build_params() -> list[ParamSpec]:
     add(_p(th + "bearing_deg", "Storm bearing", "deg", 0, 360, tier=1, wrap=True, hint="direction of the storm cell"))
     add(_p(th + "approach_kmh", "Storm approach", "km/h", -60, 60, tier=1, hint="+ approaching, - receding"))
     add(_p(th + "flashes_per_min", "Flashes", "/min", 0, 20, tier=1, hint="how often thunder arrives"))
+    add(_auto_level(th + "rumble", "Cloud rumble", "continuous distant rumble (30-100 Hz) of storms beyond single strikes", tier=1))
 
     add(_p("weather.temperature_c", "Temperature", "°C", -30, 45, tier=1, audibility="indirect", hint=_H_TEMP))
     add(_p("weather.humidity_pct", "Humidity", "%", 10, 100, tier=1, audibility="distant_only", hint=_H_HUM))
@@ -284,10 +312,11 @@ def _build_params() -> list[ParamSpec]:
            description="auto from place; sets wind at your ears and gust factor"))
     add(_p("place.ground", "Ground", "", choices=GROUNDS, type="str", tier=2, audibility="distant_only",
            hint="soft ground gives a 200-600 Hz dip for distant sound"))
-    add(_p("place.biophony.birds", "Birds", "", choices=("auto", "off", "on"), type="str", tier=2, hint="go quiet in heavy rain, rebound afterwards"))
-    add(_p("place.biophony.insects", "Insects", "", choices=("auto", "off", "on"), type="str", tier=2, hint="crickets follow temperature (Dolbear)"))
-    add(_p("place.biophony.frogs", "Frogs", "", choices=("auto", "off", "on"), type="str", tier=2, hint="chorus on warm wet evenings"))
-    add(_p("place.biophony.traffic", "Traffic", "", 0, 1, tier=2, hint="distant traffic hiss, wetter roads hiss more"))
+    for key, label, hint in _BIOPHONY_ROWS:
+        add(_auto_level(f"place.biophony.{key}", label, hint))
+    add(_auto_level("place.biophony.insects", "Insects (all)", "legacy master: sets crickets, katydids and cicadas that are on auto"))
+    for key, label, hint in _AMBIENT_ROWS:
+        add(_p(f"place.biophony.{key}", label, "", 0, 1, tier=2, smoothing=0.3, hint=hint))
     add(_p("place.biophony.region", "Biophony region", "", choices=REGIONS, type="str", tier=2, wwise="State",
            hint="region- and season-correct species"))
     add(_p("place.aftermath_tau_min", "Drip decay", "min", 1, 30, scale="log", tier=2, hint="how long drips and runoff last after rain"))
@@ -421,7 +450,7 @@ def from_perceptual(spec: ParamSpec, p: float) -> Any:
 
 def clamp(spec: ParamSpec, value: Any) -> Any:
     """Clamp a numeric value to the spec range (wrapping circular quantities)."""
-    if value is None or not spec.is_numeric:
+    if value is None or not spec.is_numeric or isinstance(value, str):
         return value
     v = float(value)
     if spec.zero_ok and v <= 0.0:
@@ -437,8 +466,31 @@ def clamp(spec: ParamSpec, value: Any) -> Any:
     return int(round(v)) if spec.type == "int" else v
 
 
+def coerce_auto_level(value: Any) -> Any:
+    """'auto' / None -> 'auto'; on / off / bool -> 1.0 / 0.0; a number -> clamped 0..1."""
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in ("auto", ""):
+            return "auto"
+        if t in ("on", "true", "yes"):
+            return 1.0
+        if t in ("off", "false", "no", "none"):
+            return 0.0
+        value = float(t.rstrip("%")) / (100.0 if t.endswith("%") else 1.0)
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError("level must be finite")
+    return min(1.0, max(0.0, v))
+
+
 def normalize(spec: ParamSpec, value: Any) -> float:
     """Plain value -> 0..1 slider / MIDI position (in the perceptual domain)."""
+    if isinstance(value, str) and spec.auto_level:
+        return 0.0
     if spec.scale == "choice":
         n = max(1, len(spec.choices) - 1)
         return to_perceptual(spec, value) / n
@@ -471,6 +523,8 @@ def midi_to_value(spec: ParamSpec, msb: int, lsb: Optional[int] = None) -> Any:
 
 def coerce(spec: ParamSpec, value: Any, temp_c: float = 20.0) -> Any:
     """Convert a user/OSC/MIDI value into the stored type and unit (strings may carry units)."""
+    if spec.auto_level:
+        return coerce_auto_level(value)
     if spec.nullable and (value is None or (isinstance(value, str) and value.strip().lower() in ("auto", "none", ""))):
         return None
     if spec.type == "bool":
@@ -531,6 +585,8 @@ def _json_type(spec: ParamSpec) -> dict:
                 t["x-log-floor"] = spec.min
         if spec.max is not None:
             t["maximum"] = spec.max
+    if spec.auto_level:
+        t = {"type": ["string", "number"], "minimum": 0, "maximum": 1}
     if spec.nullable:
         if "type" in t:
             t["type"] = [t["type"], "null"]

@@ -11,6 +11,7 @@
 
 pub mod aeolian;
 pub mod biophony;
+pub mod brook;
 pub mod common;
 pub mod gust;
 pub mod npy;
@@ -38,8 +39,10 @@ pub fn build_voices(scene: &Scene, patches: &[Patch], materials: &MaterialTable,
         }
     }
     out.push(Box::new(thunder::ThunderVoice::new(scene, patches, cfg)));
+    out.push(Box::new(thunder::CloudRumbleVoice::new(scene, cfg)));
     out.extend(biophony::build(scene, patches, cfg));
     out.extend(biophony::build_traffic(scene, cfg));
+    out.push(Box::new(brook::BrookVoice::new(scene, cfg)));
     if scene.place.shelter == crate::types::Shelter::Car {
         out.push(Box::new(places::CarWipersVoice::new(scene, patches, cfg)));
     }
